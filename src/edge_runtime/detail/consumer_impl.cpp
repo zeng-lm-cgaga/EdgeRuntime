@@ -1,5 +1,8 @@
 #include "edge_runtime/detail/consumer_impl.hpp"
 
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <cerrno>
 #include <cstring>
 #include <ctime>
@@ -9,6 +12,7 @@
 #include "edge_runtime/detail/checksum.hpp"
 #include "edge_runtime/detail/clock.hpp"
 #include "edge_runtime/detail/failpoint.hpp"
+#include "edge_runtime/detail/fd_broker.hpp"
 #include "edge_runtime/detail/futex.hpp"
 #include "edge_runtime/detail/slot_protocol.hpp"
 
@@ -82,16 +86,44 @@ Result<std::shared_ptr<ConsumerHandle>> consumer_open_impl(const ChannelOptions&
 
 	const std::string shm_name = channel_shm_name(options.name);
 	const std::string lock_path = channel_lock_path(options.name);
+	const std::string socket_path = channel_socket_path(options.name);
 	const uint32_t name_hash = channel_name_hash(options.name.c_str(), options.name.size());
+	const bool fd_mode = options.transport == Transport::kMemfdFdPass;
 
 	// ---- open + fstat ----------------------------------------------------------
-	auto fd_res = shm_open_existing(shm_name);
-	if (!fd_res) return fd_res.error();  // ENOENT -> NotFound
-	UniqueFd fd = std::move(fd_res.value());
-
+	// The transports are distinguished at object acquisition only (v0.2 §33.2):
+	// everything downstream — bootstrap/header validation, slot protocol, control
+	// lock — is byte-identical for both.
+	UniqueFd fd;
 	uint64_t dev = 0, ino = 0, size = 0;
-	auto fst = shm_fstat_and_capture(fd, &dev, &ino, &size);
-	if (!fst) return fst.error();
+	FdBrokerReplyAbi fd_reply{};
+	if (fd_mode) {
+		// Receive the one-shot fd from the broker (bounded retry, §33.6).
+		auto rf = fd_broker_request_fd(socket_path, name_hash, schema, /*readonly=*/false,
+		                               &fd_reply,
+		                               static_cast<uint64_t>(
+		                                       options.reconnect_timeout.count()));
+		if (!rf) return rf.error();
+		fd = std::move(rf.value());
+		auto fst = memfd_fstat_and_capture(fd, &dev, &ino, &size);
+		if (!fst) return fst.error();
+	} else {
+		auto fd_res = shm_open_existing(shm_name);
+		if (!fd_res) {
+			// Explicit transport-mismatch diagnosis (v0.2 §33.2): a fd-pass
+			// channel has no shm name but does have a broker socket.
+			struct stat st {};
+			if (fd_res.error().code == ErrorCode::kNotFound &&
+			    ::stat(socket_path.c_str(), &st) == 0) {
+				return make_error(ErrorCode::kInvalidOptions, "Consumer::open",
+				                  "channel is fd-pass; use Transport::kMemfdFdPass");
+			}
+			return fd_res.error();  // ENOENT -> NotFound
+		}
+		fd = std::move(fd_res.value());
+		auto fst = shm_fstat_and_capture(fd, &dev, &ino, &size);
+		if (!fst) return fst.error();
+	}
 	if (size < sizeof(BootstrapHeaderAbi)) {
 		return make_error(ErrorCode::kInitializationIncomplete, "Consumer::open",
 		                  "segment below bootstrap size");
@@ -151,14 +183,28 @@ Result<std::shared_ptr<ConsumerHandle>> consumer_open_impl(const ChannelOptions&
 		                  "journal channel mismatch");
 	}
 
-	auto again = shm_open_existing(shm_name);
-	if (!again) return again.error();
-	uint64_t adev = 0, aino = 0;
-	auto afst = shm_fstat_and_capture(again.value(), &adev, &aino, nullptr);
-	if (!afst) return afst.error();
-	if (adev != dev || aino != ino) {
-		return make_error(ErrorCode::kNameRaceDetected, "Consumer::open",
-		                  "instance replaced during open");
+	if (!fd_mode) {
+		auto again = shm_open_existing(shm_name);
+		if (!again) return again.error();
+		uint64_t adev = 0, aino = 0;
+		auto afst = shm_fstat_and_capture(again.value(), &adev, &aino, nullptr);
+		if (!afst) return afst.error();
+		if (adev != dev || aino != ino) {
+			return make_error(ErrorCode::kNameRaceDetected, "Consumer::open",
+			                  "instance replaced during open");
+		}
+	} else {
+		// v0.2 §33.6: the received fd is a one-shot grant and cannot be swapped
+		// under us — the name-inode recheck above does not exist in fd mode.
+		// Cross-check the wire record against the mapped header as the
+		// equivalent consistency guard.
+		if (fd_reply.generation != header->generation ||
+		    fd_reply.nonce_hi != header->instance_nonce_hi ||
+		    fd_reply.nonce_lo != header->instance_nonce_lo ||
+		    fd_reply.mapping_size != header->mapping_size) {
+			return make_error(ErrorCode::kTransportFailed, "Consumer::open",
+			                  "broker reply disagrees with header");
+		}
 	}
 
 	// ---- register consumer identity -----------------------------------------------
@@ -205,6 +251,7 @@ Result<std::shared_ptr<ConsumerHandle>> consumer_open_impl(const ChannelOptions&
 	const uint64_t role_epoch = cw.value();
 	shared_store_release(&header->consumer_state,
 	                     static_cast<uint32_t>(EndpointState::kOnline));
+	EDGE_FAILPOINT(C15);  // crash matrix: consumer registered, handle not built
 
 	// ---- build handle ---------------------------------------------------------------
 	auto handle = std::make_shared<ConsumerHandle>();
@@ -215,6 +262,7 @@ Result<std::shared_ptr<ConsumerHandle>> consumer_open_impl(const ChannelOptions&
 	handle->shm.ino = ino;
 	handle->shm.size = size;
 	handle->channel_name = options.name;
+	handle->transport = options.transport;
 	handle->generation = header->generation;
 	handle->role_epoch = role_epoch;
 	handle->instance_nonce_hi = header->instance_nonce_hi;
@@ -345,7 +393,9 @@ Result<ReadSnapshot> consumer_try_read_latest_impl(const std::shared_ptr<Consume
 namespace {
 // §15.5 wait-timeout classification: producer liveness decides whether the
 // timeout means "alive but idle" (DataStale), "gone" (ProducerOffline), or
-// "cannot verify" (RecoveryBlocked — fail closed, never guess).
+// "cannot verify" (RecoveryBlocked — fail closed, never guess). v0.2 §34 adds
+// the heartbeat branch: alive + heartbeat enabled + no fresh publish + no fresh
+// heartbeat -> ProducerStalled (an observation only; never a takeover grant).
 Result<ReadSnapshot> classify_wait_timeout(const std::shared_ptr<ConsumerHandle>&,
                                            ChannelHeaderAbi* header) noexcept {
 	const uint32_t pstate = shared_load_acquire(&header->producer_state);
@@ -368,9 +418,27 @@ Result<ReadSnapshot> classify_wait_timeout(const std::shared_ptr<ConsumerHandle>
 		                  "producer identity unknown");
 	}
 	switch (probe_liveness(pid_abi.pid, pid_abi.proc_start_ticks)) {
-		case Liveness::kAlive:
+		case Liveness::kAlive: {
+			// v0.2 §34.3 heartbeat classification, in order (read-only paths):
+			const uint64_t interval =
+			        shared_load_acquire(&header->producer_heartbeat_interval_ns);
+			const uint64_t now = boottime_now_ns();
+			const uint64_t last_publish =
+			        shared_load_acquire(&header->last_publish_boot_ns);
+			const uint64_t last_beat = shared_load_acquire(&header->heartbeat_boot_ns);
+			// 1. Heartbeat disabled: v0.1 semantics unchanged.
+			// 2. Data still advancing: normal DataStale.
+			// 3. Heartbeat enabled and stale beyond 3x the interval: stalled.
+			// 4. Otherwise: within tolerance, plain DataStale.
+			if (interval != 0 && now != 0 &&
+			    (last_publish == 0 || now - last_publish > interval) &&
+			    (last_beat == 0 || now - last_beat > interval * kHeartbeatStallFactor)) {
+				return make_error(ErrorCode::kProducerStalled, "Consumer::wait_latest",
+				                  "producer alive, heartbeat stale");
+			}
 			return make_error(ErrorCode::kDataStale, "Consumer::wait_latest",
 			                  "producer alive but no new sample");
+		}
 		case Liveness::kExited:
 			return make_error(ErrorCode::kProducerOffline, "Consumer::wait_latest",
 			                  "producer exited");
@@ -439,18 +507,22 @@ Result<ReadSnapshot> consumer_wait_latest_impl(const std::shared_ptr<ConsumerHan
 }
 
 Result<ChannelStatus> consumer_status_impl(const std::shared_ptr<ConsumerHandle>& handle) noexcept {
-	const std::string shm_name = channel_shm_name(handle->channel_name);
-	auto re = shm_open_existing(shm_name);
-	if (!re) {
-		return make_error(ErrorCode::kStaleHandle, "Consumer::status", "channel name gone");
+	if (handle->transport == Transport::kPosixShm) {
+		const std::string shm_name = channel_shm_name(handle->channel_name);
+		auto re = shm_open_existing(shm_name);
+		if (!re) {
+			return make_error(ErrorCode::kStaleHandle, "Consumer::status",
+			                  "channel name gone");
+		}
+		uint64_t dev = 0, ino = 0;
+		auto fst = shm_fstat_and_capture(re.value(), &dev, &ino, nullptr);
+		if (!fst) return fst.error();
+		if (dev != handle->shm.dev || ino != handle->shm.ino) {
+			return make_error(ErrorCode::kStaleHandle, "Consumer::status",
+			                  "instance replaced under name");
+		}
 	}
-	uint64_t dev = 0, ino = 0;
-	auto fst = shm_fstat_and_capture(re.value(), &dev, &ino, nullptr);
-	if (!fst) return fst.error();
-	if (dev != handle->shm.dev || ino != handle->shm.ino) {
-		return make_error(ErrorCode::kStaleHandle, "Consumer::status",
-		                  "instance replaced under name");
-	}
+	// fd mode (v0.2 §33.6): the mapping IS the one-shot identity.
 	auto* base = static_cast<std::byte*>(handle->shm.mapping.get());
 	return read_channel_status(base);
 }

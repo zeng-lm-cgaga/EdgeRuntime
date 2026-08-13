@@ -66,7 +66,9 @@ Result<void> validate_bootstrap_parse(const BootstrapHeaderAbi& boot, uint64_t s
 		return make_error(ErrorCode::kCorruptHeader, "validate_bootstrap_parse",
 		                  "bootstrap magic");
 	}
-	if (boot.abi_major != kAbiMajor || boot.abi_minor != kAbiMinor) {
+	if (boot.abi_major != kAbiMajor || boot.abi_minor > kAbiMinorMax) {
+		// v0.2 §8.3: minor is accept-anything-<=kAbiMinorMax; minor 1 only ever
+		// means "optional heartbeat fields are meaningful" (pure addition).
 		return make_error(ErrorCode::kAbiMismatch, "validate_bootstrap_parse",
 		                  "bootstrap abi");
 	}
@@ -95,7 +97,7 @@ Result<void> validate_header_parse(const ChannelHeaderAbi& h, const SchemaDescri
 		return make_error(ErrorCode::kCorruptHeader, "validate_header_parse",
 		                  "header magic");
 	}
-	if (h.abi_major != kAbiMajor || h.abi_minor != kAbiMinor) {
+	if (h.abi_major != kAbiMajor || h.abi_minor > kAbiMinorMax) {
 		return make_error(ErrorCode::kAbiMismatch, "validate_header_parse", "header abi");
 	}
 	if (h.header_size != sizeof(ChannelHeaderAbi)) {
@@ -226,6 +228,9 @@ Result<ChannelStatus> read_channel_status(std::byte* base) noexcept {
 	st.publish_count = shared_load_acquire(&header->publish_count);
 	st.read_count = shared_load_acquire(&header->read_count);
 	st.last_publish_boot_ns = shared_load_acquire(&header->last_publish_boot_ns);
+	st.heartbeat_boot_ns = shared_load_acquire(&header->heartbeat_boot_ns);
+	st.producer_heartbeat_interval_ns =
+	        shared_load_acquire(&header->producer_heartbeat_interval_ns);
 
 	auto p = identity_snapshot_read(&header->producer);
 	if (p) {

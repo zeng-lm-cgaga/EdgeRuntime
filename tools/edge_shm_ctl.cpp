@@ -14,6 +14,7 @@
 // Exit codes: 0 success, 1 inspect-only "not present", 2 refused/failed.
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <cinttypes>
 #include <cstdint>
@@ -21,9 +22,11 @@
 #include <cstring>
 #include <string>
 
+#include "edge_runtime/channel_options.hpp"
 #include "edge_runtime/detail/channel_abi.hpp"
 #include "edge_runtime/detail/channel_layout.hpp"
 #include "edge_runtime/detail/control_lock.hpp"
+#include "edge_runtime/detail/fd_broker.hpp"
 #include "edge_runtime/detail/process_identity.hpp"
 #include "edge_runtime/detail/shared_atomic.hpp"
 #include "edge_runtime/detail/shm_object.hpp"
@@ -34,6 +37,7 @@
 namespace {
 
 using edge_runtime::ErrorCode;
+using edge_runtime::Transport;
 using edge_runtime::to_string;
 namespace detail = edge_runtime::detail;
 
@@ -136,6 +140,7 @@ void print_identity_line(const char* tag,
 int cmd_inspect(const std::string& channel_name) {
 	const std::string shm_name = detail::channel_shm_name(channel_name);
 	const std::string lock_path = detail::channel_lock_path(channel_name);
+	const std::string socket_path = detail::channel_socket_path(channel_name);
 	std::printf("OBJECT name=%s\n", shm_name.c_str());
 
 	// Control lock + journal first: a consistent cross-check for the header dump
@@ -148,20 +153,50 @@ int cmd_inspect(const std::string& channel_name) {
 		return 1;
 	}
 	auto lock = std::move(lock_res.value());
+	uint32_t journal_transport = 0;
 	auto jr = lock.read_journal();
 	if (jr) {
 		const detail::ControlJournalV1& j = jr.value();
+		journal_transport = j.transport;
 		std::printf("JOURNAL state=%s target_ino=%" PRIu64 " gen_old=%" PRIu64
 		            " gen_new=%" PRIu64 " nonce_old=%016" PRIx64 "%016" PRIx64
-		            " nonce_new=%016" PRIx64 "%016" PRIx64 " creator_pid=%" PRIu64 "\n",
+		            " nonce_new=%016" PRIx64 "%016" PRIx64 " creator_pid=%" PRIu64
+		            " transport=%s\n",
 		            journal_state_name(j.state), j.target_ino, j.old_generation,
 		            j.new_generation, j.old_nonce_hi, j.old_nonce_lo, j.new_nonce_hi,
-		            j.new_nonce_lo, j.creator.pid);
+		            j.new_nonce_lo, j.creator.pid,
+		            j.transport == static_cast<uint32_t>(Transport::kMemfdFdPass)
+		                    ? "fd_pass"
+		                    : "posix");
 	} else {
 		std::printf("JOURNAL read_failed code=%s\n", to_string(jr.error().code));
 	}
 
 	auto fd_res = detail::shm_open_existing(shm_name);
+	bool fd_mode = false;
+	if (!fd_res && fd_res.error().code == ErrorCode::kNotFound) {
+		// v0.2 fd-pass channel: no shm name; the broker socket is the only
+		// reachability point. Ask it for a READONLY fd (design §33.6).
+		const bool is_fd_channel =
+		        journal_transport == static_cast<uint32_t>(Transport::kMemfdFdPass) ||
+		        (::access(socket_path.c_str(), F_OK) == 0);
+		if (is_fd_channel) {
+			edge_runtime::SchemaDescriptor any{};
+			const uint32_t hash =
+			        detail::channel_name_hash(channel_name.c_str(), channel_name.size());
+			detail::FdBrokerReplyAbi reply{};
+			auto rf = detail::fd_broker_request_fd(socket_path, hash, any,
+			                                       /*readonly=*/true, &reply, 500);
+			if (!rf) {
+				std::printf("STATUS broker_failed code=%s (fd-pass channel; the "
+				            "producer process is gone — journal-only report)\n",
+				            to_string(rf.error().code));
+				return 1;
+			}
+			fd_res = edge_runtime::Result<detail::UniqueFd>(std::move(rf.value()));
+			fd_mode = true;
+		}
+	}
 	if (!fd_res) {
 		if (fd_res.error().code == ErrorCode::kNotFound) {
 			std::printf("STATUS not_found\n");
@@ -177,15 +212,16 @@ int cmd_inspect(const std::string& channel_name) {
 	struct stat st {};
 	if (::fstat(fd.get(), &st) == 0) {
 		std::printf("OBJECT inode=%" PRIu64 " dev=%" PRIu64 " size=%" PRIu64
-		            " mode=%04o uid=%u\n",
+		            " mode=%04o uid=%u transport=%s\n",
 		            static_cast<uint64_t>(st.st_ino), static_cast<uint64_t>(st.st_dev),
 		            static_cast<uint64_t>(st.st_size),
 		            static_cast<unsigned>(st.st_mode & 07777u),
-		            static_cast<unsigned>(st.st_uid));
+		            static_cast<unsigned>(st.st_uid), fd_mode ? "fd_pass" : "posix");
 	}
 
 	uint64_t dev = 0, ino = 0, size = 0;
-	auto fst = detail::shm_fstat_and_capture(fd, &dev, &ino, &size);
+	auto fst = fd_mode ? detail::memfd_fstat_and_capture(fd, &dev, &ino, &size)
+	                   : detail::shm_fstat_and_capture(fd, &dev, &ino, &size);
 	if (!fst) {
 		std::printf("STATUS fstat_failed code=%s\n", to_string(fst.error().code));
 		return 1;
@@ -215,7 +251,8 @@ int cmd_inspect(const std::string& channel_name) {
 		return 0;
 	}
 
-	auto mm = detail::mmap_region(fd, size);
+	auto mm = fd_mode ? detail::mmap_region_readonly(fd, size)
+	                  : detail::mmap_region(fd, size);
 	if (!mm) {
 		std::printf("STATUS mmap_failed code=%s errno=%d\n", to_string(mm.error().code),
 		            mm.error().errno_value);
@@ -351,6 +388,36 @@ int cmd_remove(const std::string& channel_name, bool has_expect_gen, uint64_t ex
 	if (journal.channel_hash != 0 && journal.channel_hash != name_hash) {
 		std::printf("REFUSE journal_channel_mismatch\n");
 		return 2;
+	}
+
+	// v0.2 fd-pass channel (design §33.6): no shm name — the object dies with
+	// its producer, so removal is journal-only. If the recorded creator is still
+	// alive, refuse (the object still exists inside it).
+	if (journal.transport == static_cast<uint32_t>(Transport::kMemfdFdPass)) {
+		if (journal.creator.pid != 0) {
+			const detail::Liveness lv =
+			        detail::probe_liveness(journal.creator.pid, journal.creator.proc_start_ticks);
+			if (lv == detail::Liveness::kAlive) {
+				std::printf("REFUSE producer_alive pid=%" PRIu64
+				            " (fd-pass channel: object dies with creator)\n",
+				            journal.creator.pid);
+				return 2;
+			}
+			if (lv == detail::Liveness::kUnverifiable) {
+				std::printf("REFUSE producer_unverifiable\n");
+				return 2;
+			}
+		}
+		// Creator dead: the object is already gone; reconcile the journal to Idle.
+		auto idle = detail::make_control_journal(channel_name, detail::JournalState::kIdle,
+		                                         0, 0, 0, 0, 0, 0,
+		                                         detail::current_process_identity());
+		idle.transport = static_cast<uint32_t>(Transport::kMemfdFdPass);
+		(void)lock.write_journal(idle);
+		std::printf("REMOVED fd_pass channel=%s (object dies with creator; journal "
+		            "reconciled)\n",
+		            channel_name.c_str());
+		return 0;
 	}
 
 	auto fd_res = detail::shm_open_existing(shm_name);

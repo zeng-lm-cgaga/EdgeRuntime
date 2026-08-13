@@ -18,6 +18,8 @@ using edge_runtime::detail::BootstrapHeaderAbi;
 using edge_runtime::detail::channel_lock_path;
 using edge_runtime::detail::channel_shm_name;
 using edge_runtime::detail::ChannelHeaderAbi;
+using edge_runtime::detail::kAbiMinor;
+using edge_runtime::detail::kAbiMinorMax;
 using edge_runtime::detail::kChannelHeaderOffset;
 using edge_runtime::detail::kFirstSlotOffset;
 using edge_runtime::detail::kMaxPayloadSize;
@@ -66,6 +68,13 @@ TEST(AbiLayout, HeaderOffsets) {  // U04
 	EXPECT_EQ(offsetof(ChannelHeaderAbi, producer_state), 272u);
 	EXPECT_EQ(offsetof(ChannelHeaderAbi, publish_count), 280u);
 	EXPECT_EQ(offsetof(ChannelHeaderAbi, last_publish_boot_ns), 296u);
+	// v0.2 §34: heartbeat fields occupy the former trailing padding; the struct
+	// size stays 320 so every v0.1 offset above is unchanged.
+	EXPECT_EQ(offsetof(ChannelHeaderAbi, heartbeat_boot_ns), 304u);
+	EXPECT_EQ(offsetof(ChannelHeaderAbi, producer_heartbeat_interval_ns), 312u);
+	EXPECT_EQ(sizeof(ChannelHeaderAbi), 320u);
+	EXPECT_EQ(kAbiMinor, 0u);     // written when heartbeat is disabled
+	EXPECT_EQ(kAbiMinorMax, 1u);  // minor 1 == optional heartbeat
 }
 
 TEST(AbiLayout, SlotOffsets) {  // U04

@@ -103,6 +103,10 @@ Result<void> shm_truncate(const UniqueFd& fd, uint64_t size);
 
 Result<MappedRegion> mmap_region(const UniqueFd& fd, uint64_t size);
 
+// Read-only mapping for a fd granted with read-only access (v0.2 §33.4: ctl
+// inspect via the broker). PROT_READ only; writing through it would SIGSEGV.
+Result<MappedRegion> mmap_region_readonly(const UniqueFd& fd, uint64_t size);
+
 // fstat validation: owner uid == euid, mode 0600, regular file; captures
 // st_dev/st_ino/st_size. Fails closed on any mismatch.
 Result<void> shm_fstat_and_capture(const UniqueFd& fd, uint64_t* dev, uint64_t* ino,
@@ -113,6 +117,13 @@ Result<void> shm_fstat_and_capture(const UniqueFd& fd, uint64_t* dev, uint64_t* 
 // name is a race -> NameRaceDetected, never touched.
 Result<void> shm_unlink_checked(const std::string& posix_name, uint64_t expected_dev,
                                 uint64_t expected_ino);
+
+// fstat validation for a memfd-backed object (v0.2, design §33.3). memfd fstat
+// mode is typically 0700, so the exact-0600 rule of shm_fstat_and_capture does
+// not apply; instead: regular file, owner uid == euid, and no group/other
+// write/execute bits. Captures st_dev/st_ino/st_size.
+Result<void> memfd_fstat_and_capture(const UniqueFd& fd, uint64_t* dev, uint64_t* ino,
+                                     uint64_t* size);
 
 }  // namespace edge_runtime::detail
 

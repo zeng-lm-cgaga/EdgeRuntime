@@ -47,6 +47,7 @@ struct Args {
 	uint64_t use_wait_ms = 0;          // >0: wait_latest(ms) instead of polling (ER3)
 	bool checksum = true;
 	bool use_v2 = false;
+	edge_runtime::Transport transport{edge_runtime::Transport::kPosixShm};
 };
 
 template <typename T>
@@ -55,6 +56,7 @@ int run_consume(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 	edge_runtime::ChannelOptions opts;
 	opts.name = a.name;
 	opts.enable_payload_checksum = a.checksum;
+	opts.transport = a.transport;
 
 	// ---- open with retry while the producer is absent or mid-create (I04) ------
 	// NotFound: no channel yet. InitializationIncomplete: the bootstrap is
@@ -68,7 +70,10 @@ int run_consume(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 	if (!consumer &&
 	    (consumer.error().code == edge_runtime::ErrorCode::kNotFound ||
 	     consumer.error().code == edge_runtime::ErrorCode::kInitializationIncomplete ||
-	     consumer.error().code == edge_runtime::ErrorCode::kCorruptHeader) &&
+	     consumer.error().code == edge_runtime::ErrorCode::kCorruptHeader ||
+	     // v0.2 fd-pass: the broker is unreachable while the producer is absent
+	     // or mid-create — same "not ready yet" family, retry it (design §33.6).
+	     consumer.error().code == edge_runtime::ErrorCode::kProducerOffline) &&
 	    a.open_retry_ms > 0) {
 		const int64_t deadline_ms =
 		        monotonic_ms_now() + static_cast<int64_t>(a.open_retry_ms);
@@ -137,10 +142,12 @@ int run_consume(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 			// (NoNewSample/ReadContention are consumed inside the wait loop). The
 			// timeout classifications are a clean, informative end: the producer
 			// liveness decided the outcome (alive-but-idle -> DataStale, offline/dead
-			// -> ProducerOffline, unverifiable -> RecoveryBlocked).
+			// -> ProducerOffline, unverifiable -> RecoveryBlocked, v0.2 alive-but-
+			// stalled -> ProducerStalled).
 			if (ec == edge_runtime::ErrorCode::kDataStale ||
 			    ec == edge_runtime::ErrorCode::kProducerOffline ||
-			    ec == edge_runtime::ErrorCode::kRecoveryBlocked) {
+			    ec == edge_runtime::ErrorCode::kRecoveryBlocked ||
+			    ec == edge_runtime::ErrorCode::kProducerStalled) {
 				timed_out = 1;
 				last_error = edge_runtime::to_string(ec);
 				break;
@@ -207,6 +214,12 @@ int main(int argc, char** argv) {
 	a.seq_start = edge_tool::arg_u64(argc, argv, "--seq-start", 0);
 	a.use_wait_ms = edge_tool::arg_u64(argc, argv, "--use-wait-ms", 0);
 	a.checksum = edge_tool::arg_u64(argc, argv, "--checksum", 1) != 0;
+	{
+		const char* transport_arg = edge_tool::arg_value(argc, argv, "--transport");
+		if (transport_arg != nullptr && std::string(transport_arg) == "fd") {
+			a.transport = edge_runtime::Transport::kMemfdFdPass;
+		}
+	}
 
 	if (a.name.empty()) {
 		std::fprintf(stderr,
@@ -216,7 +229,7 @@ int main(int argc, char** argv) {
 		             "[--reads N] [--expect-last-seq N] "
 		             "[--read-interval-ms N] [--read-timeout-ms N] "
 		             "[--open-retry-ms N] [--seq-start N] "
-		             "[--use-wait-ms N] [--checksum 0|1]\n");
+		             "[--use-wait-ms N] [--checksum 0|1] [--transport fd|posix]\n");
 		return 2;
 	}
 

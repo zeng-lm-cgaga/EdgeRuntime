@@ -67,3 +67,35 @@ add_test(
           $<TARGET_FILE:edge_shm_producer>
           $<TARGET_FILE:edge_shm_consumer>)
 set_tests_properties(recovery_er4 PROPERTIES TIMEOUT 90 LABELS integration)
+
+# ER10 v0.2 fd-pass transport driver (F1-F4): fork+execs the tool binaries and
+# inspects via edge_shm_ctl's readonly broker fd.
+add_executable(fd_transport_test fd_transport_test.cpp)
+edgeruntime_apply_project_options(fd_transport_test)
+target_link_libraries(
+  fd_transport_test PRIVATE edge_runtime GTest::gtest_main Threads::Threads rt)
+target_include_directories(
+  fd_transport_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
+
+add_test(
+  NAME fd_transport_er10
+  COMMAND fd_transport_test
+          $<TARGET_FILE:edge_shm_producer>
+          $<TARGET_FILE:edge_shm_consumer>
+          $<TARGET_FILE:edge_shm_ctl>)
+set_tests_properties(fd_transport_er10 PROPERTIES TIMEOUT 120 LABELS integration)
+
+# ER11 v0.2 heartbeat driver (H1/H2): SIGSTOP-freeze vs healthy heartbeat loop.
+add_executable(heartbeat_test heartbeat_test.cpp)
+edgeruntime_apply_project_options(heartbeat_test)
+target_link_libraries(
+  heartbeat_test PRIVATE edge_runtime GTest::gtest_main Threads::Threads rt)
+target_include_directories(
+  heartbeat_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
+
+add_test(
+  NAME heartbeat_er11
+  COMMAND heartbeat_test
+          $<TARGET_FILE:edge_shm_producer>
+          $<TARGET_FILE:edge_shm_consumer>)
+set_tests_properties(heartbeat_er11 PROPERTIES TIMEOUT 90 LABELS integration)

@@ -67,6 +67,7 @@ add_library(edge_runtime STATIC
   src/edge_runtime/detail/consumer_impl.cpp
   src/edge_runtime/detail/control_lock.cpp
   src/edge_runtime/detail/failpoint.cpp
+  src/edge_runtime/detail/fd_broker.cpp
   src/edge_runtime/detail/futex.cpp
   src/edge_runtime/detail/process_identity.cpp
   src/edge_runtime/detail/producer_impl.cpp

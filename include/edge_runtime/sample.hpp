@@ -58,6 +58,9 @@ struct ChannelStatus {
 	uint64_t consumer_pid{0};
 	bool producer_alive{false};
 	bool consumer_alive{false};
+	// v0.2 optional heartbeat (design §34)
+	uint64_t heartbeat_boot_ns{0};
+	uint64_t producer_heartbeat_interval_ns{0};
 };
 
 }  // namespace edge_runtime

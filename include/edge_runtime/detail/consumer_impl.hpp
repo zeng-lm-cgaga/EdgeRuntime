@@ -24,6 +24,7 @@ namespace edge_runtime::detail {
 struct ConsumerHandle {
 	ShmObject shm;
 	std::string channel_name;
+	Transport transport{Transport::kPosixShm};
 	uint64_t generation{0};
 	uint64_t role_epoch{0};  // consumer's own even role_epoch
 	uint64_t instance_nonce_hi{0};

@@ -22,3 +22,4 @@ edgeruntime_unit_test(slot_protocol_test)     # U07/U09/U14 slot machine
 edgeruntime_unit_test(futex_test)             # U10 futex wait/wake/EAGAIN/EINTR/timeout
 edgeruntime_unit_test(clock_test)             # §15.7 deadline + remaining-time helpers
 edgeruntime_unit_test(failpoint_test)         # §20.3 registry + env modes + hit counting
+edgeruntime_unit_test(fd_broker_test)         # v0.2 §33 wire record layouts + checksum

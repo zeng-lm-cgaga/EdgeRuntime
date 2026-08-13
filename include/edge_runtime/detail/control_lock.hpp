@@ -40,7 +40,10 @@ struct alignas(64) ControlJournalV1 {
 	uint64_t new_nonce_lo;       // 80
 	ProcessIdentityAbi creator;  // 128 (aligned to 64)
 	uint64_t record_checksum;    // 192
-	uint8_t reserved[56];        // 200
+	// v0.2 (design §7.3): transport occupies the first 4 bytes of the former
+	// reserved tail. Journal version stays 1; old records read 0 == kPosixShm.
+	uint32_t transport;   // 200
+	uint8_t reserved[52];  // 204
 };
 static_assert(sizeof(ControlJournalV1) == kJournalRecordSize, "journal record size");
 static_assert(offsetof(ControlJournalV1, channel_hash) == 12, "journal channel_hash");
@@ -48,6 +51,7 @@ static_assert(offsetof(ControlJournalV1, target_dev) == 24, "journal target_dev"
 static_assert(offsetof(ControlJournalV1, target_ino) == 32, "journal target_ino");
 static_assert(offsetof(ControlJournalV1, creator) == 128, "journal creator");
 static_assert(offsetof(ControlJournalV1, record_checksum) == 192, "journal checksum");
+static_assert(offsetof(ControlJournalV1, transport) == 200, "journal transport");
 
 // Checksum over the whole record with the checksum field zeroed.
 uint64_t journal_checksum(const ControlJournalV1& journal) noexcept;

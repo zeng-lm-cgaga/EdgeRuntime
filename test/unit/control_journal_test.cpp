@@ -7,6 +7,7 @@
 
 #include <string>
 
+#include "edge_runtime/channel_options.hpp"
 #include "edge_runtime/detail/channel_abi.hpp"
 #include "edge_runtime/detail/control_lock.hpp"
 #include "edge_runtime/detail/process_identity.hpp"
@@ -90,6 +91,10 @@ TEST(ControlJournal, LockRoundTrip) {  // U13
 		EXPECT_EQ(rec.creator.pid, static_cast<uint64_t>(getpid()));
 		// checksum validates against the record as read back
 		EXPECT_EQ(journal_checksum(rec), rec.record_checksum);
+		// v0.2 §7.3: transport defaults to posix in fresh records (old binary
+		// compatibility — a v0.1 record reads as transport 0).
+		EXPECT_EQ(rec.transport, static_cast<uint32_t>(edge_runtime::Transport::kPosixShm));
+		EXPECT_EQ(offsetof(ControlJournalV1, transport), 200u);
 
 		// cleanup: return the journal to idle so later tests see a clean channel
 		edge_runtime::detail::ProcessIdentity creator_id;
@@ -100,6 +105,37 @@ TEST(ControlJournal, LockRoundTrip) {  // U13
 		auto back = make_control_journal(name, JournalState::kIdle, 2, 2, 5, 6, 5, 6,
 		                                 creator_id);
 		ASSERT_TRUE(lock.write_journal(back));
+	}
+}
+
+TEST(ControlJournal, TransportFieldRoundTrip) {  // v0.2 §7.3
+	const std::string name = "ctrl_tr_" + std::to_string(getpid());
+	const std::string path = channel_lock_path(name);
+
+	{
+		auto lock_res = ControlLock::acquire(path);
+		ASSERT_TRUE(lock_res);
+		ControlLock lock = std::move(lock_res.value());
+		const auto creator = current_process_identity();
+		auto rec = make_control_journal(name, JournalState::kIdle, 0, 1, 0, 0, 7, 8, creator);
+		rec.transport = static_cast<uint32_t>(edge_runtime::Transport::kMemfdFdPass);
+		ASSERT_TRUE(lock.write_journal(rec));
+	}
+
+	{
+		auto lock_res = ControlLock::acquire(path);
+		ASSERT_TRUE(lock_res);
+		ControlLock lock = std::move(lock_res.value());
+		auto rd = lock.read_journal();
+		ASSERT_TRUE(rd);
+		EXPECT_EQ(rd.value().transport,
+		          static_cast<uint32_t>(edge_runtime::Transport::kMemfdFdPass));
+		EXPECT_EQ(rd.value().new_generation, 1u);
+		// the transport field is inside the checksummed record: tampering must
+		// be detected (journal_checksum covers the whole record).
+		auto tampered = rd.value();
+		tampered.transport = 0;
+		EXPECT_NE(journal_checksum(tampered), tampered.record_checksum);
 	}
 }
 

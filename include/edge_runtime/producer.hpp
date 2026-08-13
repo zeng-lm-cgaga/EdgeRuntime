@@ -23,6 +23,7 @@ Result<ChannelStatus> producer_status_impl(const std::shared_ptr<ProducerHandle>
 uint64_t producer_generation_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
 void producer_shutdown_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
 Result<void> producer_remove_if_owner_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
+Result<void> producer_heartbeat_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
 
 }  // namespace edge_runtime::detail
 
@@ -73,6 +74,14 @@ class Producer {
 	// implicitly from the destructor.
 	Result<void> remove_if_owner() noexcept {
 		return detail::producer_remove_if_owner_impl(handle_);
+	}
+
+	// v0.2 optional heartbeat (design §34): declare "the application is still
+	// making progress" between publishes. No-op data-wise when the channel was
+	// created with heartbeat disabled; otherwise stores BOOTTIME into
+	// heartbeat_boot_ns under the same stale guards as publish().
+	Result<void> heartbeat() noexcept {
+		return detail::producer_heartbeat_impl(handle_);
 	}
 
 	Producer(const Producer&) = delete;

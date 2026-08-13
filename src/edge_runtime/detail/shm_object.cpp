@@ -49,6 +49,15 @@ Result<MappedRegion> mmap_region(const UniqueFd& fd, uint64_t size) {
 	return Result<MappedRegion>(MappedRegion(addr, static_cast<size_t>(size)));
 }
 
+Result<MappedRegion> mmap_region_readonly(const UniqueFd& fd, uint64_t size) {
+	void* addr = ::mmap(nullptr, static_cast<size_t>(size), PROT_READ, MAP_SHARED, fd.get(), 0);
+	if (addr == MAP_FAILED) {
+		return make_error(classify_errno(errno), "mmap_region_readonly",
+		                  std::strerror(errno));
+	}
+	return Result<MappedRegion>(MappedRegion(addr, static_cast<size_t>(size)));
+}
+
 Result<void> shm_fstat_and_capture(const UniqueFd& fd, uint64_t* dev, uint64_t* ino,
                                    uint64_t* size) {
 	struct stat st {};
@@ -66,6 +75,33 @@ Result<void> shm_fstat_and_capture(const UniqueFd& fd, uint64_t* dev, uint64_t* 
 	}
 	if ((st.st_mode & 0777) != kExpectedShmMode) {
 		return make_error(ErrorCode::kPermissionDenied, "shm_fstat_and_capture",
+		                  "unexpected mode");
+	}
+	if (dev != nullptr) *dev = static_cast<uint64_t>(st.st_dev);
+	if (ino != nullptr) *ino = static_cast<uint64_t>(st.st_ino);
+	if (size != nullptr) *size = static_cast<uint64_t>(st.st_size);
+	return Result<void>::ok();
+}
+
+Result<void> memfd_fstat_and_capture(const UniqueFd& fd, uint64_t* dev, uint64_t* ino,
+                                     uint64_t* size) {
+	struct stat st {};
+	if (::fstat(fd.get(), &st) != 0) {
+		return make_error(classify_errno(errno), "memfd_fstat_and_capture",
+		                  std::strerror(errno));
+	}
+	if (!S_ISREG(st.st_mode)) {
+		return make_error(ErrorCode::kCorruptHeader, "memfd_fstat_and_capture",
+		                  "not a regular file");
+	}
+	if (st.st_uid != geteuid()) {
+		return make_error(ErrorCode::kPermissionDenied, "memfd_fstat_and_capture",
+		                  "owner uid mismatch");
+	}
+	// memfd mode is typically 0700; forbid group/other write+execute (design §33.3).
+	const mode_t forbidden = static_cast<mode_t>(S_IWGRP | S_IXGRP | S_IWOTH | S_IXOTH);
+	if ((st.st_mode & forbidden) != 0) {
+		return make_error(ErrorCode::kPermissionDenied, "memfd_fstat_and_capture",
 		                  "unexpected mode");
 	}
 	if (dev != nullptr) *dev = static_cast<uint64_t>(st.st_dev);

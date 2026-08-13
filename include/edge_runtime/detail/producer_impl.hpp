@@ -1,11 +1,15 @@
 #ifndef EDGE_RUNTIME_DETAIL_PRODUCER_IMPL_HPP
 #define EDGE_RUNTIME_DETAIL_PRODUCER_IMPL_HPP
 
+#include <sys/socket.h>
+
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include "edge_runtime/channel_options.hpp"
 #include "edge_runtime/detail/process_identity.hpp"
@@ -30,6 +34,36 @@ struct ProducerHandle {
 	uint32_t schema_version{0};
 	uint32_t payload_size{0};
 	ProcessIdentity self{};
+
+	// v0.2 fd-pass transport (design §33). Members are declared AFTER shm
+	// (whose mapping the serving thread reads) so destruction joins the thread
+	// before munmap runs.
+	Transport transport{Transport::kPosixShm};
+	uint32_t channel_hash{0};  // frozen for the serving thread (never a local)
+	std::string socket_path;
+	UniqueFd listen_fd;
+	std::atomic<bool> serve_stop{false};
+	std::thread server_thread;
+	bool socket_unlinked{false};
+
+	// v0.2 optional heartbeat (design §34): frozen interval in ns (0 = off).
+	uint64_t heartbeat_interval_ns{0};
+
+	~ProducerHandle() {
+		// Join the serving thread before the mapping dies (design §18.2). The
+		// wake uses shutdown(), never close(): close would leave a fd number a
+		// concurrent accept could reuse.
+		if (server_thread.joinable()) {
+			serve_stop.store(true, std::memory_order_relaxed);
+			if (listen_fd.get() >= 0) {
+				(void)::shutdown(listen_fd.get(), SHUT_RDWR);
+			}
+			server_thread.join();
+		}
+	}
+	ProducerHandle(const ProducerHandle&) = delete;
+	ProducerHandle& operator=(const ProducerHandle&) = delete;
+	ProducerHandle() = default;
 };
 
 // Full §9.1 create sequence. payload_size comes from PayloadCodec<T> at the
@@ -60,6 +94,10 @@ void producer_shutdown_impl(const std::shared_ptr<ProducerHandle>& handle) noexc
 
 // Explicit, verified removal (§9.4 inode-checked unlink + journal REMOVING).
 Result<void> producer_remove_if_owner_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
+
+// v0.2 optional heartbeat (design §34): application-declared making-progress.
+// Same stale guards as publish; only ever writes heartbeat_boot_ns.
+Result<void> producer_heartbeat_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
 
 }  // namespace edge_runtime::detail
 

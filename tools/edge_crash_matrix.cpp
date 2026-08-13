@@ -36,8 +36,10 @@
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -926,6 +928,250 @@ static bool run_c13(CaseDriver& d) {
 	return d.ok();
 }
 
+// ---- v0.2 fd-pass + heartbeat cases (C14-C18) --------------------------------
+
+// C14: fd producer crashes inside the serving loop right after handing out one
+// fd. The socket survives (crash leaves a stale socket); consumers get bounded
+// ProducerOffline, ctl falls back to a journal-only report, and a successor
+// producer probes the stale socket, unlinks it, and rebinds at generation+1
+// (design §33.5).
+static bool run_c14(CaseDriver& d) {
+	d.begin_case("C14",
+	             "fd producer dies in serve_loop after one hand-out: consumer "
+	             "bounded-retry -> ProducerOffline, stale socket probe -> "
+	             "successor rebinds gen+1");
+	const std::string name = d.channel_name("c14");
+
+	CrashChild victim;
+	if (!victim.spawn({d.prod_bin, "--name", name, "--transport", "fd",
+	                   "--interval-us", "50000"},
+	                  fp_env("C14", nullptr))) {
+		d.fail("C14 victim spawn failed");
+		d.finish_case(gen_pids_line("C14", victim));
+		return d.ok();
+	}
+	// Trigger the failpoint: a consumer request makes the server serve one fd,
+	// then SIGSTOP. The consumer itself gets its fd BEFORE the failpoint fires
+	// (the reply precedes it), so it succeeds.
+	const CommandResult first = d.run_command(
+	        {d.cons_bin, "--name", name, "--transport", "fd", "--reads", "1",
+	         "--read-interval-ms", "20", "--open-retry-ms", "8000"});
+	d.expect_contains(first.out, "SUMMARY reads=1", "C14 first consumer");
+	d.expect_contains(first.out, "torn=0", "C14 first consumer");
+
+	if (!victim.wait_stop(8000)) {
+		d.fail("C14 victim never stopped at C14");
+		d.finish_case(gen_pids_line("C14", victim));
+		return d.ok();
+	}
+	victim.kill_and_reap();
+
+	// The broker is gone but its socket remains: ctl reports journal-only.
+	const CommandResult dump = d.ctl_inspect(name);
+	d.expect_contains(dump.out, "transport=fd_pass", "C14 header_dump");
+	d.expect_contains(dump.out, "broker_failed", "C14 header_dump");
+
+	// A second consumer (bounded retry) must end in ProducerOffline, never hang.
+	const CommandResult second = d.run_command(
+	        {d.cons_bin, "--name", name, "--transport", "fd", "--reads", "1",
+	         "--open-retry-ms", "3000"});
+	d.expect_contains(second.out, "code=ProducerOffline", "C14 second consumer");
+
+	// Successor: EADDRINUSE -> probe (dead) -> unlink -> rebind -> generation+1.
+	const CommandResult rec = d.run_command(
+	        {d.prod_bin, "--name", name, "--transport", "fd", "--count", "2"});
+	d.write_evidence("recovery_result.txt",
+	                 rec.out + "EXIT " + std::to_string(rec.exit_code) + "\n");
+	d.expect_contains(rec.out, "GENERATION 2", "C14 recovery");
+	d.expect_contains(rec.out, "DONE published=2", "C14 recovery");
+	if (rec.exit_code != 0)
+		d.fail("C14 recovery producer exit " + std::to_string(rec.exit_code));
+
+	d.finish_case(gen_pids_line("C14", victim));
+	return d.ok();
+}
+
+// C15: fd consumer dies after registering its identity, before the handle is
+// built. The next open must probe it dead and reclaim its role (C07-style)
+// without blocking the producer (design §33.6 + §15.4).
+static bool run_c15(CaseDriver& d) {
+	d.begin_case("C15",
+	             "fd consumer dies after identity registration: dead identity "
+	             "reclaimed by the next open, producer keeps publishing");
+	const std::string name = d.channel_name("c15");
+
+	CrashChild prod;
+	if (!prod.spawn({d.prod_bin, "--name", name, "--transport", "fd",
+	                 "--interval-us", "20000"},
+	                {})) {
+		d.fail("C15 producer spawn failed");
+		d.finish_case(gen_pids_line("C15", prod));
+		return d.ok();
+	}
+	struct timespec wait_ts {};
+	wait_ts.tv_nsec = 400 * 1000 * 1000;  // let the producer bind + serve
+	::nanosleep(&wait_ts, nullptr);
+
+	CrashChild victim;
+	if (!victim.spawn({d.cons_bin, "--name", name, "--transport", "fd", "--reads", "1"},
+	                  fp_env("C15", nullptr)) ||
+	    !victim.wait_stop(8000)) {
+		d.fail("C15 victim never stopped at C15");
+		d.finish_case(gen_pids_line("C15", victim));
+		return d.ok();
+	}
+	victim.kill_and_reap();
+
+	const CommandResult dump = d.ctl_inspect(name);
+	d.expect_contains(dump.out, "consumer=online", "C15 header_dump");
+
+	// A fresh consumer takes the role from the dead one and reads cleanly.
+	const CommandResult rec = d.run_command(
+	        {d.cons_bin, "--name", name, "--transport", "fd", "--reads", "2",
+	         "--read-interval-ms", "20", "--open-retry-ms", "5000"});
+	d.write_evidence("recovery_result.txt",
+	                 rec.out + "EXIT " + std::to_string(rec.exit_code) + "\n");
+	d.expect_contains(rec.out, "SUMMARY reads=2", "C15 recovery");
+	d.expect_contains(rec.out, "torn=0", "C15 recovery");
+	if (rec.exit_code != 0) d.fail("C15 recovery consumer exit " + std::to_string(rec.exit_code));
+
+	prod.kill_and_reap();
+	d.finish_case(gen_pids_line("C15", victim));
+	return d.ok();
+}
+
+// C16: fd producer dies right after memfd_create (journal still PREOBJECT).
+// The object died with the creator — no residual, no unlink needed; the
+// journal reconciles to Idle and the successor numbers from it (design §33.3,
+// the fd-mode counterpart of C01).
+static bool run_c16(CaseDriver& d) {
+	d.begin_case("C16",
+	             "fd creator dies after memfd_create: object gone with creator, "
+	             "journal reconciles, successor creates gen 1");
+	const std::string name = d.channel_name("c16");
+
+	CrashChild victim;
+	if (!victim.spawn({d.prod_bin, "--name", name, "--transport", "fd", "--count", "0"},
+	                  fp_env("C16", nullptr)) ||
+	    !victim.wait_stop(8000)) {
+		d.fail("C16 victim never stopped at C16");
+		d.finish_case(gen_pids_line("C16", victim));
+		return d.ok();
+	}
+	victim.kill_and_reap();
+
+	const CommandResult dump = d.ctl_inspect(name);
+	d.expect_contains(dump.out, "JOURNAL state=creating_pre_object", "C16 header_dump");
+	d.expect_contains(dump.out, "transport=fd_pass", "C16 header_dump");
+
+	const CommandResult rec = d.run_command(
+	        {d.prod_bin, "--name", name, "--transport", "fd", "--count", "3"});
+	d.write_evidence("recovery_result.txt",
+	                 rec.out + "EXIT " + std::to_string(rec.exit_code) + "\n");
+	d.expect_contains(rec.out, "GENERATION 1", "C16 recovery");
+	d.expect_contains(rec.out, "DONE published=3", "C16 recovery");
+	if (rec.exit_code != 0)
+		d.fail("C16 recovery producer exit " + std::to_string(rec.exit_code));
+
+	// The successor exited cleanly (object dies with it); ctl remove reports the
+	// fd-pass journal-only semantics.
+	const CommandResult rm = d.run_command({d.ctl_bin, "remove", name});
+	d.expect_contains(rm.out, "REMOVED fd_pass", "C16 remove");
+
+	d.finish_case(gen_pids_line("C16", victim));
+	return d.ok();
+}
+
+// C17: a stale broker socket occupies the path (staged, no failpoint): bind
+// succeeds only after probe-dead -> unlink -> rebind (design §33.5).
+static bool run_c17(CaseDriver& d) {
+	d.begin_case("C17",
+	             "stale broker socket at the path: create probes it dead, unlinks "
+	             "and rebinds (no ghost instance, no AlreadyOwned)");
+	const std::string name = d.channel_name("c17");
+	const std::string sock = detail::channel_socket_path(name);
+
+	// Stage the stale socket: bind it and close WITHOUT ever listening.
+	{
+		const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+		if (fd < 0) {
+			d.fail("C17 stage socket failed");
+			d.finish_case(gen_pids_line("C17", CrashChild{}));
+			return d.ok();
+		}
+		struct sockaddr_un addr {};
+		addr.sun_family = AF_UNIX;
+		if (sock.size() >= sizeof(addr.sun_path)) {
+			::close(fd);
+			d.fail("C17 socket path too long");
+			d.finish_case(gen_pids_line("C17", CrashChild{}));
+			return d.ok();
+		}
+		std::memcpy(addr.sun_path, sock.c_str(), sock.size() + 1);
+		if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr),
+		           static_cast<socklen_t>(sizeof(addr))) != 0) {
+			::close(fd);
+			d.fail("C17 stage bind failed");
+			d.finish_case(gen_pids_line("C17", CrashChild{}));
+			return d.ok();
+		}
+		::close(fd);  // no listener, no accept: a dead socket stays on the path
+	}
+
+	const CommandResult rec = d.run_command(
+	        {d.prod_bin, "--name", name, "--transport", "fd", "--count", "2"});
+	d.write_evidence("recovery_result.txt",
+	                 rec.out + "EXIT " + std::to_string(rec.exit_code) + "\n");
+	d.expect_contains(rec.out, "GENERATION 1", "C17 create");
+	d.expect_contains(rec.out, "DONE published=2", "C17 create");
+	if (rec.exit_code != 0) d.fail("C17 create exit " + std::to_string(rec.exit_code));
+
+	d.finish_case(gen_pids_line("C17", CrashChild{}));
+	return d.ok();
+}
+
+// C18: heartbeat producer freezes right after writing one beat (SIGSTOP victim).
+// The consumer classifies ProducerStalled — an observation; the owner is never
+// reclaimed (design §34.3).
+static bool run_c18(CaseDriver& d) {
+	d.begin_case("C18",
+	             "producer frozen after one heartbeat: consumer wait classifies "
+	             "ProducerStalled (observation, no takeover)");
+	const std::string name = d.channel_name("c18");
+
+	CrashChild victim;
+	if (!victim.spawn({d.prod_bin, "--name", name, "--heartbeat-interval-us", "100000",
+	                   "--heartbeat-only"},
+	                  fp_env("C18", nullptr)) ||
+	    !victim.wait_stop(8000)) {
+		d.fail("C18 victim never stopped at C18");
+		d.finish_case(gen_pids_line("C18", victim));
+		return d.ok();
+	}
+
+	const CommandResult dump = d.ctl_inspect(name);
+	d.expect_contains(dump.out, "abi=1.1", "C18 header_dump");
+	d.expect_contains(dump.out, "producer=online", "C18 header_dump");
+
+	const CommandResult rec = d.run_command(
+	        {d.cons_bin, "--name", name, "--use-wait-ms", "2000",
+	         "--read-timeout-ms", "0", "--open-retry-ms", "5000"});
+	d.write_evidence("recovery_result.txt",
+	                 rec.out + "EXIT " + std::to_string(rec.exit_code) + "\n");
+	d.expect_contains(rec.out, "last_error=ProducerStalled", "C18 consumer");
+	d.expect_contains(rec.out, "timed_out=1", "C18 consumer");
+
+	// The frozen producer is still the owner: a takeover attempt must be
+	// refused while it is alive (observation-only semantics).
+	const CommandResult takeover = d.run_command(
+	        {d.prod_bin, "--name", name, "--count", "1"});
+	d.expect_contains(takeover.out, "code=AlreadyOwned", "C18 no takeover");
+
+	victim.kill_and_reap();
+	d.finish_case(gen_pids_line("C18", victim));
+	return d.ok();
+}
+
 // ---- dispatcher --------------------------------------------------------------
 
 struct CaseDef {
@@ -990,9 +1236,14 @@ static const CaseDef kCases[] = {
         {"C11", "PID-reuse fixture (live pid + wrong starttime -> kPidReused, gen+1)", run_c11},
         {"C12", "identity-epoch corruption (odd epoch -> RecoveryBlocked, closed)", run_c12},
         {"C13", "name/inode ABA (replaced object -> kNameRaceDetected)", run_c13},
+        {"C14", "fd producer dies after one fd hand-out (stale socket -> successor rebinds)", run_c14},
+        {"C15", "fd consumer dies after identity registration (role reclaimed)", run_c15},
+        {"C16", "fd creator dies after memfd_create (object dies with creator)", run_c16},
+        {"C17", "stale broker socket (probe-dead -> unlink -> rebind)", run_c17},
+        {"C18", "heartbeat producer frozen (ProducerStalled, no takeover)", run_c18},
 };
 
-static const char* kSmokeCases[] = {"C01", "C03", "C08"};
+static const char* kSmokeCases[] = {"C01", "C03", "C08", "C16"};
 
 const char* arg_value(int argc, char** argv, const char* flag) {
 	for (int i = 1; i + 1 < argc; ++i) {

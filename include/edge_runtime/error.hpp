@@ -37,6 +37,9 @@ enum class ErrorCode : uint32_t {
 	kSequenceExhausted,
 	kConcurrentHandleUse,
 	kSystemError,
+	// v0.2 (design §17/§34)
+	kProducerStalled,
+	kTransportFailed,
 };
 
 // Fixed-size error payload. The hot path must not allocate or throw (design

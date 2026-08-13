@@ -19,7 +19,9 @@ namespace edge_runtime::detail {
 inline constexpr char kBootstrapMagic[] = "EDGBOOT1";  // 8 chars, NUL not copied
 inline constexpr char kChannelHeaderMagic[] = "EDGERT01";
 inline constexpr uint32_t kAbiMajor = 1;
-inline constexpr uint32_t kAbiMinor = 0;
+inline constexpr uint32_t kAbiMinor = 0;  // written when heartbeat is disabled
+inline constexpr uint32_t kAbiMinorMax = 1;  // v0.2: minor 1 == optional heartbeat (§34)
+inline constexpr uint32_t kHeartbeatStallFactor = 3;  // §34.3 stall threshold
 inline constexpr uint32_t kEndianMarker = 0x01020304u;
 inline constexpr uint32_t kSlotCount = 3;
 inline constexpr uint32_t kMaxPayloadSize = 64u * 1024u;
@@ -127,6 +129,10 @@ struct alignas(64) ChannelHeaderAbi {
 	alignas(8) uint64_t publish_count;         // 280
 	alignas(8) uint64_t read_count;            // 288
 	alignas(8) uint64_t last_publish_boot_ns;  // 296
+	// v0.2 optional heartbeat (design §34): formerly trailing padding, so the
+	// struct size stays 320 and every v0.1 offset assertion below is untouched.
+	alignas(8) uint64_t heartbeat_boot_ns;             // 304
+	alignas(8) uint64_t producer_heartbeat_interval_ns;  // 312
 };
 static_assert(sizeof(ChannelHeaderAbi) == 320, "ChannelHeaderAbi size");
 static_assert(alignof(ChannelHeaderAbi) == 64, "ChannelHeaderAbi align");
@@ -153,6 +159,9 @@ static_assert(offsetof(ChannelHeaderAbi, consumer_state) == 276, "hdr consumer_s
 static_assert(offsetof(ChannelHeaderAbi, publish_count) == 280, "hdr publish_count");
 static_assert(offsetof(ChannelHeaderAbi, read_count) == 288, "hdr read_count");
 static_assert(offsetof(ChannelHeaderAbi, last_publish_boot_ns) == 296, "hdr last_publish");
+static_assert(offsetof(ChannelHeaderAbi, heartbeat_boot_ns) == 304, "hdr heartbeat_boot_ns");
+static_assert(offsetof(ChannelHeaderAbi, producer_heartbeat_interval_ns) == 312,
+              "hdr heartbeat_interval");
 
 // ---- SlotHeaderAbi: 64 bytes, followed immediately by the payload bytes. ----
 struct alignas(64) SlotHeaderAbi {
@@ -212,6 +221,9 @@ std::string channel_shm_name(const std::string& channel_name);
 
 // /run/user/<uid>/edgeruntime/<channel_name>.lock
 std::string channel_lock_path(const std::string& channel_name);
+
+// /run/user/<uid>/edgeruntime/<channel_name>.sock (v0.2 fd broker, design §33)
+std::string channel_socket_path(const std::string& channel_name);
 
 }  // namespace edge_runtime::detail
 

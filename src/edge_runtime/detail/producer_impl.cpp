@@ -1,5 +1,7 @@
 #include "edge_runtime/detail/producer_impl.hpp"
 
+#include <unistd.h>
+
 #include <cerrno>
 #include <cstring>
 #include <utility>
@@ -8,6 +10,7 @@
 #include "edge_runtime/detail/checksum.hpp"
 #include "edge_runtime/detail/clock.hpp"
 #include "edge_runtime/detail/failpoint.hpp"
+#include "edge_runtime/detail/fd_broker.hpp"
 #include "edge_runtime/detail/futex.hpp"
 #include "edge_runtime/detail/random.hpp"
 #include "edge_runtime/detail/slot_protocol.hpp"
@@ -44,6 +47,35 @@ struct CreatedObjectGuard {
 		}
 	}
 };
+
+// Shared stale-guard block for publish() and heartbeat() (design §15.6/§34):
+// the instance must still be READY, the frozen generation/nonce must still
+// match, the producer role must still belong to this handle, and the producer
+// must still be online. Returns the header on success.
+Result<ChannelHeaderAbi*> verify_handle_ownership(const ProducerHandle& handle,
+                                                  const char* operation) noexcept {
+	auto* base = static_cast<std::byte*>(handle.shm.mapping.get());
+	auto* boot = reinterpret_cast<BootstrapHeaderAbi*>(base);
+	auto* header = reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset);
+	if (shared_load_acquire(&boot->init_state) != static_cast<uint32_t>(InitState::kReady) ||
+	    shared_load_acquire(&header->init_state) != static_cast<uint32_t>(InitState::kReady)) {
+		return make_error(ErrorCode::kStaleHandle, operation, "instance not ready");
+	}
+	if (header->generation != handle.generation ||
+	    header->instance_nonce_hi != handle.instance_nonce_hi ||
+	    header->instance_nonce_lo != handle.instance_nonce_lo) {
+		return make_error(ErrorCode::kStaleHandle, operation, "instance replaced");
+	}
+	auto pid_res = identity_snapshot_read(&header->producer);
+	if (!pid_res || pid_res.value().role_epoch != handle.role_epoch) {
+		return make_error(ErrorCode::kStaleHandle, operation, "producer role changed");
+	}
+	if (shared_load_acquire(&header->producer_state) !=
+	    static_cast<uint32_t>(EndpointState::kOnline)) {
+		return make_error(ErrorCode::kProducerOffline, operation, "producer offline");
+	}
+	return Result<ChannelHeaderAbi*>(header);
+}
 
 bool payload_and_schema_valid(const ChannelOptions& options, const SchemaDescriptor& schema,
                               uint32_t payload_size) {
@@ -208,8 +240,15 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 		return make_error(ErrorCode::kInvalidOptions, "Producer::create",
 		                  "name/schema/payload invalid");
 	}
+	if (options.transport != Transport::kPosixShm &&
+	    options.transport != Transport::kMemfdFdPass) {
+		return make_error(ErrorCode::kInvalidOptions, "Producer::create",
+		                  "unknown transport");
+	}
+	const bool fd_mode = options.transport == Transport::kMemfdFdPass;
 	const std::string shm_name = channel_shm_name(options.name);
 	const std::string lock_path = channel_lock_path(options.name);
+	const std::string socket_path = channel_socket_path(options.name);
 	const uint32_t name_hash = channel_name_hash(options.name.c_str(), options.name.size());
 
 	// ---- control lock + journal ---------------------------------------------
@@ -239,7 +278,31 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 		                  "generation exhausted");
 	}
 
+	// ---- cross-transport guard (v0.2, design §7.3) -----------------------------
+	// The journal's last completed record pins the channel's transport. A
+	// different transport is only allowed once the old owner is proven dead:
+	// the old object is unreachable to the other transport (fd mode has no
+	// name), so a live owner cannot be detected by the other transport's
+	// inspect path — fail closed instead of risking a split brain.
+	if (journal.transport != static_cast<uint32_t>(options.transport) &&
+	    journal.creator.pid != 0) {
+		const Liveness prev = probe_liveness(journal.creator.pid,
+		                                     journal.creator.proc_start_ticks);
+		if (prev == Liveness::kAlive) {
+			return make_error(ErrorCode::kAlreadyOwned, "Producer::create",
+			                  "previous owner alive under other transport");
+		}
+		if (prev == Liveness::kUnverifiable) {
+			return make_error(ErrorCode::kRecoveryBlocked, "Producer::create",
+			                  "cannot verify previous owner transport");
+		}
+		// Previous owner dead: transport switch allowed, generation continues.
+	}
+
 	// ---- inspect existing object --------------------------------------------
+	// POSIX mode: the named object. fd mode: also run this check — a live POSIX
+	// instance under the same name must block the fd-mode create (design §7.3);
+	// when absent, the fd broker socket probe below decides.
 	auto existing = shm_open_existing(shm_name);
 	if (existing) {
 		uint64_t edev = 0, eino = 0, esize = 0;
@@ -331,44 +394,67 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 	auto j0 = make_control_journal(options.name, JournalState::kCreatingPreObject,
 	                               journal.old_generation, generation, journal.old_nonce_hi,
 	                               journal.old_nonce_lo, nonce_hi, nonce_lo, self);
+	j0.transport = static_cast<uint32_t>(options.transport);
 	auto wj0 = lock.write_journal(j0);
 	if (!wj0) return wj0.error();
 	journal_guard.armed = true;
 
 	// ---- create the object ----------------------------------------------------
-	auto fd_res = shm_open_create(shm_name);
-	if (!fd_res) {
-		if (fd_res.error().code == ErrorCode::kAlreadyOwned) {
-			return make_error(ErrorCode::kNameRaceDetected, "Producer::create",
-			                  "object appeared under name");
-		}
-		return fd_res.error();
-	}
-	UniqueFd fd = std::move(fd_res.value());
-	EDGE_FAILPOINT(C01);  // crash matrix: created, journal still PREOBJECT
-
+	UniqueFd fd;
+	uint64_t cdev = 0;
+	uint64_t cino = 0;
 	CreatedObjectGuard created;
-	created.name = shm_name;
-	uint64_t cdev = 0, cino = 0;
-	auto cst = shm_fstat_and_capture(fd, &cdev, &cino, nullptr);
-	if (!cst) return cst.error();
-	created.dev = cdev;
-	created.ino = cino;
-	created.armed = true;
+	if (fd_mode) {
+		// v0.2 fd-pass (design §33.3): anonymous memfd; the object dies with
+		// this fd. No global name, no unlink cleanup, no inode-ABA surface.
+		auto mfd = memfd_create_object(options.name);
+		if (!mfd) return mfd.error();
+		fd = std::move(mfd.value());
+		EDGE_FAILPOINT(C16);  // crash matrix: memfd created, journal PREOBJECT
+		auto cst = memfd_fstat_and_capture(fd, &cdev, &cino, nullptr);
+		if (!cst) return cst.error();
+	} else {
+		auto fd_res = shm_open_create(shm_name);
+		if (!fd_res) {
+			if (fd_res.error().code == ErrorCode::kAlreadyOwned) {
+				return make_error(ErrorCode::kNameRaceDetected, "Producer::create",
+				                  "object appeared under name");
+			}
+			return fd_res.error();
+		}
+		fd = std::move(fd_res.value());
+		EDGE_FAILPOINT(C01);  // crash matrix: created, journal still PREOBJECT
+		created.name = shm_name;
+		auto cst = shm_fstat_and_capture(fd, &cdev, &cino, nullptr);
+		if (!cst) return cst.error();
+		created.dev = cdev;
+		created.ino = cino;
+		created.armed = true;
+	}
 
 	auto j1 = make_control_journal(options.name, JournalState::kCreatingObject,
 	                               journal.old_generation, generation, journal.old_nonce_hi,
 	                               journal.old_nonce_lo, nonce_hi, nonce_lo, self);
+	j1.transport = static_cast<uint32_t>(options.transport);
 	j1.target_dev = cdev;
 	j1.target_ino = cino;
 	auto wj1 = lock.write_journal(j1);
 	if (!wj1) return wj1.error();
 
 	// ---- bootstrap INITIALIZING ------------------------------------------------
+	// v0.2 heartbeat (design §34): interval > 0 enables heartbeat and bumps
+	// abi_minor to 1 (both headers, same value); disabled stays minor 0 and the
+	// heartbeat fields stay zeroed — byte-identical to a v0.1 segment.
+	const uint64_t heartbeat_interval_ns =
+	        static_cast<uint64_t>(options.heartbeat_interval.count() > 0
+	                                     ? options.heartbeat_interval.count()
+	                                     : 0);
+	const uint16_t abi_minor =
+	        heartbeat_interval_ns > 0 ? static_cast<uint16_t>(kAbiMinorMax) : kAbiMinor;
 	BootstrapHeaderAbi boot{};
 	std::memcpy(boot.magic, kBootstrapMagic, sizeof(kBootstrapMagic) - 1);
 	boot.abi_major = kAbiMajor;
-	boot.abi_minor = kAbiMinor;
+	boot.abi_minor = abi_minor;
 	boot.header_size = sizeof(BootstrapHeaderAbi);
 	uint64_t mapping = 0;
 	if (!mapping_size_for_payload(payload_size, &mapping)) {
@@ -402,7 +488,7 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 	auto* header = reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset);
 	std::memcpy(header->magic, kChannelHeaderMagic, sizeof(kChannelHeaderMagic) - 1);
 	header->abi_major = kAbiMajor;
-	header->abi_minor = kAbiMinor;
+	header->abi_minor = abi_minor;
 	header->header_size = sizeof(ChannelHeaderAbi);
 	header->endian_marker = kEndianMarker;
 	header->slot_count = kSlotCount;
@@ -414,6 +500,7 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 	header->generation = generation;
 	header->instance_nonce_hi = nonce_hi;
 	header->instance_nonce_lo = nonce_lo;
+	header->producer_heartbeat_interval_ns = heartbeat_interval_ns;  // v0.2 §34
 
 	ProcessIdentityAbi pid_abi{};
 	pid_abi.pid = self.pid;
@@ -429,6 +516,21 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 	                     static_cast<uint32_t>(EndpointState::kOnline));
 	// latest_ticket / notify_epoch / consumer_state / counters stay zeroed.
 
+	// ---- fd mode: bind the broker socket BEFORE the READY commit ----------------
+	// (v0.2, design §33.5). The socket is the only reachability point of a
+	// nameless object; a bind failure after READY would be unrollable and leave
+	// a ghost instance. Still under the control lock, so the probe-before-unlink
+	// discipline in fd_broker_bind cannot race a concurrent create.
+	UniqueFd listen_fd;
+	bool socket_bound = false;
+	if (fd_mode) {
+		auto b = fd_broker_bind(socket_path);
+		if (!b) return b.error();
+		listen_fd = std::move(b.value());
+		socket_bound = true;
+		EDGE_FAILPOINT(C17);  // crash matrix: socket bound, READY not committed
+	}
+
 	// ---- commit ----------------------------------------------------------------
 	shared_store_release(&header->init_state, static_cast<uint32_t>(InitState::kReady));
 	auto* boot_map = reinterpret_cast<BootstrapHeaderAbi*>(base);
@@ -438,10 +540,14 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 	auto jdone = make_control_journal(options.name, JournalState::kIdle, journal.old_generation,
 	                                  generation, journal.old_nonce_hi, journal.old_nonce_lo,
 	                                  nonce_hi, nonce_lo, self);
+	jdone.transport = static_cast<uint32_t>(options.transport);
 	jdone.target_dev = cdev;
 	jdone.target_ino = cino;
 	auto wjdone = lock.write_journal(jdone);
-	if (!wjdone) return wjdone.error();
+	if (!wjdone) {
+		if (socket_bound) (void)::unlink(socket_path.c_str());
+		return wjdone.error();
+	}
 
 	journal_guard.armed = false;
 	created.armed = false;
@@ -462,6 +568,32 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 	handle->schema_version = schema.version;
 	handle->payload_size = payload_size;
 	handle->self = self;
+	handle->transport = options.transport;
+	handle->channel_hash = name_hash;
+	handle->heartbeat_interval_ns = heartbeat_interval_ns;
+	if (fd_mode) {
+		handle->socket_path = socket_path;
+		handle->listen_fd = std::move(listen_fd);
+	}
+
+	// ---- fd mode: start the serving thread (design §18.1/§33.4) ------------------
+	// The thread reads only handle-owned state (mapping, channel_hash, frozen
+	// fingerprint, serve_stop), so it outlives this function safely.
+	if (fd_mode) {
+		const int listen = handle->listen_fd.get();
+		const int shm_fd = handle->shm.fd.get();
+		std::byte* serve_base = static_cast<std::byte*>(handle->shm.mapping.get());
+		try {
+			handle->server_thread = std::thread(
+			        fd_broker_serve_loop, listen, shm_fd, serve_base,
+			        &handle->channel_hash, &handle->schema_fingerprint,
+			        &handle->serve_stop);
+		} catch (...) {
+			(void)::unlink(socket_path.c_str());  // no server: never leave a live path
+			return make_error(ErrorCode::kSystemError, "Producer::create",
+			                  "serving thread start failed");
+		}
+	}
 	return Result<std::shared_ptr<ProducerHandle>>(std::move(handle));
 }
 
@@ -475,34 +607,13 @@ Result<PublishInfo> producer_publish_impl(const std::shared_ptr<ProducerHandle>&
 		                  "codec size drift");
 	}
 
-	auto* base = static_cast<std::byte*>(handle->shm.mapping.get());
-	auto* boot = reinterpret_cast<BootstrapHeaderAbi*>(base);
-	auto* header = reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset);
-
 	// Cheap mapping-internal stale checks (design §15.6): instance must still be
 	// READY, the frozen generation/nonce must still match, and the producer role
 	// must still belong to this handle.
-	if (shared_load_acquire(&boot->init_state) != static_cast<uint32_t>(InitState::kReady) ||
-	    shared_load_acquire(&header->init_state) != static_cast<uint32_t>(InitState::kReady)) {
-		return make_error(ErrorCode::kStaleHandle, "Producer::publish",
-		                  "instance not ready");
-	}
-	if (header->generation != handle->generation ||
-	    header->instance_nonce_hi != handle->instance_nonce_hi ||
-	    header->instance_nonce_lo != handle->instance_nonce_lo) {
-		return make_error(ErrorCode::kStaleHandle, "Producer::publish",
-		                  "instance replaced");
-	}
-	auto pid_res = identity_snapshot_read(&header->producer);
-	if (!pid_res || pid_res.value().role_epoch != handle->role_epoch) {
-		return make_error(ErrorCode::kStaleHandle, "Producer::publish",
-		                  "producer role changed");
-	}
-	if (shared_load_acquire(&header->producer_state) !=
-	    static_cast<uint32_t>(EndpointState::kOnline)) {
-		return make_error(ErrorCode::kProducerOffline, "Producer::publish",
-		                  "producer offline");
-	}
+	auto v = verify_handle_ownership(*handle, "Producer::publish");
+	if (!v) return v.error();
+	auto* base = static_cast<std::byte*>(handle->shm.mapping.get());
+	auto* header = v.value();
 
 	const uint64_t current = shared_load_acquire(&header->latest_ticket);
 	uint64_t next_sequence = 0;
@@ -582,19 +693,24 @@ uint64_t producer_generation_impl(const std::shared_ptr<ProducerHandle>& handle)
 }
 
 Result<ChannelStatus> producer_status_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept {
-	// Slow check (design §15.6): the name must still resolve to our frozen inode.
-	const std::string shm_name = channel_shm_name(handle->channel_name);
-	auto re = shm_open_existing(shm_name);
-	if (!re) {
-		return make_error(ErrorCode::kStaleHandle, "Producer::status", "channel name gone");
+	if (handle->transport == Transport::kPosixShm) {
+		// Slow check (design §15.6): the name must still resolve to our frozen inode.
+		const std::string shm_name = channel_shm_name(handle->channel_name);
+		auto re = shm_open_existing(shm_name);
+		if (!re) {
+			return make_error(ErrorCode::kStaleHandle, "Producer::status",
+			                  "channel name gone");
+		}
+		uint64_t dev = 0, ino = 0;
+		auto fst = shm_fstat_and_capture(re.value(), &dev, &ino, nullptr);
+		if (!fst) return fst.error();
+		if (dev != handle->shm.dev || ino != handle->shm.ino) {
+			return make_error(ErrorCode::kStaleHandle, "Producer::status",
+			                  "instance replaced under name");
+		}
 	}
-	uint64_t dev = 0, ino = 0;
-	auto fst = shm_fstat_and_capture(re.value(), &dev, &ino, nullptr);
-	if (!fst) return fst.error();
-	if (dev != handle->shm.dev || ino != handle->shm.ino) {
-		return make_error(ErrorCode::kStaleHandle, "Producer::status",
-		                  "instance replaced under name");
-	}
+	// fd mode (v0.2 §33.6): the mapping IS the one-shot identity — a name-based
+	// reopen would always be ENOENT and falsely report StaleHandle.
 	auto* base = static_cast<std::byte*>(handle->shm.mapping.get());
 	return read_channel_status(base);
 }
@@ -610,9 +726,33 @@ void producer_shutdown_impl(const std::shared_ptr<ProducerHandle>& handle) noexc
 	}
 	shared_store_release(&header->producer_state,
 	                     static_cast<uint32_t>(EndpointState::kOffline));
+
+	if (handle->transport == Transport::kMemfdFdPass && !handle->socket_unlinked) {
+		// v0.2 §33.5: clean shutdown releases the channel by removing the broker
+		// socket (the fd-mode reachability point), so a successor can bind
+		// directly — the equivalent of v0.1's OFFLINE -> replace. Best-effort and
+		// under the control lock: only unlink if the journal still records OUR
+		// instance, so a late shutdown can never remove a successor's socket
+		// (socket name-ABA guard, mirror of §9.4).
+		handle->serve_stop.store(true, std::memory_order_relaxed);
+		if (handle->listen_fd.get() >= 0) {
+			(void)::shutdown(handle->listen_fd.get(), SHUT_RDWR);
+		}
+		auto lock_res = ControlLock::acquire(channel_lock_path(handle->channel_name));
+		if (lock_res) {
+			auto jr = lock_res.value().read_journal();
+			if (jr && jr.value().new_generation == handle->generation &&
+			    jr.value().new_nonce_hi == handle->instance_nonce_hi &&
+			    jr.value().new_nonce_lo == handle->instance_nonce_lo) {
+				(void)::unlink(handle->socket_path.c_str());
+				handle->socket_unlinked = true;
+			}
+		}
+	}
 }
 
 Result<void> producer_remove_if_owner_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept {
+	const bool fd_mode = handle->transport == Transport::kMemfdFdPass;
 	const std::string shm_name = channel_shm_name(handle->channel_name);
 	const std::string lock_path = channel_lock_path(handle->channel_name);
 
@@ -624,14 +764,16 @@ Result<void> producer_remove_if_owner_impl(const std::shared_ptr<ProducerHandle>
 	if (!jr) return jr.error();
 	const ControlJournalV1 journal = jr.value();
 
-	auto re = shm_open_existing(shm_name);
-	if (!re) return re.error();
 	uint64_t dev = 0, ino = 0;
-	auto fst = shm_fstat_and_capture(re.value(), &dev, &ino, nullptr);
-	if (!fst) return fst.error();
-	if (dev != handle->shm.dev || ino != handle->shm.ino) {
-		return make_error(ErrorCode::kNameRaceDetected, "Producer::remove_if_owner",
-		                  "inode changed");
+	if (!fd_mode) {
+		auto re = shm_open_existing(shm_name);
+		if (!re) return re.error();
+		auto fst = shm_fstat_and_capture(re.value(), &dev, &ino, nullptr);
+		if (!fst) return fst.error();
+		if (dev != handle->shm.dev || ino != handle->shm.ino) {
+			return make_error(ErrorCode::kNameRaceDetected, "Producer::remove_if_owner",
+			                  "inode changed");
+		}
 	}
 
 	auto* base = static_cast<std::byte*>(handle->shm.mapping.get());
@@ -649,6 +791,14 @@ Result<void> producer_remove_if_owner_impl(const std::shared_ptr<ProducerHandle>
 		                  "producer role changed");
 	}
 
+	// fd mode: stop serving first so no new fd can be handed out mid-removal.
+	if (fd_mode) {
+		handle->serve_stop.store(true, std::memory_order_relaxed);
+		if (handle->listen_fd.get() >= 0) {
+			(void)::shutdown(handle->listen_fd.get(), SHUT_RDWR);
+		}
+	}
+
 	JournalGuard journal_guard;
 	journal_guard.lock = &lock;
 	journal_guard.reset_to = journal;
@@ -656,25 +806,57 @@ Result<void> producer_remove_if_owner_impl(const std::shared_ptr<ProducerHandle>
 	auto jr2 = make_control_journal(handle->channel_name, JournalState::kRemoving,
 	                                handle->generation, 0, handle->instance_nonce_hi,
 	                                handle->instance_nonce_lo, 0, 0, handle->self);
+	jr2.transport = static_cast<uint32_t>(handle->transport);
 	jr2.target_dev = dev;
 	jr2.target_ino = ino;
 	auto wj = lock.write_journal(jr2);
 	if (!wj) return wj.error();
 	journal_guard.armed = true;
 
-	auto un = shm_unlink_checked(shm_name, dev, ino);
-	if (!un) return un.error();
+	if (fd_mode) {
+		// v0.2 §33.5: the object dies with its fds; removal = unlink our own
+		// socket under the lock (no probe needed: it is ours by journal match).
+		if (!handle->socket_unlinked) {
+			(void)::unlink(handle->socket_path.c_str());
+			handle->socket_unlinked = true;
+		}
+	} else {
+		auto un = shm_unlink_checked(shm_name, dev, ino);
+		if (!un) return un.error();
+	}
 
 	// Completed removal: keep the removed instance's gen/nonce for audit.
 	auto jdone = make_control_journal(
 	        handle->channel_name, JournalState::kIdle, handle->generation, handle->generation,
 	        handle->instance_nonce_hi, handle->instance_nonce_lo, handle->instance_nonce_hi,
 	        handle->instance_nonce_lo, handle->self);
+	jdone.transport = static_cast<uint32_t>(handle->transport);
 	jdone.target_dev = dev;
 	jdone.target_ino = ino;
 	auto wjd = lock.write_journal(jdone);
 	if (!wjd) return wjd.error();
 	journal_guard.armed = false;
+	return Result<void>::ok();
+}
+
+Result<void> producer_heartbeat_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept {
+	// v0.2 optional heartbeat (design §34): an explicit application declaration
+	// of making-progress. Same stale guards as publish; disabled heartbeat is a
+	// validated no-op (the interval was frozen at create).
+	if (handle->heartbeat_interval_ns == 0) {
+		return Result<void>::ok();
+	}
+	auto v = verify_handle_ownership(*handle, "Producer::heartbeat");
+	if (!v) return v.error();
+	auto* header = v.value();
+
+	const uint64_t now = boottime_now_ns();
+	if (now == 0) {
+		return make_error(ErrorCode::kClockAnomaly, "Producer::heartbeat",
+		                  "boottime unavailable");
+	}
+	shared_store_release(&header->heartbeat_boot_ns, now);
+	EDGE_FAILPOINT(C18);  // crash matrix: heartbeat written, producer now frozen
 	return Result<void>::ok();
 }
 

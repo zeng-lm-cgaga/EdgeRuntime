@@ -31,4 +31,8 @@ std::string channel_lock_path(const std::string& channel_name) {
 	return "/run/user/" + std::to_string(getuid()) + "/edgeruntime/" + channel_name + ".lock";
 }
 
+std::string channel_socket_path(const std::string& channel_name) {
+	return "/run/user/" + std::to_string(getuid()) + "/edgeruntime/" + channel_name + ".sock";
+}
+
 }  // namespace edge_runtime::detail

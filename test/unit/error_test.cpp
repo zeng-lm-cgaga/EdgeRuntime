@@ -19,8 +19,11 @@ using edge_runtime::to_string;
 TEST(ErrorModel, EveryCodeHasStableName) {  // U08
 	EXPECT_STREQ(to_string(ErrorCode::kInvalidName), "InvalidName");
 	EXPECT_STREQ(to_string(ErrorCode::kSystemError), "SystemError");
+	// v0.2 additions (design §17/§34) append after kSystemError.
+	EXPECT_STREQ(to_string(ErrorCode::kProducerStalled), "ProducerStalled");
+	EXPECT_STREQ(to_string(ErrorCode::kTransportFailed), "TransportFailed");
 	// no code maps to the sentinel; the table must cover the full range
-	for (uint32_t i = 0; i <= static_cast<uint32_t>(ErrorCode::kSystemError); ++i) {
+	for (uint32_t i = 0; i <= static_cast<uint32_t>(ErrorCode::kTransportFailed); ++i) {
 		const char* name = to_string(static_cast<ErrorCode>(i));
 		EXPECT_NE(name, nullptr);
 		EXPECT_STRNE(name, "UnknownError");

@@ -42,6 +42,9 @@ struct Args {
 	bool no_publish = false;      // create channel, publish nothing, wait for signal (ER3 I14)
 	bool checksum = true;
 	bool use_v2 = false;
+	edge_runtime::Transport transport{edge_runtime::Transport::kPosixShm};
+	uint64_t heartbeat_interval_us = 0;  // v0.2: 0 = heartbeat disabled
+	bool heartbeat_only = false;         // v0.2: heartbeat loop, never publish (C18)
 };
 
 // Publish one sample; returns the published sequence or 0 on failure.
@@ -66,6 +69,8 @@ int run_publish(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 	edge_runtime::ChannelOptions opts;
 	opts.name = a.name;
 	opts.enable_payload_checksum = a.checksum;
+	opts.transport = a.transport;
+	opts.heartbeat_interval = std::chrono::microseconds(a.heartbeat_interval_us);
 
 	auto producer = ProducerT::create(opts, schema);
 	if (!producer) {
@@ -101,6 +106,14 @@ int run_publish(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 		// producer_state OFFLINE and the consumer's wait classifies ProducerOffline.
 		while (!g_stop.load(std::memory_order_relaxed)) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		}
+	} else if (a.heartbeat_only) {
+		// v0.2 C18: heartbeat loop with no publishes. The application-level loop
+		// is "healthy" while this runs; SIGSTOP at the C18 failpoint freezes it.
+		const uint64_t step = std::min<uint64_t>(a.heartbeat_interval_us, 50000);
+		while (!g_stop.load(std::memory_order_relaxed)) {
+			(void)producer.value().heartbeat();
+			std::this_thread::sleep_for(std::chrono::microseconds(step));
 		}
 	} else {
 		while (true) {
@@ -142,6 +155,15 @@ int main(int argc, char** argv) {
 	a.sleep_first_us = edge_tool::arg_u64(argc, argv, "--sleep-first-us", 0);
 	a.no_publish = edge_tool::arg_flag(argc, argv, "--no-publish") ||
 	               edge_tool::arg_u64(argc, argv, "--no-publish", 0) != 0;
+	a.heartbeat_interval_us = edge_tool::arg_u64(argc, argv, "--heartbeat-interval-us", 0);
+	a.heartbeat_only = edge_tool::arg_flag(argc, argv, "--heartbeat-only") ||
+	                   edge_tool::arg_u64(argc, argv, "--heartbeat-only", 0) != 0;
+	{
+		const char* transport_arg = edge_tool::arg_value(argc, argv, "--transport");
+		if (transport_arg != nullptr && std::string(transport_arg) == "fd") {
+			a.transport = edge_runtime::Transport::kMemfdFdPass;
+		}
+	}
 
 	if (a.name.empty()) {
 		std::fprintf(stderr,
@@ -150,7 +172,8 @@ int main(int argc, char** argv) {
 		             "[--schema testpayloadv1|testpayloadv2] "
 		             "[--count N] [--interval-us N] [--seq-start N] "
 		             "[--sleep-first-us N] [--no-publish 0|1] "
-		             "[--checksum 0|1]\n");
+		             "[--checksum 0|1] [--transport fd|posix] "
+		             "[--heartbeat-interval-us N] [--heartbeat-only 0|1]\n");
 		return 2;
 	}
 
