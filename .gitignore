@@ -1,0 +1,22 @@
+/build/
+/install/
+/log/
+/compile_commands.json
+/.cache/
+/.clangd/
+/.vscode/
+*.core
+core
+
+# Local collaboration artifacts and design notes are kept out of the repo.
+/CLAUDE.md
+/EDGERUNTIME_DESIGN.md
+/docs/
+/.claude/
+
+# Generated validation evidence (crash-matrix runs, test logs) is not source;
+# the directory structure is kept via .gitkeep.
+/evidence/*
+!/evidence/.gitkeep
+!/evidence/.gitignore
+

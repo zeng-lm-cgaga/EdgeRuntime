@@ -1,0 +1,5 @@
+# Evidence/ is generated output; only structure is committed.
+*/
+*
+!.gitignore
+!.gitkeep
