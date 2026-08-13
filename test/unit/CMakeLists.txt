@@ -23,3 +23,6 @@ edgeruntime_unit_test(futex_test)             # U10 futex wait/wake/EAGAIN/EINTR
 edgeruntime_unit_test(clock_test)             # §15.7 deadline + remaining-time helpers
 edgeruntime_unit_test(failpoint_test)         # §20.3 registry + env modes + hit counting
 edgeruntime_unit_test(fd_broker_test)         # v0.2 §33 wire record layouts + checksum
+edgeruntime_unit_test(channel_observer_test)  # v0.3 §35.3 readonly view + stall classification
+edgeruntime_unit_test(liveness_watch_test)    # v0.3 §35.3 long-held pidfd + CLOEXEC
+edgeruntime_unit_test(process_spawn_test)     # v0.3 §35.3 fork+exec + nonblock stdout pipe

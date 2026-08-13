@@ -219,6 +219,11 @@ class CrashChild {
 		drain();
 	}
 
+	// Send an arbitrary signal (v0.3 C19: SIGTERM for a clean supervisor stop).
+	void send_signal(int sig) {
+		if (!reaped_) ::kill(pid_, sig);
+	}
+
        private:
 	void drain() {
 		if (pipe_ < 0) return;
@@ -255,6 +260,7 @@ class CaseDriver {
 	std::string prod_bin;
 	std::string cons_bin;
 	std::string ctl_bin;
+	std::string supervisor_bin;  // v0.3 C19-C21
 	std::string run_dir;
 	uint64_t name_seq = 0;
 	int failures = 0;
@@ -1172,6 +1178,151 @@ static bool run_c18(CaseDriver& d) {
 	return d.ok();
 }
 
+// ---- v0.3 supervisor cases (C19-C21) ----------------------------------------
+
+// C19: stall takeover. The supervisor runs a heartbeat-only producer; the
+// driver freezes the grandchild with SIGSTOP. The supervisor must classify the
+// stall, escalate SIGTERM->SIGKILL, restart at generation+1, and a consumer
+// must read the replacement (design §35.4).
+static bool run_c19(CaseDriver& d) {
+	d.begin_case("C19",
+	             "supervisor stall takeover: frozen heartbeat producer -> "
+	             "STALL_DETECTED -> KILLED -> RESTART gen+1, consumer reads");
+	if (d.supervisor_bin.empty()) {
+		d.fail("C19 needs --supervisor <bin>");
+		d.finish_case("C19 supervisor_bin_unset\n");
+		return d.ok();
+	}
+	const std::string name = d.channel_name("c19");
+
+	CrashChild sup;
+	if (!sup.spawn({d.supervisor_bin, "--name", name, "--producer-argv",
+	                d.prod_bin + " --name " + name +
+	                        " --heartbeat-only --heartbeat-interval-us 100000",
+	                "--watch-interval-ms", "100", "--stall-grace-ms", "500",
+	                "--initial-delay-ms", "200"},
+	               {})) {
+		d.fail("C19 supervisor spawn failed");
+		d.finish_case(gen_pids_line("C19", sup));
+		return d.ok();
+	}
+	struct timespec wait_ts {};
+	wait_ts.tv_sec = 1;
+	wait_ts.tv_nsec = 500 * 1000 * 1000;  // 1.5s (tv_nsec must stay < 1e9)
+	::nanosleep(&wait_ts, nullptr);
+
+	// Freeze the grandchild (anchored pattern: only the producer's own cmdline).
+	const std::string stop_cmd =
+	        "/usr/bin/pkill -STOP -f \"^" + d.prod_bin + " --name " + name + " \"";
+	(void)d.run_command({"/bin/sh", "-c", stop_cmd});
+
+	wait_ts.tv_sec = 3;  // 3s: detection + grace + backoff + replacement create
+	wait_ts.tv_nsec = 0;
+	::nanosleep(&wait_ts, nullptr);
+
+	// The replacement instance must be generation 2 and openable. (It is a
+	// heartbeat-only producer, so it publishes nothing — a successful open is
+	// the recovery assertion.)
+	const CommandResult dump = d.ctl_inspect(name);
+	d.expect_contains(dump.out, "gen=2", "C19 header_dump");
+	const CommandResult rec = d.run_command(
+	        {d.cons_bin, "--name", name, "--reads", "1", "--read-interval-ms", "20",
+	         "--open-retry-ms", "8000", "--read-timeout-ms", "2000"});
+	d.write_evidence("recovery_result.txt",
+	                 rec.out + "EXIT " + std::to_string(rec.exit_code) + "\n");
+	d.expect_contains(rec.out, "READY", "C19 recovery");
+	if (rec.exit_code != 0)
+		d.fail("C19 recovery consumer exit " + std::to_string(rec.exit_code));
+
+	// Clean stop of the supervisor, then assert the marker sequence.
+	sup.send_signal(SIGTERM);
+	const int sup_rc = sup.wait_exit(15000);
+	d.write_evidence("supervisor_result.txt",
+	                 sup.stdout_text() + "EXIT " + std::to_string(sup_rc) + "\n");
+	d.expect_contains(sup.stdout_text(), "STALL_DETECTED", "C19 supervisor");
+	d.expect_contains(sup.stdout_text(), "KILLED sig=9", "C19 supervisor");
+	d.expect_contains(sup.stdout_text(), "RESTART attempt=1", "C19 supervisor");
+	d.expect_contains(sup.stdout_text(), "gen=2", "C19 supervisor");
+	d.expect_contains(sup.stdout_text(), "STOPPED", "C19 supervisor");
+
+	d.finish_case(gen_pids_line("C19", sup));
+	return d.ok();
+}
+
+// C20: crash-loop cap. A child that dies instantly (/bin/false) restarts
+// exactly max_restarts times, then GAVE_UP with a non-zero exit (design §35.4).
+static bool run_c20(CaseDriver& d) {
+	d.begin_case("C20",
+	             "supervisor crash loop: /bin/false child -> RESTART x3 -> "
+	             "GAVE_UP, non-zero exit");
+	if (d.supervisor_bin.empty()) {
+		d.fail("C20 needs --supervisor <bin>");
+		d.finish_case("C20 supervisor_bin_unset\n");
+		return d.ok();
+	}
+	const std::string name = d.channel_name("c20");
+
+	CrashChild sup;
+	if (!sup.spawn({d.supervisor_bin, "--name", name, "--producer-argv", "/bin/false",
+	                "--watch-interval-ms", "100", "--max-restarts", "3",
+	                "--max-delay-ms", "200", "--initial-delay-ms", "50",
+	                "--create-timeout-ms", "1000"},
+	               {})) {
+		d.fail("C20 supervisor spawn failed");
+		d.finish_case(gen_pids_line("C20", sup));
+		return d.ok();
+	}
+	const int rc = sup.wait_exit(30000);
+	d.write_evidence("supervisor_result.txt",
+	                 sup.stdout_text() + "EXIT " + std::to_string(rc) + "\n");
+	if (rc != 3) d.fail("C20 expected supervisor exit 3 (GAVE_UP), got " +
+	                    std::to_string(rc));
+	d.expect_contains(sup.stdout_text(), "GAVE_UP", "C20 supervisor");
+	d.expect_contains(sup.stdout_text(), "RESTART attempt=3", "C20 supervisor");
+	if (contains(sup.stdout_text(), "RESTART attempt=4")) {
+		d.fail("C20 restarted past the cap");
+	}
+
+	d.finish_case(gen_pids_line("C20", sup));
+	return d.ok();
+}
+
+// C21: clean exit. A child that finishes by itself (exit 0) must NOT be
+// restarted (design §35.4).
+static bool run_c21(CaseDriver& d) {
+	d.begin_case("C21",
+	             "supervisor clean exit: --count 2 child finishes -> "
+	             "CLEAN_EXIT, no restart, exit 0");
+	if (d.supervisor_bin.empty()) {
+		d.fail("C21 needs --supervisor <bin>");
+		d.finish_case("C21 supervisor_bin_unset\n");
+		return d.ok();
+	}
+	const std::string name = d.channel_name("c21");
+
+	CrashChild sup;
+	if (!sup.spawn({d.supervisor_bin, "--name", name, "--producer-argv",
+	                d.prod_bin + " --name " + name + " --count 2 --interval-us 20000",
+	                "--watch-interval-ms", "100"},
+	               {})) {
+		d.fail("C21 supervisor spawn failed");
+		d.finish_case(gen_pids_line("C21", sup));
+		return d.ok();
+	}
+	const int rc = sup.wait_exit(20000);
+	d.write_evidence("supervisor_result.txt",
+	                 sup.stdout_text() + "EXIT " + std::to_string(rc) + "\n");
+	if (rc != 0) d.fail("C21 expected supervisor exit 0, got " + std::to_string(rc));
+	d.expect_contains(sup.stdout_text(), "SUPERVISED", "C21 supervisor");
+	d.expect_contains(sup.stdout_text(), "CLEAN_EXIT", "C21 supervisor");
+	if (contains(sup.stdout_text(), "RESTART")) {
+		d.fail("C21 restarted after a clean exit");
+	}
+
+	d.finish_case(gen_pids_line("C21", sup));
+	return d.ok();
+}
+
 // ---- dispatcher --------------------------------------------------------------
 
 struct CaseDef {
@@ -1241,6 +1392,9 @@ static const CaseDef kCases[] = {
         {"C16", "fd creator dies after memfd_create (object dies with creator)", run_c16},
         {"C17", "stale broker socket (probe-dead -> unlink -> rebind)", run_c17},
         {"C18", "heartbeat producer frozen (ProducerStalled, no takeover)", run_c18},
+        {"C19", "supervisor stall takeover (STALL_DETECTED -> KILLED -> RESTART gen+1)", run_c19},
+        {"C20", "supervisor crash loop (RESTART x3 -> GAVE_UP)", run_c20},
+        {"C21", "supervisor clean exit (CLEAN_EXIT, no restart)", run_c21},
 };
 
 static const char* kSmokeCases[] = {"C01", "C03", "C08", "C16"};
@@ -1265,14 +1419,16 @@ int main(int argc, char** argv) {
 		for (const CaseDef& c : kCases) {
 			std::printf("  %-4s  %s\n", c.id, c.desc);
 		}
-		std::printf("smoke subset: %s, %s, %s\n", kSmokeCases[0], kSmokeCases[1],
-		            kSmokeCases[2]);
+		std::printf("smoke subset:");
+		for (const char* id : kSmokeCases) std::printf(" %s", id);
+		std::printf("\n");
 		return 0;
 	}
 
 	const char* prod = arg_value(argc, argv, "--producer");
 	const char* cons = arg_value(argc, argv, "--consumer");
 	const char* ctl = arg_value(argc, argv, "--ctl");
+	const char* supervisor = arg_value(argc, argv, "--supervisor");
 	const char* out_dir = arg_value(argc, argv, "--out-dir");
 	const char* seed = arg_value(argc, argv, "--seed");
 	const bool smoke = arg_has(argc, argv, "--smoke");
@@ -1281,8 +1437,8 @@ int main(int argc, char** argv) {
 	if (prod == nullptr || cons == nullptr || ctl == nullptr) {
 		std::fprintf(stderr,
 		             "usage: edge_crash_matrix --producer <bin> --consumer <bin> "
-		             "--ctl <bin> [--smoke] [--only C01,C03] [--seed N] "
-		             "[--out-dir P]\n");
+		             "--ctl <bin> [--supervisor <bin>] [--smoke] [--only C01,C03] "
+		             "[--seed N] [--out-dir P]\n");
 		return 2;
 	}
 
@@ -1340,6 +1496,7 @@ int main(int argc, char** argv) {
 	d.prod_bin = prod;
 	d.cons_bin = cons;
 	d.ctl_bin = ctl;
+	d.supervisor_bin = supervisor != nullptr ? supervisor : "";
 	d.run_dir = run_dir;
 
 	std::printf("edge_crash_matrix run=%s cases=%zu\n", run_id, selected.size());

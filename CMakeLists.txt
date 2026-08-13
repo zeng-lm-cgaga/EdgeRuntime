@@ -62,6 +62,7 @@ add_library(edge_runtime STATIC
   src/edge_runtime/detail/error.cpp
   src/edge_runtime/detail/channel_abi.cpp
   src/edge_runtime/detail/channel_layout.cpp
+  src/edge_runtime/detail/channel_observer.cpp
   src/edge_runtime/detail/checksum.cpp
   src/edge_runtime/detail/clock.cpp
   src/edge_runtime/detail/consumer_impl.cpp
@@ -70,9 +71,11 @@ add_library(edge_runtime STATIC
   src/edge_runtime/detail/fd_broker.cpp
   src/edge_runtime/detail/futex.cpp
   src/edge_runtime/detail/process_identity.cpp
+  src/edge_runtime/detail/process_spawn.cpp
   src/edge_runtime/detail/producer_impl.cpp
   src/edge_runtime/detail/shm_object.cpp
-  src/edge_runtime/detail/slot_protocol.cpp)
+  src/edge_runtime/detail/slot_protocol.cpp
+  src/edge_runtime/detail/supervisor_impl.cpp)
 add_library(EdgeRuntime::edge_runtime ALIAS edge_runtime)
 
 target_compile_features(edge_runtime PUBLIC cxx_std_17)

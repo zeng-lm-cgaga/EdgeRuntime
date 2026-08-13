@@ -25,6 +25,7 @@ edgeruntime_tool(edge_shm_consumer)
 # ER4 diagnostic/forensic CLI (design §22): inspect reads a channel without
 # dumping payload; remove performs verified, journal-bound unlink.
 edgeruntime_tool(edge_shm_ctl)
+edgeruntime_tool(edge_shm_supervisor)
 
 # ER4 crash matrix (design §20.3/§24): the C01-C13 table-driven runner. It
 # pauses victims at failpoints, dumps forensics via edge_shm_ctl, runs the

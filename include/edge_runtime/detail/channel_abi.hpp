@@ -33,6 +33,11 @@ Result<void> validate_bootstrap_parse(const BootstrapHeaderAbi& boot, uint64_t s
 Result<void> validate_header_parse(const ChannelHeaderAbi& header, const SchemaDescriptor& schema,
                                    uint32_t payload_size) noexcept;
 
+// Schema-free shape check for payload-agnostic observers (v0.3 §35.3: the
+// supervisor and edge_shm_ctl). Validates magic/abi/header_size/endian/slot
+// count/mapping size only; never touches the schema fingerprint or payload.
+Result<void> validate_header_shape(const ChannelHeaderAbi& h) noexcept;
+
 // Next generation for create/replace from the journal's last completed record
 // (design §15.3); 1 when nothing is recorded. Fails on overflow.
 bool next_generation_from_journal(const ControlJournalV1& journal, uint64_t* out) noexcept;

@@ -3,6 +3,7 @@
 
 #include <cstdint>
 
+#include "edge_runtime/detail/shm_object.hpp"
 #include "edge_runtime/result.hpp"
 
 namespace edge_runtime::detail {
@@ -38,6 +39,31 @@ ProcessIdentity current_process_identity() noexcept;
 Liveness probe_liveness(uint64_t pid, uint64_t expected_start_ticks) noexcept;
 
 bool identity_matches_current(const ProcessIdentity& id) noexcept;
+
+// Long-lived pidfd for the v0.3 ProducerSupervisor (design §35.3): pidfd_open
+// once, FD_CLOEXEC, register with epoll; readable == the watched process
+// exited. This is the ONLY long-held pidfd in the library — the recovery
+// engine keeps using the one-shot probe_liveness above.
+class LivenessWatch {
+       public:
+	static Result<LivenessWatch> open(uint64_t pid) noexcept;
+	int fd() const noexcept { return pidfd_.get(); }
+	// Hands the pidfd to the caller (e.g. for epoll registration under a
+	// different owner); this watch then owns nothing.
+	int release() noexcept { return pidfd_.release(); }
+	// Non-blocking readability probe (level-triggered: stays readable after the
+	// exit until the fd is closed — callers dedupe via their reaped flag).
+	bool exited() const noexcept;
+
+	LivenessWatch() = default;
+	LivenessWatch(const LivenessWatch&) = delete;
+	LivenessWatch& operator=(const LivenessWatch&) = delete;
+	LivenessWatch(LivenessWatch&& other) noexcept = default;
+	LivenessWatch& operator=(LivenessWatch&& other) noexcept = default;
+
+       private:
+	UniqueFd pidfd_;
+};
 
 }  // namespace edge_runtime::detail
 

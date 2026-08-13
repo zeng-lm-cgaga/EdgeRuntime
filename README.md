@@ -10,6 +10,7 @@ EdgeRuntime 是一个 Linux C++17 跨进程通信库，提供固定 schema、单
 - **崩溃恢复**：对通道生命周期各崩溃点有界恢复（重建、槽位回收、重连），身份无法验证时安全关闭（fail closed）。
 - **双 transport（v0.2）**：POSIX shm（默认，行为与 v0.1 一致）与 **memfd + SCM_RIGHTS**——通道对象无全局名，consumer 通过 producer 进程内的 per-channel broker socket（`SO_PEERCRED` 同 UID 门控）收到一次性 fd；崩溃后对象随创建者消失，恢复得以简化。
 - **optional heartbeat（v0.2）**：`Producer<T>::heartbeat()` 显式声明"正在推进"，consumer 可区分正常空闲（`kDataStale`）与逻辑卡死（`kProducerStalled`，纯观测报告，不回收 owner）。
+- **ProducerSupervisor（v0.3）**：长驻 pidfd 监督 + 有界 backoff 重启——监督自 spawn 的 producer 子进程，崩溃自动重启（generation+1），心跳卡死经 SIGTERM→grace→SIGKILL 接管；clean exit 不重启，crash loop 封顶后 GAVE_UP。**不绕过恢复引擎**：接管只是信号，替换由子进程自己的 `Producer::create` 走死 owner 路径。
 - **诊断与取证**：`edge_shm_ctl` 检查通道状态（含 fd-pass 通道经只读 fd）、执行受验证的删除，不导出 payload 内容。
 
 ## 构建与测试

@@ -141,4 +141,36 @@ bool identity_matches_current(const ProcessIdentity& id) noexcept {
 	return hi == id.boot_id_hash_hi && lo == id.boot_id_hash_lo;
 }
 
+Result<LivenessWatch> LivenessWatch::open(uint64_t pid) noexcept {
+	if (pid == 0 || pid > static_cast<uint64_t>(INT32_MAX)) {
+		return make_error(ErrorCode::kInvalidOptions, "LivenessWatch::open",
+		                  "implausible pid");
+	}
+	const int pidfd = static_cast<int>(::syscall(SYS_pidfd_open, static_cast<pid_t>(pid), 0));
+	if (pidfd < 0) {
+		return make_error(classify_errno(errno), "LivenessWatch::open",
+		                  std::strerror(errno));
+	}
+	UniqueFd owned(pidfd);
+	// pidfd_open does not set CLOEXEC: without it, every respawned child would
+	// inherit the supervisor's pidfd (fd leak + self-watch).
+	const int flags = ::fcntl(pidfd, F_GETFD);
+	if (flags < 0 || ::fcntl(pidfd, F_SETFD, flags | FD_CLOEXEC) != 0) {
+		return make_error(classify_errno(errno), "LivenessWatch::open",
+		                  "fcntl(FD_CLOEXEC)");
+	}
+	LivenessWatch watch;
+	watch.pidfd_ = std::move(owned);
+	return Result<LivenessWatch>(std::move(watch));
+}
+
+bool LivenessWatch::exited() const noexcept {
+	if (pidfd_.get() < 0) return true;
+	struct pollfd pfd {};
+	pfd.fd = pidfd_.get();
+	pfd.events = POLLIN;
+	const int rc = ::poll(&pfd, 1, 0);
+	return rc > 0;
+}
+
 }  // namespace edge_runtime::detail

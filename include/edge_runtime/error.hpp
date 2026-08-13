@@ -40,6 +40,8 @@ enum class ErrorCode : uint32_t {
 	// v0.2 (design §17/§34)
 	kProducerStalled,
 	kTransportFailed,
+	// v0.3 (design §35)
+	kSupervisionExhausted,
 };
 
 // Fixed-size error payload. The hot path must not allocate or throw (design

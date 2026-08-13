@@ -99,3 +99,19 @@ add_test(
           $<TARGET_FILE:edge_shm_producer>
           $<TARGET_FILE:edge_shm_consumer>)
 set_tests_properties(heartbeat_er11 PROPERTIES TIMEOUT 90 LABELS integration)
+
+# ER13 v0.3 ProducerSupervisor driver (S1-S5): fork+execs the supervisor tool.
+add_executable(supervisor_test supervisor_test.cpp)
+edgeruntime_apply_project_options(supervisor_test)
+target_link_libraries(
+  supervisor_test PRIVATE edge_runtime GTest::gtest_main Threads::Threads rt)
+target_include_directories(
+  supervisor_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
+
+add_test(
+  NAME supervisor_er13
+  COMMAND supervisor_test
+          $<TARGET_FILE:edge_shm_supervisor>
+          $<TARGET_FILE:edge_shm_producer>
+          $<TARGET_FILE:edge_shm_consumer>)
+set_tests_properties(supervisor_er13 PROPERTIES TIMEOUT 150 LABELS integration)

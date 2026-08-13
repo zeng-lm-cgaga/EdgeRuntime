@@ -138,6 +138,40 @@ Result<void> validate_header_parse(const ChannelHeaderAbi& h, const SchemaDescri
 	return Result<void>::ok();
 }
 
+Result<void> validate_header_shape(const ChannelHeaderAbi& h) noexcept {
+	// v0.3 §35.3: payload-agnostic observers validate the structural envelope
+	// only. Schema fingerprint / payload size / schema version are the
+	// consumer's job (validate_header_parse) and never the observer's.
+	if (std::memcmp(h.magic, kChannelHeaderMagic, kHeaderMagicLen) != 0) {
+		return make_error(ErrorCode::kCorruptHeader, "validate_header_shape",
+		                  "header magic");
+	}
+	if (h.abi_major != kAbiMajor || h.abi_minor > kAbiMinorMax) {
+		return make_error(ErrorCode::kAbiMismatch, "validate_header_shape", "header abi");
+	}
+	if (h.header_size != sizeof(ChannelHeaderAbi)) {
+		return make_error(ErrorCode::kCorruptHeader, "validate_header_shape",
+		                  "header size");
+	}
+	if (h.endian_marker != kEndianMarker) {
+		return make_error(ErrorCode::kCorruptHeader, "validate_header_shape",
+		                  "endian marker");
+	}
+	if (h.slot_count != kSlotCount) {
+		return make_error(ErrorCode::kCorruptHeader, "validate_header_shape",
+		                  "slot count");
+	}
+	if (h.mapping_size < kChannelHeaderOffset + kSlotHeaderSize) {
+		return make_error(ErrorCode::kCorruptHeader, "validate_header_shape",
+		                  "mapping too small");
+	}
+	if (h.generation == 0) {
+		return make_error(ErrorCode::kCorruptHeader, "validate_header_shape",
+		                  "zero generation");
+	}
+	return Result<void>::ok();
+}
+
 bool next_generation_from_journal(const ControlJournalV1& journal, uint64_t* out) noexcept {
 	uint64_t last = 0;
 	if (journal.state == static_cast<uint32_t>(JournalState::kIdle)) {

@@ -39,9 +39,10 @@ constexpr const char* kErrorNames[] = {
         "SystemError",               // 27
         "ProducerStalled",           // 28  (v0.2)
         "TransportFailed",           // 29  (v0.2)
+        "SupervisionExhausted",      // 30  (v0.3)
 };
 static_assert(sizeof(kErrorNames) / sizeof(kErrorNames[0]) ==
-                      static_cast<size_t>(ErrorCode::kTransportFailed) + 1u,
+                      static_cast<size_t>(ErrorCode::kSupervisionExhausted) + 1u,
               "error name table must match the frozen ErrorCode enum");
 
 }  // namespace
@@ -54,7 +55,7 @@ Error::Error(ErrorCode c, const char* op, const char* ctx) : code(c), operation(
 
 const char* to_string(ErrorCode code) noexcept {
 	const uint32_t index = static_cast<uint32_t>(code);
-	if (index > static_cast<uint32_t>(ErrorCode::kTransportFailed)) return "UnknownError";
+	if (index > static_cast<uint32_t>(ErrorCode::kSupervisionExhausted)) return "UnknownError";
 	return kErrorNames[index];
 }
 

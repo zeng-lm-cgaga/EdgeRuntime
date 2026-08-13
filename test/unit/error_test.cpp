@@ -22,8 +22,10 @@ TEST(ErrorModel, EveryCodeHasStableName) {  // U08
 	// v0.2 additions (design §17/§34) append after kSystemError.
 	EXPECT_STREQ(to_string(ErrorCode::kProducerStalled), "ProducerStalled");
 	EXPECT_STREQ(to_string(ErrorCode::kTransportFailed), "TransportFailed");
+	// v0.3 addition (design §35).
+	EXPECT_STREQ(to_string(ErrorCode::kSupervisionExhausted), "SupervisionExhausted");
 	// no code maps to the sentinel; the table must cover the full range
-	for (uint32_t i = 0; i <= static_cast<uint32_t>(ErrorCode::kTransportFailed); ++i) {
+	for (uint32_t i = 0; i <= static_cast<uint32_t>(ErrorCode::kSupervisionExhausted); ++i) {
 		const char* name = to_string(static_cast<ErrorCode>(i));
 		EXPECT_NE(name, nullptr);
 		EXPECT_STRNE(name, "UnknownError");
