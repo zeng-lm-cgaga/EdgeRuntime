@@ -22,9 +22,27 @@ ctest --preset dev-debug
 cmake --preset asan-ubsan && cmake --build --preset asan-ubsan && ctest --preset asan-ubsan
 ```
 
+## 安装与使用
+
+```bash
+cmake --preset release && cmake --build --preset release
+cmake --install build/release --prefix /your/prefix
+```
+
+下游项目通过 `find_package` 使用安装后的静态库与头文件：
+
+```cmake
+find_package(EdgeRuntime CONFIG REQUIRED)
+target_link_libraries(app PRIVATE EdgeRuntime::edge_runtime)
+```
+
+完整示例见 [examples/consume_demo/](examples/consume_demo/)（独立 CMake 项目，验证已安装 target 可被干净消费）。数据编解码由调用方以 `PayloadCodec<T>` 特化提供，库不引入动态 schema。
+
 ## 目录结构
 
 - `include/edge_runtime/` — 公共 API：`Producer<T>` / `Consumer<T>` / `Result<T>` / `PayloadCodec<T>`
 - `src/edge_runtime/` — 实现：ABI 布局、共享内存对象、槽位协议、futex、进程身份、恢复引擎
 - `tools/` — 示例与工具：`edge_shm_producer` / `edge_shm_consumer` / `edge_shm_ctl`、`edge_crash_matrix`、`edge_shm_bench`
 - `test/` — 单元测试（gtest）与跨进程集成测试
+- `examples/` — 下游消费示例（独立 CMake 项目，消费已安装的 target）
+- `scripts/` — 本地 CI gate 脚本；`.github/workflows/` 提供相同 gate 的 GitHub Actions 版
