@@ -17,7 +17,8 @@ Result<UniqueFd> shm_open_create(const std::string& posix_name) {
 	const int fd = ::shm_open(posix_name.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC,
 	                          kExpectedShmMode);
 	if (fd < 0) {
-		return make_error(classify_errno(errno), "shm_open_create", std::strerror(errno));
+		const int e = errno;
+		return make_errno_error(e, "shm_open_create", std::strerror(e));
 	}
 	return Result<UniqueFd>(UniqueFd(fd));
 }
@@ -25,7 +26,8 @@ Result<UniqueFd> shm_open_create(const std::string& posix_name) {
 Result<UniqueFd> shm_open_existing(const std::string& posix_name) {
 	const int fd = ::shm_open(posix_name.c_str(), O_RDWR | O_CLOEXEC, 0);
 	if (fd < 0) {
-		return make_error(classify_errno(errno), "shm_open_existing", std::strerror(errno));
+		const int e = errno;
+		return make_errno_error(e, "shm_open_existing", std::strerror(e));
 	}
 	return Result<UniqueFd>(UniqueFd(fd));
 }
@@ -35,25 +37,34 @@ Result<void> shm_truncate(const UniqueFd& fd, uint64_t size) {
 		return make_error(ErrorCode::kInvalidOptions, "shm_truncate", "size exceeds off_t");
 	}
 	if (::ftruncate(fd.get(), static_cast<off_t>(size)) != 0) {
-		return make_error(classify_errno(errno), "shm_truncate", std::strerror(errno));
+		const int e = errno;
+		return make_errno_error(e, "shm_truncate", std::strerror(e));
 	}
 	return Result<void>::ok();
 }
 
 Result<MappedRegion> mmap_region(const UniqueFd& fd, uint64_t size) {
+	if (size > static_cast<uint64_t>(SIZE_MAX)) {
+		return make_error(ErrorCode::kInvalidOptions, "mmap_region", "size exceeds size_t");
+	}
 	void* addr = ::mmap(nullptr, static_cast<size_t>(size), PROT_READ | PROT_WRITE, MAP_SHARED,
 	                    fd.get(), 0);
 	if (addr == MAP_FAILED) {
-		return make_error(classify_errno(errno), "mmap_region", std::strerror(errno));
+		const int e = errno;
+		return make_errno_error(e, "mmap_region", std::strerror(e));
 	}
 	return Result<MappedRegion>(MappedRegion(addr, static_cast<size_t>(size)));
 }
 
 Result<MappedRegion> mmap_region_readonly(const UniqueFd& fd, uint64_t size) {
+	if (size > static_cast<uint64_t>(SIZE_MAX)) {
+		return make_error(ErrorCode::kInvalidOptions, "mmap_region_readonly",
+		                  "size exceeds size_t");
+	}
 	void* addr = ::mmap(nullptr, static_cast<size_t>(size), PROT_READ, MAP_SHARED, fd.get(), 0);
 	if (addr == MAP_FAILED) {
-		return make_error(classify_errno(errno), "mmap_region_readonly",
-		                  std::strerror(errno));
+		const int e = errno;
+		return make_errno_error(e, "mmap_region_readonly", std::strerror(e));
 	}
 	return Result<MappedRegion>(MappedRegion(addr, static_cast<size_t>(size)));
 }
@@ -62,8 +73,8 @@ Result<void> shm_fstat_and_capture(const UniqueFd& fd, uint64_t* dev, uint64_t* 
                                    uint64_t* size) {
 	struct stat st {};
 	if (::fstat(fd.get(), &st) != 0) {
-		return make_error(classify_errno(errno), "shm_fstat_and_capture",
-		                  std::strerror(errno));
+		const int e = errno;
+		return make_errno_error(e, "shm_fstat_and_capture", std::strerror(e));
 	}
 	if (!S_ISREG(st.st_mode)) {
 		return make_error(ErrorCode::kCorruptHeader, "shm_fstat_and_capture",
@@ -87,8 +98,8 @@ Result<void> memfd_fstat_and_capture(const UniqueFd& fd, uint64_t* dev, uint64_t
                                      uint64_t* size) {
 	struct stat st {};
 	if (::fstat(fd.get(), &st) != 0) {
-		return make_error(classify_errno(errno), "memfd_fstat_and_capture",
-		                  std::strerror(errno));
+		const int e = errno;
+		return make_errno_error(e, "memfd_fstat_and_capture", std::strerror(e));
 	}
 	if (!S_ISREG(st.st_mode)) {
 		return make_error(ErrorCode::kCorruptHeader, "memfd_fstat_and_capture",
@@ -125,8 +136,8 @@ Result<void> shm_unlink_checked(const std::string& posix_name, uint64_t expected
 		                  "inode changed before unlink");
 	}
 	if (::shm_unlink(posix_name.c_str()) != 0) {
-		return make_error(classify_errno(errno), "shm_unlink_checked",
-		                  std::strerror(errno));
+		const int e = errno;
+		return make_errno_error(e, "shm_unlink_checked", std::strerror(e));
 	}
 	// The name must now be ENOENT; a new object already present is a race.
 	const int probe = ::shm_open(posix_name.c_str(), O_RDWR | O_CLOEXEC, 0);
@@ -136,8 +147,8 @@ Result<void> shm_unlink_checked(const std::string& posix_name, uint64_t expected
 		                  "new object appeared after unlink");
 	}
 	if (errno != ENOENT) {
-		return make_error(classify_errno(errno), "shm_unlink_checked",
-		                  std::strerror(errno));
+		const int e = errno;
+		return make_errno_error(e, "shm_unlink_checked", std::strerror(e));
 	}
 	return Result<void>::ok();
 }

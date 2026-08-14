@@ -4,7 +4,7 @@
 # Re-runs, in one script on a clean tree, everything the release-audit milestone
 # must prove before a release can be claimed:
 #
-#   1. dev-debug build + full ctest          (§26: clean build, 54 tests green)
+#   1. dev-debug build + full ctest          (§26: clean build, all tests green)
 #   2. asan-ubsan build + full ctest         (§26: ASan/UBSan no known failures)
 #   3. release build (-Werror, failpoints off)  (§26: release compiles failpoints out)
 #   4. install + standalone consume_demo     (§26: public API and target installable)
@@ -37,6 +37,10 @@ done
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+
+if [[ "$OUT_DIR" != /* ]]; then
+	OUT_DIR="$ROOT/$OUT_DIR"
+fi
 
 mkdir -p "$OUT_DIR"
 LOG="$OUT_DIR/ci.log"
@@ -82,7 +86,7 @@ run_stage "install" cmake --install build/dev-debug --prefix "$INSTALL_PREFIX"
 # CMAKE_PREFIX_PATH must be absolute: CMake resolves a relative prefix against
 # the consume_demo build dir, not the repo root.
 INSTALL_PREFIX="$(cd "$INSTALL_PREFIX" && pwd)"
-DEMO_BUILD="$ROOT/$OUT_DIR/consume_demo_build"
+DEMO_BUILD="$OUT_DIR/consume_demo_build"
 rm -rf "$DEMO_BUILD"
 run_stage "consume_demo configure" \
 	cmake -S examples/consume_demo -B "$DEMO_BUILD" \

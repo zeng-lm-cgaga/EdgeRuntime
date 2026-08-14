@@ -42,12 +42,19 @@ Result<uint64_t> proc_stat_starttime(int pid) noexcept {
 	char buf[4096];
 	const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0) {
-		return make_error(classify_errno(errno), "proc_stat_starttime",
-		                  std::strerror(errno));
+		const int e = errno;
+		return make_errno_error(e, "proc_stat_starttime", std::strerror(e));
 	}
-	const ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+	ssize_t n = -1;
+	do {
+		n = ::read(fd, buf, sizeof(buf) - 1);
+	} while (n < 0 && errno == EINTR);
+	const int read_errno = errno;
 	::close(fd);
-	if (n <= 0) {
+	if (n < 0) {
+		return make_errno_error(read_errno, "proc_stat_starttime", std::strerror(read_errno));
+	}
+	if (n == 0) {
 		return make_error(ErrorCode::kRecoveryBlocked, "proc_stat_starttime",
 		                  "empty or unreadable stat");
 	}
@@ -148,16 +155,16 @@ Result<LivenessWatch> LivenessWatch::open(uint64_t pid) noexcept {
 	}
 	const int pidfd = static_cast<int>(::syscall(SYS_pidfd_open, static_cast<pid_t>(pid), 0));
 	if (pidfd < 0) {
-		return make_error(classify_errno(errno), "LivenessWatch::open",
-		                  std::strerror(errno));
+		const int e = errno;
+		return make_errno_error(e, "LivenessWatch::open", std::strerror(e));
 	}
 	UniqueFd owned(pidfd);
 	// pidfd_open does not set CLOEXEC: without it, every respawned child would
 	// inherit the supervisor's pidfd (fd leak + self-watch).
 	const int flags = ::fcntl(pidfd, F_GETFD);
 	if (flags < 0 || ::fcntl(pidfd, F_SETFD, flags | FD_CLOEXEC) != 0) {
-		return make_error(classify_errno(errno), "LivenessWatch::open",
-		                  "fcntl(FD_CLOEXEC)");
+		const int e = errno;
+		return make_errno_error(e, "LivenessWatch::open", "fcntl(FD_CLOEXEC)");
 	}
 	LivenessWatch watch;
 	watch.pidfd_ = std::move(owned);

@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include "edge_runtime/detail/channel_layout.hpp"
+#include "edge_runtime/detail/checked_math.hpp"
 #include "edge_runtime/detail/checksum.hpp"
 #include "edge_runtime/detail/clock.hpp"
 #include "edge_runtime/detail/failpoint.hpp"
@@ -49,14 +50,28 @@ bool request_fingerprint_set(const FdBrokerRequestAbi& r) noexcept {
 	return false;
 }
 
-// Full recv of exactly `size` bytes (EINTR-safe). Short read / error -> false.
-bool recv_full(int fd, void* buf, size_t size) noexcept {
+inline constexpr int kServePollIntervalMs = 100;
+
+// Full recv of exactly `size` bytes. Polling keeps a half-open client from
+// pinning producer shutdown while still allowing arbitrarily fragmented input.
+bool recv_full(int fd, void* buf, size_t size, const std::atomic<bool>* stop) noexcept {
 	auto* dst = static_cast<char*>(buf);
 	size_t got = 0;
 	while (got < size) {
-		const ssize_t n = ::recv(fd, dst + got, size - got, 0);
-		if (n < 0) {
+		if (stop->load(std::memory_order_relaxed)) return false;
+		struct pollfd pfd {};
+		pfd.fd = fd;
+		pfd.events = POLLIN;
+		const int prc = ::poll(&pfd, 1, kServePollIntervalMs);
+		if (prc < 0) {
 			if (errno == EINTR) continue;
+			return false;
+		}
+		if (prc == 0) continue;
+		if ((pfd.revents & (POLLIN | POLLHUP)) == 0) return false;
+		const ssize_t n = ::recv(fd, dst + got, size - got, MSG_DONTWAIT);
+		if (n < 0) {
+			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
 			return false;
 		}
 		if (n == 0) return false;  // peer closed mid-record
@@ -135,9 +150,7 @@ int hand_out_fd(int shm_fd, bool readonly) noexcept {
 	if (!readonly) return ::fcntl(shm_fd, F_DUPFD_CLOEXEC, 0);
 	char path[64]{};
 	std::snprintf(path, sizeof(path), "/proc/self/fd/%d", shm_fd);
-	const int ro = ::open(path, O_RDONLY | O_CLOEXEC);
-	if (ro >= 0) return ro;
-	return ::fcntl(shm_fd, F_DUPFD_CLOEXEC, 0);  // documented fallback
+	return ::open(path, O_RDONLY | O_CLOEXEC);  // fail closed; never hand out O_RDWR
 }
 
 }  // namespace
@@ -159,15 +172,16 @@ Result<UniqueFd> memfd_create_object(const std::string& channel_name) {
 	const int fd = static_cast<int>(
 	        ::syscall(SYS_memfd_create, tag.c_str(), static_cast<unsigned long>(MFD_CLOEXEC)));
 	if (fd < 0) {
-		return make_error(classify_errno(errno), "memfd_create_object", std::strerror(errno));
+		const int e = errno;
+		return make_errno_error(e, "memfd_create_object", std::strerror(e));
 	}
 	UniqueFd owned(fd);
 	// memfd arrives with umask-derived mode (typically 0755); pin it to 0600 so
 	// memfd_fstat_and_capture's group/other check and the §33.3 permission
 	// discipline match the named-shm rules.
 	if (::fchmod(fd, static_cast<mode_t>(S_IRUSR | S_IWUSR)) != 0) {
-		return make_error(classify_errno(errno), "memfd_create_object",
-		                  std::strerror(errno));
+		const int e = errno;
+		return make_errno_error(e, "memfd_create_object", std::strerror(e));
 	}
 	return Result<UniqueFd>(std::move(owned));
 #else
@@ -180,7 +194,8 @@ Result<UniqueFd> memfd_create_object(const std::string& channel_name) {
 Result<UniqueFd> fd_broker_bind(const std::string& socket_path) {
 	const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (fd < 0) {
-		return make_error(classify_errno(errno), "fd_broker_bind", std::strerror(errno));
+		const int e = errno;
+		return make_errno_error(e, "fd_broker_bind", std::strerror(e));
 	}
 	UniqueFd listen_fd(fd);
 	struct sockaddr_un addr {};
@@ -200,20 +215,26 @@ Result<UniqueFd> fd_broker_bind(const std::string& socket_path) {
 			                  "live broker socket under path");
 		}
 		if (!unlink_socket(socket_path)) {
-			return make_error(classify_errno(errno), "fd_broker_bind", std::strerror(errno));
+			const int e = errno;
+			return make_errno_error(e, "fd_broker_bind", std::strerror(e));
 		}
 		rc = ::bind(fd, reinterpret_cast<struct sockaddr*>(&addr),
 		            static_cast<socklen_t>(sizeof(addr)));
 	}
 	if (rc != 0) {
-		return make_error(classify_errno(errno), "fd_broker_bind", std::strerror(errno));
+		const int e = errno;
+		return make_errno_error(e, "fd_broker_bind", std::strerror(e));
 	}
-	// Socket mode 0600 (design §33.4); bind leaves umask-derived permissions.
-	if (::fchmod(fd, static_cast<mode_t>(S_IRUSR | S_IWUSR)) != 0) {
-		return make_error(classify_errno(errno), "fd_broker_bind", std::strerror(errno));
+	// chmod the filesystem node, not the sockfs inode referred to by `fd`.
+	if (::chmod(socket_path.c_str(), static_cast<mode_t>(S_IRUSR | S_IWUSR)) != 0) {
+		const int e = errno;
+		(void)::unlink(socket_path.c_str());
+		return make_errno_error(e, "fd_broker_bind", std::strerror(e));
 	}
 	if (::listen(fd, static_cast<int>(kListenBacklog)) != 0) {
-		return make_error(classify_errno(errno), "fd_broker_bind", std::strerror(errno));
+		const int e = errno;
+		(void)::unlink(socket_path.c_str());
+		return make_errno_error(e, "fd_broker_bind", std::strerror(e));
 	}
 	return Result<UniqueFd>(std::move(listen_fd));
 }
@@ -249,7 +270,7 @@ void fd_broker_serve_loop(int listen_fd, int shm_fd, std::byte* base,
 		}
 
 		FdBrokerRequestAbi req{};
-		if (!recv_full(conn, &req, sizeof(req))) continue;
+		if (!recv_full(conn, &req, sizeof(req), stop)) continue;
 		if (std::memcmp(req.magic, kFdBrokerRequestMagic, sizeof(kFdBrokerRequestMagic) - 1) !=
 		    0) {
 			continue;  // garbage: drop, never answer an unparseable record
@@ -290,7 +311,6 @@ void fd_broker_serve_loop(int listen_fd, int shm_fd, std::byte* base,
 				UniqueFd out_guard(out_fd);
 				reply.checksum = reply_checksum_of(reply);
 				if (send_reply_with_fd(conn, reply, out_fd)) {
-					out_guard.release();  // ownership moved into the socket
 					EDGE_FAILPOINT(C14);  // crash matrix: served one request
 					continue;
 				}
@@ -306,7 +326,12 @@ void fd_broker_serve_loop(int listen_fd, int shm_fd, std::byte* base,
 Result<UniqueFd> fd_broker_request_fd(const std::string& socket_path, uint32_t channel_hash,
                                       const SchemaDescriptor& schema, bool readonly,
                                       FdBrokerReplyAbi* reply_out, uint64_t retry_ms) noexcept {
-	const uint64_t deadline = monotonic_deadline_ns(retry_ms * 1'000'000ull);
+	uint64_t retry_ns = 0;
+	if (!checked_mul_u64(retry_ms, 1'000'000ull, &retry_ns)) {
+		return make_error(ErrorCode::kInvalidOptions, "fd_broker_request_fd",
+		                  "retry timeout out of range");
+	}
+	const uint64_t deadline = monotonic_deadline_ns(retry_ns);
 	if (deadline == 0) {
 		return make_error(ErrorCode::kClockAnomaly, "fd_broker_request_fd",
 		                  "monotonic clock unavailable");
@@ -315,8 +340,9 @@ Result<UniqueFd> fd_broker_request_fd(const std::string& socket_path, uint32_t c
 	for (;;) {
 		const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 		if (fd < 0) {
-			return make_error(ErrorCode::kTransportFailed, "fd_broker_request_fd",
-			                  "socket create failed");
+			const int e = errno;
+			return make_errno_error(ErrorCode::kTransportFailed, e,
+			                        "fd_broker_request_fd", std::strerror(e));
 		}
 		UniqueFd conn_fd(fd);
 		struct sockaddr_un addr {};
@@ -338,8 +364,8 @@ Result<UniqueFd> fd_broker_request_fd(const std::string& socket_path, uint32_t c
 				(void)::nanosleep(&ts, nullptr);
 				continue;
 			}
-			return make_error(ErrorCode::kTransportFailed, "fd_broker_request_fd",
-			                  std::strerror(e));
+			return make_errno_error(ErrorCode::kTransportFailed, e,
+			                        "fd_broker_request_fd", std::strerror(e));
 		}
 
 		FdBrokerRequestAbi req{};
@@ -362,35 +388,42 @@ Result<UniqueFd> fd_broker_request_fd(const std::string& socket_path, uint32_t c
 		msg.msg_iovlen = 1;
 		msg.msg_control = cmsg_buf;
 		msg.msg_controllen = sizeof(cmsg_buf);
-		const ssize_t n = ::recvmsg(fd, &msg, 0);
-		if (n != static_cast<ssize_t>(sizeof(reply))) {
-			continue;  // truncated/absent reply: abandon this connection
+		const ssize_t n = ::recvmsg(fd, &msg, MSG_CMSG_CLOEXEC);
+		UniqueFd received_fd;
+		for (auto* cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+			if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
+			    cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
+				int passed_fd = -1;
+				std::memcpy(&passed_fd, CMSG_DATA(cmsg), sizeof(passed_fd));
+				if (received_fd.get() < 0) {
+					received_fd.reset(passed_fd);
+				} else {
+					::close(passed_fd);  // protocol allows exactly one descriptor
+				}
+			}
+		}
+		if (n != static_cast<ssize_t>(sizeof(reply)) ||
+		    (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0) {
+			continue;  // received_fd closes even for a malformed ancillary record
 		}
 		if (std::memcmp(reply.magic, kFdBrokerReplyMagic, sizeof(kFdBrokerReplyMagic) - 1) != 0 ||
 		    reply_checksum_of(reply) != reply.checksum) {
 			continue;  // unparseable wire record: never trust it
 		}
 		const auto status = static_cast<FdBrokerStatus>(reply.status);
-		int received_fd = -1;
-		for (auto* cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-			if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
-			    cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
-				std::memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(int));
-			}
-		}
 		if (status == FdBrokerStatus::kOk) {
-			if (received_fd < 0) continue;  // ok status without fd: protocol violation
-			// SCM_RIGHTS does not guarantee CLOEXEC on the received fd.
-			const int flags = ::fcntl(received_fd, F_GETFD);
-			if (flags < 0 || ::fcntl(received_fd, F_SETFD, flags | FD_CLOEXEC) != 0) {
-				::close(received_fd);
-				return make_error(ErrorCode::kTransportFailed, "fd_broker_request_fd",
-				                  "fcntl on received fd failed");
+			if (received_fd.get() < 0) continue;  // ok status without fd: protocol violation
+			// MSG_CMSG_CLOEXEC handles Linux atomically; keep an explicit check so a
+			// platform/libc regression cannot silently leak the fd across exec.
+			const int flags = ::fcntl(received_fd.get(), F_GETFD);
+			if (flags < 0 || ::fcntl(received_fd.get(), F_SETFD, flags | FD_CLOEXEC) != 0) {
+				const int e = errno;
+				return make_errno_error(ErrorCode::kTransportFailed, e,
+				                        "fd_broker_request_fd", "fcntl on received fd failed");
 			}
 			if (reply_out != nullptr) *reply_out = reply;
-			return Result<UniqueFd>(UniqueFd(received_fd));
+			return Result<UniqueFd>(std::move(received_fd));
 		}
-		if (received_fd >= 0) ::close(received_fd);
 		if (status == FdBrokerStatus::kChannelMismatch) {
 			return make_error(ErrorCode::kSchemaMismatch, "fd_broker_request_fd",
 			                  "broker rejected channel/schema");

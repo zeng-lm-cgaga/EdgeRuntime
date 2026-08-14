@@ -14,6 +14,7 @@ namespace {
 using edge_runtime::classify_errno;
 using edge_runtime::Error;
 using edge_runtime::ErrorCode;
+using edge_runtime::make_errno_error;
 using edge_runtime::to_string;
 
 TEST(ErrorModel, EveryCodeHasStableName) {  // U08
@@ -64,6 +65,18 @@ TEST(ErrorModel, NullContext) {  // U08
 	Error e(ErrorCode::kNotFound, "op3");
 	EXPECT_STREQ(e.context, "");
 	EXPECT_STREQ(e.operation, "op3");
+}
+
+TEST(ErrorModel, SyscallErrorPreservesErrno) {
+	const Error classified = make_errno_error(EACCES, "open", "permission denied");
+	EXPECT_EQ(classified.code, ErrorCode::kPermissionDenied);
+	EXPECT_EQ(classified.errno_value, EACCES);
+	EXPECT_STREQ(classified.operation, "open");
+
+	const Error domain = make_errno_error(ErrorCode::kTransportFailed, ECONNREFUSED,
+	                                      "connect", "connection refused");
+	EXPECT_EQ(domain.code, ErrorCode::kTransportFailed);
+	EXPECT_EQ(domain.errno_value, ECONNREFUSED);
 }
 
 }  // namespace

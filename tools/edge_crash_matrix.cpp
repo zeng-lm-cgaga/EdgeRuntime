@@ -1278,7 +1278,10 @@ static bool run_c20(CaseDriver& d) {
 	if (rc != 3) d.fail("C20 expected supervisor exit 3 (GAVE_UP), got " +
 	                    std::to_string(rc));
 	d.expect_contains(sup.stdout_text(), "GAVE_UP", "C20 supervisor");
-	d.expect_contains(sup.stdout_text(), "RESTART attempt=3", "C20 supervisor");
+	d.expect_contains(sup.stdout_text(), "GAVE_UP attempts=4 restarts=3", "C20 supervisor");
+	d.expect_contains(sup.stdout_text(), "RESTART attempt=1 delay=50000000ns", "C20 supervisor");
+	d.expect_contains(sup.stdout_text(), "RESTART attempt=2 delay=100000000ns", "C20 supervisor");
+	d.expect_contains(sup.stdout_text(), "RESTART attempt=3 delay=200000000ns", "C20 supervisor");
 	if (contains(sup.stdout_text(), "RESTART attempt=4")) {
 		d.fail("C20 restarted past the cap");
 	}

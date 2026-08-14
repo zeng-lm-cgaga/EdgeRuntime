@@ -48,6 +48,19 @@ struct CreatedObjectGuard {
 	}
 };
 
+struct ProducerUseGuard {
+	std::atomic<bool>* in_use = nullptr;
+	bool armed = false;
+
+	explicit ProducerUseGuard(std::atomic<bool>* value) noexcept
+	    : in_use(value), armed(!value->exchange(true, std::memory_order_acq_rel)) {}
+	~ProducerUseGuard() {
+		if (armed) in_use->store(false, std::memory_order_release);
+	}
+
+	explicit operator bool() const noexcept { return armed; }
+};
+
 // Shared stale-guard block for publish() and heartbeat() (design §15.6/§34):
 // the instance must still be READY, the frozen generation/nonce must still
 // match, the producer role must still belong to this handle, and the producer
@@ -380,7 +393,8 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 	const ProcessIdentity self = current_process_identity();
 	uint8_t nonce_bytes[16]{};
 	if (!random_bytes(nonce_bytes, sizeof(nonce_bytes))) {
-		return make_error(ErrorCode::kSystemError, "Producer::create", "getrandom");
+		const int e = errno;
+		return make_errno_error(ErrorCode::kSystemError, e, "Producer::create", "getrandom");
 	}
 	uint64_t nonce_hi = 0;
 	uint64_t nonce_lo = 0;
@@ -600,6 +614,12 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 Result<PublishInfo> producer_publish_impl(const std::shared_ptr<ProducerHandle>& handle,
                                           const std::byte* encoded,
                                           uint32_t encoded_size) noexcept {
+	ProducerUseGuard use(&handle->operation_in_use);
+	if (!use) {
+		return make_error(ErrorCode::kConcurrentHandleUse, "Producer::publish",
+		                  "concurrent handle use");
+	}
+
 	// The encoded size was frozen at create; any drift is an internal bug that
 	// must never reach shared memory.
 	if (encoded_size != handle->payload_size) {
@@ -693,6 +713,12 @@ uint64_t producer_generation_impl(const std::shared_ptr<ProducerHandle>& handle)
 }
 
 Result<ChannelStatus> producer_status_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept {
+	ProducerUseGuard use(&handle->operation_in_use);
+	if (!use) {
+		return make_error(ErrorCode::kConcurrentHandleUse, "Producer::status",
+		                  "concurrent handle use");
+	}
+
 	if (handle->transport == Transport::kPosixShm) {
 		// Slow check (design §15.6): the name must still resolve to our frozen inode.
 		const std::string shm_name = channel_shm_name(handle->channel_name);
@@ -752,6 +778,12 @@ void producer_shutdown_impl(const std::shared_ptr<ProducerHandle>& handle) noexc
 }
 
 Result<void> producer_remove_if_owner_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept {
+	ProducerUseGuard use(&handle->operation_in_use);
+	if (!use) {
+		return make_error(ErrorCode::kConcurrentHandleUse, "Producer::remove_if_owner",
+		                  "concurrent handle use");
+	}
+
 	const bool fd_mode = handle->transport == Transport::kMemfdFdPass;
 	const std::string shm_name = channel_shm_name(handle->channel_name);
 	const std::string lock_path = channel_lock_path(handle->channel_name);
@@ -840,6 +872,12 @@ Result<void> producer_remove_if_owner_impl(const std::shared_ptr<ProducerHandle>
 }
 
 Result<void> producer_heartbeat_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept {
+	ProducerUseGuard use(&handle->operation_in_use);
+	if (!use) {
+		return make_error(ErrorCode::kConcurrentHandleUse, "Producer::heartbeat",
+		                  "concurrent handle use");
+	}
+
 	// v0.2 optional heartbeat (design §34): an explicit application declaration
 	// of making-progress. Same stale guards as publish; disabled heartbeat is a
 	// validated no-op (the interval was frozen at create).

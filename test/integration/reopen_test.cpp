@@ -7,9 +7,13 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "edge_runtime/consumer.hpp"
@@ -21,9 +25,11 @@
 namespace {
 
 using edge_runtime::ChannelOptions;
+using edge_runtime::Consumer;
 using edge_runtime::ErrorCode;
 using edge_runtime::Producer;
 using edge_runtime::SchemaDescriptor;
+using edge_runtime::Transport;
 
 std::string g_helper;
 
@@ -142,6 +148,112 @@ TEST(Reopen, ConsumerOwnershipAndCleanShutdown) {
 	ASSERT_TRUE(c3) << edge_runtime::to_string(c3.error().code) << " " << c3.error().context;
 
 	ASSERT_TRUE(prod.value().remove_if_owner());
+}
+
+void verify_reconnect_to_replaced_instance(Transport transport) {
+	const std::string name = edge_test::unique_channel_name("consumer_reconnect");
+	ChannelOptions opts;
+	opts.name = name;
+	opts.transport = transport;
+	opts.reconnect_timeout = std::chrono::milliseconds(2000);
+	const SchemaDescriptor schema = TestPayloadV1Schema();
+
+	std::optional<Consumer<TestPayloadV1>> consumer;
+	uint64_t old_generation = 0;
+	std::array<std::byte, 16> old_nonce{};
+	{
+		auto producer = Producer<TestPayloadV1>::create(opts, schema);
+		ASSERT_TRUE(producer) << edge_runtime::to_string(producer.error().code);
+		auto first_publish = producer.value().publish(TestPayloadV1{0x5A000001u, 11, 0});
+		ASSERT_TRUE(first_publish);
+		old_generation = first_publish.value().generation;
+
+		auto opened = Consumer<TestPayloadV1>::open(opts, schema);
+		ASSERT_TRUE(opened) << edge_runtime::to_string(opened.error().code);
+		consumer.emplace(std::move(opened.value()));
+		auto first = consumer->try_read_latest();
+		ASSERT_TRUE(first);
+		old_nonce = first.value().instance_nonce;
+		EXPECT_EQ(first.value().sequence, 1u);
+
+		// Reconnect is only for a replacement. Failure against the current live
+		// instance must leave the existing handle usable.
+		auto premature = consumer->reconnect();
+		ASSERT_FALSE(premature);
+		EXPECT_EQ(premature.error().code, ErrorCode::kConsumerAlreadyOwned);
+		ASSERT_TRUE(producer.value().publish(TestPayloadV1{0x5A000001u, 12, 0}));
+		auto second = consumer->try_read_latest();
+		ASSERT_TRUE(second);
+		EXPECT_EQ(second.value().value.counter, 12u);
+		// producer clean shutdown leaves the consumer holding the old mapping.
+	}
+
+	auto successor = Producer<TestPayloadV1>::create(opts, schema);
+	ASSERT_TRUE(successor) << edge_runtime::to_string(successor.error().code) << " "
+	                       << successor.error().context;
+	auto successor_publish = successor.value().publish(TestPayloadV1{0x5A000001u, 21, 0});
+	ASSERT_TRUE(successor_publish);
+	ASSERT_EQ(successor_publish.value().generation, old_generation + 1);
+	ASSERT_EQ(successor_publish.value().sequence, 1u);
+
+	auto reconnected = consumer->reconnect();
+	ASSERT_TRUE(reconnected) << edge_runtime::to_string(reconnected.error().code) << " "
+	                         << reconnected.error().context;
+	EXPECT_EQ(reconnected.value().old_generation, old_generation);
+	EXPECT_EQ(reconnected.value().new_generation, old_generation + 1);
+	EXPECT_EQ(reconnected.value().old_instance_nonce, old_nonce);
+	EXPECT_NE(reconnected.value().new_instance_nonce, old_nonce);
+	EXPECT_FALSE(reconnected.value().schema_changed);
+
+	auto sample = consumer->try_read_latest();
+	ASSERT_TRUE(sample) << edge_runtime::to_string(sample.error().code);
+	EXPECT_EQ(sample.value().value.counter, 21u);
+	EXPECT_EQ(sample.value().generation, old_generation + 1);
+	EXPECT_EQ(sample.value().sequence, 1u);
+	EXPECT_EQ(sample.value().missed_samples, 0u);
+	consumer.reset();
+	EXPECT_TRUE(successor.value().remove_if_owner());
+}
+
+TEST(Reopen, ConsumerReconnectsToPosixReplacement) {
+	verify_reconnect_to_replaced_instance(Transport::kPosixShm);
+}
+
+TEST(Reopen, ConsumerReconnectsToMemfdReplacement) {
+	verify_reconnect_to_replaced_instance(Transport::kMemfdFdPass);
+}
+
+TEST(Reopen, ReconnectRejectsConcurrentWaitWithoutInvalidatingIt) {
+	const std::string name = edge_test::unique_channel_name("reconnect_wait");
+	ChannelOptions opts;
+	opts.name = name;
+	const SchemaDescriptor schema = TestPayloadV1Schema();
+	auto producer = Producer<TestPayloadV1>::create(opts, schema);
+	ASSERT_TRUE(producer);
+	auto opened = Consumer<TestPayloadV1>::open(opts, schema);
+	ASSERT_TRUE(opened);
+	std::optional<Consumer<TestPayloadV1>> consumer(std::move(opened.value()));
+
+	std::atomic<bool> wait_started{false};
+	std::optional<edge_runtime::Result<edge_runtime::Sample<TestPayloadV1>>> waited;
+	std::thread waiter([&] {
+		wait_started.store(true, std::memory_order_release);
+		waited.emplace(consumer->wait_latest(std::chrono::seconds(2)));
+	});
+	while (!wait_started.load(std::memory_order_acquire)) std::this_thread::yield();
+	std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+	auto reconnect = consumer->reconnect();
+	EXPECT_FALSE(reconnect);
+	EXPECT_EQ(reconnect.error().code, ErrorCode::kConcurrentHandleUse);
+	EXPECT_TRUE(producer.value().publish(TestPayloadV1{0x5A000001u, 31, 0}));
+	waiter.join();
+	ASSERT_TRUE(waited.has_value());
+	ASSERT_TRUE(*waited) << edge_runtime::to_string(waited->error().code);
+	EXPECT_EQ(waited->value().value.counter, 31u);
+
+	consumer.reset();
+	EXPECT_TRUE(producer.value().remove_if_owner());
 }
 
 }  // namespace

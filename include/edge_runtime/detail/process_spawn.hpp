@@ -1,11 +1,10 @@
 #ifndef EDGE_RUNTIME_DETAIL_PROCESS_SPAWN_HPP
 #define EDGE_RUNTIME_DETAIL_PROCESS_SPAWN_HPP
 
-// Library-side fork+exec for the v0.3 ProducerSupervisor (design §35.3).
-// Unlike the test fixture spawners, this one is safe for a multi-threaded
-// parent: the char*[] argv is built BEFORE fork (only async-signal-safe calls
-// run between fork and exec), and both pipe ends are O_NONBLOCK so a verbose
-// child can never wedge the supervisor's drain loop.
+// Library-side posix_spawn for the v0.3 ProducerSupervisor (design §35.3).
+// The libc implementation owns the fork/vfork-to-exec window, so no application
+// code or allocator runs in a post-fork child of a multi-threaded process. Both
+// pipe ends are O_NONBLOCK so verbose output cannot wedge supervision.
 
 #include <string>
 #include <vector>
@@ -20,9 +19,9 @@ struct SpawnedProcess {
 	UniqueFd stdout_read;  // O_NONBLOCK read end; EOF when the child exits
 };
 
-// fork + exec(argv[0], argv...). The child's stdout goes to stdout_read; its
-// stderr is inherited (surfaces in the supervisor's own log stream). The
-// caller reaps the child with waitpid; nothing here detaches or double-forks.
+// Spawn argv[0] directly (no PATH search). The child's stdout goes to
+// stdout_read; stderr is inherited. The caller reaps the child with waitpid;
+// nothing here detaches or double-forks.
 Result<SpawnedProcess> spawn_process(const std::vector<std::string>& argv) noexcept;
 
 }  // namespace edge_runtime::detail

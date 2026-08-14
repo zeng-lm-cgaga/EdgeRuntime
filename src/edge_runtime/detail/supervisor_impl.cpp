@@ -24,7 +24,14 @@ inline constexpr int kEpollMaxEvents = 8;
 inline constexpr uint64_t kStdoutTailLimit = 4096;
 inline constexpr uint64_t kAwaitReadySliceNs = 100'000'000;  // 100 ms open retry slice
 
-uint64_t ms_to_ns(int64_t ms) { return ms > 0 ? static_cast<uint64_t>(ms) * 1'000'000ull : 0; }
+bool valid_milliseconds(int64_t ms, bool allow_zero) noexcept {
+	if (ms < 0 || (!allow_zero && ms == 0)) return false;
+	return static_cast<uint64_t>(ms) <= UINT64_MAX / 1'000'000ull;
+}
+
+uint64_t ms_to_ns(int64_t ms) noexcept {
+	return ms > 0 ? static_cast<uint64_t>(ms) * 1'000'000ull : 0;
+}
 
 // epoll_wait timeout in int milliseconds, clamped (design §35.3 deadline
 // slicing — all waits go through epoll so request_stop stays responsive).
@@ -36,11 +43,15 @@ int ns_to_epoll_ms(uint64_t ns) {
 	return static_cast<int>(ms);
 }
 
-void epoll_add(SupervisorHandle& h, int fd, uint32_t events) {
+Result<void> epoll_add(SupervisorHandle& h, int fd, uint32_t events) noexcept {
 	struct epoll_event ev {};
 	ev.events = events;
 	ev.data.fd = fd;
-	(void)::epoll_ctl(h.epoll_fd.get(), EPOLL_CTL_ADD, fd, &ev);
+	if (::epoll_ctl(h.epoll_fd.get(), EPOLL_CTL_ADD, fd, &ev) != 0) {
+		const int e = errno;
+		return make_errno_error(e, "ProducerSupervisor::epoll_add", std::strerror(e));
+	}
+	return Result<void>::ok();
 }
 
 void append_stdout_tail(std::string* tail, const char* data, size_t size) {
@@ -72,35 +83,62 @@ void drain_child_stdout(SupervisorHandle& h) {
 		}
 		if (errno == EAGAIN || errno == EWOULDBLOCK) return;
 		if (errno == EINTR) continue;
+		h.child.stdout_read.reset();
 		return;
 	}
 }
 
 // Reap the child once; idempotent. Returns true when the child is known dead
 // (either just reaped now or already reaped earlier).
-bool reap_child(SupervisorHandle& h, int* status_out) {
-	if (h.child.pid <= 0) return true;
+Result<bool> reap_child(SupervisorHandle& h, int* status_out) noexcept {
+	if (h.child.pid <= 0) return Result<bool>(true);
 	if (h.child_reaped) {
 		*status_out = h.last_exit_status_for_reap;
-		return true;
+		return Result<bool>(true);
 	}
 	int status = 0;
-	const pid_t rc = ::waitpid(h.child.pid, &status, WNOHANG);
+	pid_t rc = -1;
+	do {
+		rc = ::waitpid(h.child.pid, &status, WNOHANG);
+	} while (rc < 0 && errno == EINTR);
 	if (rc == h.child.pid) {
 		h.child_reaped = true;
 		h.last_exit_status_for_reap = status;
 		h.child_pidfd.reset();  // closes the pidfd; epoll auto-drops it
 		*status_out = status;
-		return true;
+		return Result<bool>(true);
+	}
+	if (rc < 0) {
+		const int e = errno;
+		return make_errno_error(e, "ProducerSupervisor::waitpid", std::strerror(e));
 	}
 	*status_out = 0;
-	return false;
+	return Result<bool>(false);
 }
 
-void arm_child_kill(SupervisorHandle& h) {
-	if (h.child.pid <= 0 || h.child_reaped || h.child_kill_in_progress) return;
+Result<int> reap_child_blocking(pid_t pid) noexcept {
+	int status = 0;
+	pid_t rc = -1;
+	do {
+		rc = ::waitpid(pid, &status, 0);
+	} while (rc < 0 && errno == EINTR);
+	if (rc < 0) {
+		const int e = errno;
+		return make_errno_error(e, "ProducerSupervisor::waitpid", std::strerror(e));
+	}
+	return Result<int>(status);
+}
+
+Result<void> arm_child_kill(SupervisorHandle& h) noexcept {
+	if (h.child.pid <= 0 || h.child_reaped || h.child_kill_in_progress) {
+		return Result<void>::ok();
+	}
+	if (::kill(h.child.pid, SIGTERM) != 0 && errno != ESRCH) {
+		const int e = errno;
+		return make_errno_error(e, "ProducerSupervisor::kill", std::strerror(e));
+	}
 	h.child_kill_in_progress = true;
-	(void)::kill(h.child.pid, SIGTERM);
+	return Result<void>::ok();
 }
 
 bool is_clean_exit_status(int status) {
@@ -117,7 +155,8 @@ uint64_t backoff_delay_ns(const SupervisorHandle& h) {
 	uint64_t delay = ms_to_ns(h.options.initial_delay.count());
 	uint64_t capped = ms_to_ns(h.options.max_delay.count());
 	if (capped == 0) capped = delay;
-	for (uint32_t i = 0; i < h.consecutive_failures && delay < capped; ++i) {
+	// attempt 1 uses initial_delay; each subsequent armed restart multiplies.
+	for (uint32_t i = 1; i < h.consecutive_failures && delay < capped; ++i) {
 		if (delay > capped / h.options.multiplier) {
 			delay = capped;
 			break;
@@ -128,12 +167,15 @@ uint64_t backoff_delay_ns(const SupervisorHandle& h) {
 	return delay;
 }
 
-// Count one restart failure; returns true when the crash-loop cap is hit.
+// Arm one restart after a failure. max_restarts counts actual retries after
+// the initial spawn, so exhaustion is checked before increment/event emission.
 bool count_failure(SupervisorHandle& h) {
 	const uint64_t now = monotonic_now_ns();
-	if (now - h.last_spawn_mono_ns >= ms_to_ns(h.options.stable_reset_window.count())) {
+	if (now != 0 && h.last_spawn_mono_ns != 0 && now >= h.last_spawn_mono_ns &&
+	    now - h.last_spawn_mono_ns >= ms_to_ns(h.options.stable_reset_window.count())) {
 		h.consecutive_failures = 0;  // long-stable child: reset the window
 	}
+	if (h.consecutive_failures >= h.options.max_restarts) return true;
 	++h.consecutive_failures;
 	if (h.options.on_event != nullptr) {
 		SupervisorEventInfo info;
@@ -142,7 +184,7 @@ bool count_failure(SupervisorHandle& h) {
 		info.delay_ns = backoff_delay_ns(h);
 		h.options.on_event(info, h.options.event_user_data);
 	}
-	return h.consecutive_failures >= h.options.max_restarts;
+	return false;
 }
 
 void emit_event(const SupervisorHandle& h, SupervisorEvent event, uint64_t pid,
@@ -176,14 +218,18 @@ Result<std::shared_ptr<SupervisorHandle>> supervisor_create_impl(
 		return make_error(ErrorCode::kInvalidOptions, "ProducerSupervisor::create",
 		                  "unknown transport");
 	}
-	if (options.watch_interval.count() <= 0 || options.create_timeout.count() <= 0) {
+	if (!valid_milliseconds(options.watch_interval.count(), false) ||
+	    !valid_milliseconds(options.create_timeout.count(), false)) {
 		return make_error(ErrorCode::kInvalidOptions, "ProducerSupervisor::create",
-		                  "non-positive watch/create timeouts");
+		                  "invalid watch/create timeouts");
 	}
-	if (options.max_delay.count() < options.initial_delay.count() ||
-	    options.initial_delay.count() < 0) {
+	if (!valid_milliseconds(options.initial_delay.count(), true) ||
+	    !valid_milliseconds(options.max_delay.count(), true) ||
+	    !valid_milliseconds(options.stable_reset_window.count(), false) ||
+	    !valid_milliseconds(options.stall_grace.count(), true) ||
+	    options.max_delay.count() < options.initial_delay.count()) {
 		return make_error(ErrorCode::kInvalidOptions, "ProducerSupervisor::create",
-		                  "max_delay < initial_delay");
+		                  "invalid delay/grace option");
 	}
 	if (options.multiplier < 1) {
 		return make_error(ErrorCode::kInvalidOptions, "ProducerSupervisor::create",
@@ -195,7 +241,7 @@ Result<std::shared_ptr<SupervisorHandle>> supervisor_create_impl(
 }
 
 Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>& h) noexcept {
-	if (h->running.exchange(true, std::memory_order_acquire)) {
+	if (h->running.exchange(true, std::memory_order_acq_rel)) {
 		return make_error(ErrorCode::kConcurrentHandleUse, "ProducerSupervisor::run",
 		                  "already running");
 	}
@@ -203,20 +249,31 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 	// ---- epoll / eventfd / signalfd setup --------------------------------------
 	const int epfd = ::epoll_create1(EPOLL_CLOEXEC);
 	if (epfd < 0) {
+		const int e = errno;
 		h->running.store(false, std::memory_order_release);
-		return make_error(classify_errno(errno), "ProducerSupervisor::run",
-		                  std::strerror(errno));
+		return make_errno_error(e, "ProducerSupervisor::run", std::strerror(e));
 	}
 	h->epoll_fd = UniqueFd(epfd);
 
 	const int evfd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	if (evfd < 0) {
+		const int e = errno;
+		h->epoll_fd.reset();
 		h->running.store(false, std::memory_order_release);
-		return make_error(classify_errno(errno), "ProducerSupervisor::run",
-		                  std::strerror(errno));
+		return make_errno_error(e, "ProducerSupervisor::run", std::strerror(e));
 	}
-	h->stop_evfd = UniqueFd(evfd);
-	epoll_add(*h, evfd, EPOLLIN);
+	{
+		std::lock_guard<std::mutex> lock(h->stop_fd_mutex);
+		h->stop_evfd = UniqueFd(evfd);
+	}
+	auto add_stop = epoll_add(*h, evfd, EPOLLIN);
+	if (!add_stop) {
+		std::lock_guard<std::mutex> lock(h->stop_fd_mutex);
+		h->stop_evfd.reset();
+		h->epoll_fd.reset();
+		h->running.store(false, std::memory_order_release);
+		return add_stop.error();
+	}
 
 	// Block SIGTERM/SIGINT in THIS thread and receive them via signalfd
 	// (design §35.3). The previous mask is restored when run() returns.
@@ -224,20 +281,41 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGTERM);
 	sigaddset(&mask, SIGINT);
-	if (::pthread_sigmask(SIG_BLOCK, &mask, &old_mask) != 0) {
+	const int mask_rc = ::pthread_sigmask(SIG_BLOCK, &mask, &old_mask);
+	if (mask_rc != 0) {
+		{
+			std::lock_guard<std::mutex> lock(h->stop_fd_mutex);
+			h->stop_evfd.reset();
+		}
+		h->epoll_fd.reset();
 		h->running.store(false, std::memory_order_release);
-		return make_error(classify_errno(errno), "ProducerSupervisor::run",
-		                  "pthread_sigmask");
+		return make_errno_error(mask_rc, "ProducerSupervisor::run", "pthread_sigmask");
 	}
 	const int sfd = ::signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
 	if (sfd < 0) {
+		const int e = errno;
 		(void)::pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
+		{
+			std::lock_guard<std::mutex> lock(h->stop_fd_mutex);
+			h->stop_evfd.reset();
+		}
+		h->epoll_fd.reset();
 		h->running.store(false, std::memory_order_release);
-		return make_error(classify_errno(errno), "ProducerSupervisor::run",
-		                  std::strerror(errno));
+		return make_errno_error(e, "ProducerSupervisor::run", std::strerror(e));
 	}
 	h->signalfd_fd = UniqueFd(sfd);
-	epoll_add(*h, sfd, EPOLLIN);
+	auto add_signal = epoll_add(*h, sfd, EPOLLIN);
+	if (!add_signal) {
+		h->signalfd_fd.reset();
+		(void)::pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
+		{
+			std::lock_guard<std::mutex> lock(h->stop_fd_mutex);
+			h->stop_evfd.reset();
+		}
+		h->epoll_fd.reset();
+		h->running.store(false, std::memory_order_release);
+		return add_signal.error();
+	}
 
 	SupervisionResult result;
 	result.outcome = SupervisionOutcome::kStopped;
@@ -251,6 +329,23 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 	uint64_t backoff_deadline = 0;
 	uint64_t create_deadline = 0;
 	uint64_t grace_deadline = 0;
+	bool loop_failed = false;
+	Error loop_error;
+	const auto set_deadline = [&](uint64_t timeout_ns, uint64_t* out) {
+		*out = monotonic_deadline_ns(timeout_ns);
+		if (*out != 0) return true;
+		loop_error = make_error(ErrorCode::kClockAnomaly, "ProducerSupervisor::run",
+		                        "monotonic clock unavailable");
+		loop_failed = true;
+		return false;
+	};
+	const auto enter_backoff = [&] {
+		if (!set_deadline(backoff_delay_ns(*h), &backoff_deadline)) {
+			phase = Phase::kDone;
+			return;
+		}
+		phase = Phase::kBackoff;
+	};
 
 	while (phase != Phase::kDone) {
 		if (h->stop_requested.load(std::memory_order_acquire)) {
@@ -271,50 +366,84 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 				h->view = ChannelObserverView{};
 				h->have_view = false;
 				h->stdout_tail.clear();
+				++h->spawn_attempts;
 				auto sp = spawn_process(h->options.producer_argv);
 				if (!sp) {
-					// fork/exec failure counts as a restart failure.
+					// A posix_spawn failure is still a consumed spawn attempt.
 					if (count_failure(*h)) {
 						result.outcome = SupervisionOutcome::kRestartsExhausted;
 						phase = Phase::kDone;
 						break;
 					}
-					backoff_deadline = monotonic_now_ns() + backoff_delay_ns(*h);
-					phase = Phase::kBackoff;
+					enter_backoff();
 					break;
 				}
 				h->child = std::move(sp.value());
 				h->child_reaped = false;
 				h->child_kill_in_progress = false;
 				h->reap_decision = SupervisorHandle::ReapDecision::kUndecided;
-				++h->spawn_attempts;
 				h->last_spawn_mono_ns = monotonic_now_ns();
+				if (h->last_spawn_mono_ns == 0) {
+					loop_error = make_error(ErrorCode::kClockAnomaly,
+					                        "ProducerSupervisor::run",
+					                        "monotonic clock unavailable");
+					loop_failed = true;
+					phase = Phase::kDone;
+					break;
+				}
 
 				auto start = proc_stat_starttime(h->child.pid);
 				h->child_start_ticks = start ? start.value() : 0;
 
 				auto watch = LivenessWatch::open(static_cast<uint64_t>(h->child.pid));
 				if (!watch) {
-					(void)::kill(h->child.pid, SIGKILL);
-					int status = 0;
-					(void)::waitpid(h->child.pid, &status, 0);
+					if (::kill(h->child.pid, SIGKILL) != 0 && errno != ESRCH) {
+						const int e = errno;
+						loop_error = make_errno_error(e, "ProducerSupervisor::kill",
+						                              std::strerror(e));
+						loop_failed = true;
+						phase = Phase::kDone;
+						break;
+					}
+					auto reaped = reap_child_blocking(h->child.pid);
+					if (!reaped) {
+						loop_error = reaped.error();
+						loop_failed = true;
+						phase = Phase::kDone;
+						break;
+					}
 					h->child_reaped = true;
+					h->last_exit_status_for_reap = reaped.value();
 					if (count_failure(*h)) {
 						result.outcome = SupervisionOutcome::kRestartsExhausted;
 						phase = Phase::kDone;
 						break;
 					}
-					backoff_deadline = monotonic_now_ns() + backoff_delay_ns(*h);
-					phase = Phase::kBackoff;
+					enter_backoff();
 					break;
 				}
 				h->child_pidfd = UniqueFd(watch.value().release());
-				epoll_add(*h, h->child_pidfd.get(), EPOLLIN);
-				if (h->child.stdout_read.get() >= 0) {
-					epoll_add(*h, h->child.stdout_read.get(), EPOLLIN);
+				auto add_pidfd = epoll_add(*h, h->child_pidfd.get(), EPOLLIN);
+				if (!add_pidfd) {
+					loop_error = add_pidfd.error();
+					loop_failed = true;
+					phase = Phase::kDone;
+					break;
 				}
-				create_deadline =
-				        monotonic_now_ns() + ms_to_ns(h->options.create_timeout.count());
+				if (h->child.stdout_read.get() >= 0) {
+					auto add_stdout = epoll_add(*h, h->child.stdout_read.get(), EPOLLIN);
+					if (!add_stdout) {
+						loop_error = add_stdout.error();
+						loop_failed = true;
+						phase = Phase::kDone;
+						break;
+					}
+				}
+				if (!set_deadline(ms_to_ns(h->options.create_timeout.count()),
+				                  &create_deadline)) {
+					phase = Phase::kDone;
+					break;
+				}
 				phase = Phase::kAwaitReady;
 				break;
 			}
@@ -337,7 +466,8 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 						if (ours) {
 							const uint64_t gen = observer_generation(header);
 							if (h->baseline_generation == 0 ||
-							    gen == h->baseline_generation + 1) {
+							    (h->baseline_generation != UINT64_MAX &&
+							     gen == h->baseline_generation + 1)) {
 								h->baseline_generation = gen;
 								h->view = std::move(view.value());
 								h->have_view = true;
@@ -359,8 +489,7 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 						phase = Phase::kDone;
 						break;
 					}
-					backoff_deadline = monotonic_now_ns() + backoff_delay_ns(*h);
-					phase = Phase::kBackoff;
+					enter_backoff();
 					break;
 				}
 				if (monotonic_now_ns() >= create_deadline) {
@@ -385,8 +514,7 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 						phase = Phase::kDone;
 						break;
 					}
-					backoff_deadline = monotonic_now_ns() + backoff_delay_ns(*h);
-					phase = Phase::kBackoff;
+					enter_backoff();
 					break;
 				}
 				// Stall check (only when we own a confirmed view, §35.3).
@@ -416,26 +544,50 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 				// a stale deadline would SIGKILL instantly.
 				if (h->child.pid > 0 && !h->child_reaped) {
 					if (!h->child_kill_in_progress) {
-						arm_child_kill(*h);
-						grace_deadline = monotonic_now_ns() +
-						                 ms_to_ns(h->options.stall_grace.count());
+						auto armed = arm_child_kill(*h);
+						if (!armed) {
+							loop_error = armed.error();
+							loop_failed = true;
+							phase = Phase::kDone;
+							break;
+						}
+						if (!set_deadline(ms_to_ns(h->options.stall_grace.count()),
+						                  &grace_deadline)) {
+							phase = Phase::kDone;
+							break;
+						}
 					}
 					if (h->child_kill_in_progress && monotonic_now_ns() >= grace_deadline) {
-						(void)::kill(h->child.pid, SIGKILL);
+						if (::kill(h->child.pid, SIGKILL) != 0 && errno != ESRCH) {
+							const int e = errno;
+							loop_error = make_errno_error(e, "ProducerSupervisor::kill",
+							                              std::strerror(e));
+							loop_failed = true;
+							phase = Phase::kDone;
+							break;
+						}
 						emit_event(*h, SupervisorEvent::kKilled,
 						           static_cast<uint64_t>(h->child.pid), 0, SIGKILL);
-						h->child_kill_in_progress = false;  // one escalation only
+						// Keep the kill sequence armed but move its deadline out of reach;
+						// otherwise the next loop would start a second SIGTERM grace window.
+						grace_deadline = UINT64_MAX;
 					}
 				}
 				int status = 0;
-				if (reap_child(*h, &status)) {
+				auto reaped = reap_child(*h, &status);
+				if (!reaped) {
+					loop_error = reaped.error();
+					loop_failed = true;
+					phase = Phase::kDone;
+					break;
+				}
+				if (reaped.value()) {
 					if (kill_then_restart) {
 						kill_then_restart = false;
 						if (count_failure(*h)) {
 							result.outcome = SupervisionOutcome::kRestartsExhausted;
 						} else {
-							backoff_deadline = monotonic_now_ns() + backoff_delay_ns(*h);
-							phase = Phase::kBackoff;
+							enter_backoff();
 							break;
 						}
 					} else {
@@ -468,7 +620,12 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 		const int n = ::epoll_wait(h->epoll_fd.get(), events, kEpollMaxEvents, timeout);
 		if (n < 0) {
 			if (errno == EINTR) continue;
-			break;  // EBADF etc.: end the run
+			const int e = errno;
+			loop_error = make_errno_error(e, "ProducerSupervisor::epoll_wait",
+			                              std::strerror(e));
+			loop_failed = true;
+			phase = Phase::kDone;
+			break;
 		}
 
 		for (int i = 0; i < n; ++i) {
@@ -489,7 +646,14 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 				// Child exit observed: reap once, decide by the flag armed at
 				// event time (never re-classify by exit status here, §35.4).
 				int status = 0;
-				if (!reap_child(*h, &status)) continue;
+				auto reaped = reap_child(*h, &status);
+				if (!reaped) {
+					loop_error = reaped.error();
+					loop_failed = true;
+					phase = Phase::kDone;
+					break;
+				}
+				if (!reaped.value()) continue;
 				if (h->reap_decision == SupervisorHandle::ReapDecision::kUndecided) {
 					h->reap_decision = is_clean_exit_status(status)
 					                           ? SupervisorHandle::ReapDecision::kCleanExit
@@ -506,10 +670,25 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 
 	// ---- teardown: reap whatever remains, restore the signal mask --------------
 	if (h->child.pid > 0 && !h->child_reaped) {
-		(void)::kill(h->child.pid, SIGKILL);
-		int status = 0;
-		(void)::waitpid(h->child.pid, &status, 0);
-		h->child_reaped = true;
+		bool may_reap = true;
+		if (::kill(h->child.pid, SIGKILL) != 0 && errno != ESRCH) {
+			const int e = errno;
+			if (!loop_failed) {
+				loop_error = make_errno_error(e, "ProducerSupervisor::kill", std::strerror(e));
+				loop_failed = true;
+			}
+			may_reap = false;
+		}
+		if (may_reap) {
+			auto reaped = reap_child_blocking(h->child.pid);
+			if (reaped) {
+				h->child_reaped = true;
+				h->last_exit_status_for_reap = reaped.value();
+			} else if (!loop_failed) {
+				loop_error = reaped.error();
+				loop_failed = true;
+			}
+		}
 	}
 	drain_child_stdout(*h);
 	result.stdout_tail = h->stdout_tail;
@@ -520,15 +699,24 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 	if (h->child_reaped) result.last_child_exit_status = h->last_exit_status_for_reap;
 
 	h->epoll_fd.reset();
-	h->stop_evfd.reset();
+	{
+		std::lock_guard<std::mutex> lock(h->stop_fd_mutex);
+		h->stop_evfd.reset();
+	}
 	h->signalfd_fd.reset();
-	(void)::pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
+	const int restore_rc = ::pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
 	h->running.store(false, std::memory_order_release);
+	if (loop_failed) return loop_error;
+	if (restore_rc != 0) {
+		return make_errno_error(restore_rc, "ProducerSupervisor::run",
+		                        "restore pthread signal mask");
+	}
 	return Result<SupervisionResult>(std::move(result));
 }
 
 void supervisor_request_stop(const std::shared_ptr<SupervisorHandle>& h) noexcept {
 	h->stop_requested.store(true, std::memory_order_release);
+	std::lock_guard<std::mutex> lock(h->stop_fd_mutex);
 	if (h->stop_evfd.get() >= 0) {
 		const uint64_t one = 1;
 		const ssize_t wr = ::write(h->stop_evfd.get(), &one, sizeof(one));
@@ -539,16 +727,22 @@ void supervisor_request_stop(const std::shared_ptr<SupervisorHandle>& h) noexcep
 void supervisor_handle_shutdown(const std::shared_ptr<SupervisorHandle>& h) noexcept {
 	// Destructor path: never leave an unreaped child (design §35.4).
 	h->stop_requested.store(true, std::memory_order_release);
-	if (h->stop_evfd.get() >= 0) {
-		const uint64_t one = 1;
-		const ssize_t wr = ::write(h->stop_evfd.get(), &one, sizeof(one));
-		(void)wr;
+	{
+		std::lock_guard<std::mutex> lock(h->stop_fd_mutex);
+		if (h->stop_evfd.get() >= 0) {
+			const uint64_t one = 1;
+			const ssize_t wr = ::write(h->stop_evfd.get(), &one, sizeof(one));
+			(void)wr;
+		}
 	}
 	if (h->child.pid > 0 && !h->child_reaped) {
-		(void)::kill(h->child.pid, SIGKILL);
-		int status = 0;
-		(void)::waitpid(h->child.pid, &status, 0);
-		h->child_reaped = true;
+		if (::kill(h->child.pid, SIGKILL) == 0 || errno == ESRCH) {
+			auto reaped = reap_child_blocking(h->child.pid);
+			if (reaped) {
+				h->child_reaped = true;
+				h->last_exit_status_for_reap = reaped.value();
+			}
+		}
 	}
 }
 

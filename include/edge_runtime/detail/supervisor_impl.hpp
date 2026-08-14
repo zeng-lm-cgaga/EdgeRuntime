@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "edge_runtime/detail/channel_observer.hpp"
@@ -24,6 +25,7 @@ struct SupervisorHandle {
 	UniqueFd epoll_fd;
 	UniqueFd stop_evfd;
 	UniqueFd signalfd_fd;
+	std::mutex stop_fd_mutex;  // request_stop vs run() teardown
 
 	// child state
 	SpawnedProcess child;                 // pid + stdout read end (reset per spawn)

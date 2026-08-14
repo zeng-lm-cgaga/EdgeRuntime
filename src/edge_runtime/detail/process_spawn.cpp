@@ -1,21 +1,19 @@
 #include "edge_runtime/detail/process_spawn.hpp"
 
 #include <fcntl.h>
-#include <pthread.h>
+#include <spawn.h>
 #include <signal.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
-#include <cstdio>
 #include <cstring>
+
+extern char** environ;
 
 namespace edge_runtime::detail {
 
 namespace {
-// Between fork() and execv() only async-signal-safe calls are permitted. All
-// allocation and string handling therefore happens BEFORE the fork.
 std::vector<char*> build_c_argv(const std::vector<std::string>& argv) {
 	std::vector<char*> c_argv;
 	c_argv.reserve(argv.size() + 1);
@@ -31,35 +29,65 @@ Result<SpawnedProcess> spawn_process(const std::vector<std::string>& argv) noexc
 	if (argv.empty() || argv[0].empty()) {
 		return make_error(ErrorCode::kInvalidOptions, "spawn_process", "empty argv");
 	}
-	std::vector<char*> c_argv = build_c_argv(argv);
+	std::vector<char*> c_argv;
+	try {
+		c_argv = build_c_argv(argv);
+	} catch (...) {
+		return make_error(ErrorCode::kSystemError, "spawn_process", "argv allocation failed");
+	}
 
 	int pipefd[2] = {-1, -1};
 	if (::pipe2(pipefd, O_NONBLOCK | O_CLOEXEC) != 0) {
-		return make_error(classify_errno(errno), "spawn_process", std::strerror(errno));
+		const int e = errno;
+		return make_errno_error(e, "spawn_process", std::strerror(e));
 	}
 	UniqueFd read_end(pipefd[0]);
 	UniqueFd write_end(pipefd[1]);
 
-	const pid_t pid = ::fork();
-	if (pid < 0) {
-		return make_error(classify_errno(errno), "spawn_process", std::strerror(errno));
+	posix_spawn_file_actions_t actions;
+	int rc = ::posix_spawn_file_actions_init(&actions);
+	if (rc != 0) {
+		return make_errno_error(rc, "spawn_process", std::strerror(rc));
 	}
-	if (pid == 0) {
-		// Child: stdout -> pipe write end (already O_NONBLOCK|O_CLOEXEC). Also
-		// reset the signal mask: the supervisor blocks SIGTERM/SIGINT in ITS
-		// thread, and the mask survives fork — without this the child would
-		// never receive the SIGTERM a takeover/stop sequence sends it.
-		sigset_t empty_mask;
-		sigemptyset(&empty_mask);
-		(void)::pthread_sigmask(SIG_SETMASK, &empty_mask, nullptr);
-		if (::dup2(write_end.get(), STDOUT_FILENO) < 0) ::_exit(127);
-		write_end.reset();
-		read_end.reset();
-		::execv(c_argv[0], c_argv.data());
-		std::fprintf(stderr, "spawn_process execv %s: %s\n", c_argv[0], std::strerror(errno));
-		::_exit(127);
+	const auto destroy_actions = [&actions] { (void)::posix_spawn_file_actions_destroy(&actions); };
+	rc = ::posix_spawn_file_actions_addclose(&actions, read_end.get());
+	if (rc == 0) {
+		rc = ::posix_spawn_file_actions_adddup2(&actions, write_end.get(), STDOUT_FILENO);
+	}
+	if (rc == 0 && write_end.get() != STDOUT_FILENO) {
+		rc = ::posix_spawn_file_actions_addclose(&actions, write_end.get());
+	}
+	if (rc != 0) {
+		destroy_actions();
+		return make_errno_error(rc, "spawn_process", std::strerror(rc));
 	}
 
+	posix_spawnattr_t attributes;
+	rc = ::posix_spawnattr_init(&attributes);
+	if (rc != 0) {
+		destroy_actions();
+		return make_errno_error(rc, "spawn_process", std::strerror(rc));
+	}
+	const auto destroy_attributes = [&attributes] { (void)::posix_spawnattr_destroy(&attributes); };
+	sigset_t empty_mask;
+	sigemptyset(&empty_mask);
+	rc = ::posix_spawnattr_setsigmask(&attributes, &empty_mask);
+	if (rc == 0) {
+		rc = ::posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSIGMASK);
+	}
+	if (rc != 0) {
+		destroy_attributes();
+		destroy_actions();
+		return make_errno_error(rc, "spawn_process", std::strerror(rc));
+	}
+
+	pid_t pid = -1;
+	rc = ::posix_spawn(&pid, c_argv[0], &actions, &attributes, c_argv.data(), environ);
+	destroy_attributes();
+	destroy_actions();
+	if (rc != 0) {
+		return make_errno_error(rc, "spawn_process", std::strerror(rc));
+	}
 	write_end.reset();
 	SpawnedProcess sp;
 	sp.pid = pid;

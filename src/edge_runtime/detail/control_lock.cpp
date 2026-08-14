@@ -37,20 +37,21 @@ Result<ControlLock> ControlLock::acquire(const std::string& lock_path) {
 	}
 	const std::string dir = lock_path.substr(0, slash);
 	if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) {
-		return make_error(classify_errno(errno), "control_lock_acquire", dir.c_str());
+		const int e = errno;
+		return make_errno_error(e, "control_lock_acquire", dir.c_str());
 	}
 
 	const int fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
 	if (fd < 0) {
-		return make_error(classify_errno(errno), "control_lock_acquire",
-		                  std::strerror(errno));
+		const int e = errno;
+		return make_errno_error(e, "control_lock_acquire", std::strerror(e));
 	}
 	UniqueFd owned(fd);
 
 	struct stat st {};
 	if (::fstat(fd, &st) != 0) {
-		return make_error(classify_errno(errno), "control_lock_acquire",
-		                  std::strerror(errno));
+		const int e = errno;
+		return make_errno_error(e, "control_lock_acquire", std::strerror(e));
 	}
 	if (st.st_uid != geteuid()) {
 		return make_error(ErrorCode::kPermissionDenied, "control_lock_acquire",
@@ -62,7 +63,8 @@ Result<ControlLock> ControlLock::acquire(const std::string& lock_path) {
 	}
 
 	if (::flock(fd, LOCK_EX) != 0) {
-		return make_error(classify_errno(errno), "control_lock_acquire", "flock");
+		const int e = errno;
+		return make_errno_error(e, "control_lock_acquire", "flock");
 	}
 
 	ControlLock lock;
@@ -80,8 +82,8 @@ Result<ControlJournalV1> ControlLock::read_journal() noexcept {
 		        ::pread(fd_.get(), dst + got, want - got, static_cast<off_t>(got));
 		if (n < 0) {
 			if (errno == EINTR) continue;
-			return make_error(classify_errno(errno), "control_lock_read_journal",
-			                  std::strerror(errno));
+			const int e = errno;
+			return make_errno_error(e, "control_lock_read_journal", std::strerror(e));
 		}
 		if (n == 0) break;  // short/absent file
 		got += static_cast<size_t>(n);
@@ -134,13 +136,14 @@ Result<void> ControlLock::write_journal(const ControlJournalV1& journal) noexcep
 		                           static_cast<off_t>(written));
 		if (n < 0) {
 			if (errno == EINTR) continue;
-			return make_error(classify_errno(errno), "control_lock_write_journal",
-			                  std::strerror(errno));
+			const int e = errno;
+			return make_errno_error(e, "control_lock_write_journal", std::strerror(e));
 		}
 		written += static_cast<size_t>(n);
 	}
 	if (::fdatasync(fd_.get()) != 0) {
-		return make_error(classify_errno(errno), "control_lock_write_journal", "fdatasync");
+		const int e = errno;
+		return make_errno_error(e, "control_lock_write_journal", "fdatasync");
 	}
 	return Result<void>::ok();
 }

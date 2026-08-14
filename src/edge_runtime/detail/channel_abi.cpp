@@ -215,8 +215,8 @@ Result<void> pread_full(int fd, void* buf, size_t size, uint64_t offset) noexcep
 		        ::pread(fd, dst + got, size - got, static_cast<off_t>(offset + got));
 		if (n < 0) {
 			if (errno == EINTR) continue;
-			return make_error(classify_errno(errno), "pread_full",
-			                  std::strerror(errno));
+			const int e = errno;
+			return make_errno_error(e, "pread_full", std::strerror(e));
 		}
 		if (n == 0) break;  // short read: caller treats as corruption/partial
 		got += static_cast<size_t>(n);
@@ -235,8 +235,8 @@ Result<void> pwrite_full(int fd, const void* buf, size_t size, uint64_t offset) 
 		                           static_cast<off_t>(offset + written));
 		if (n < 0) {
 			if (errno == EINTR) continue;
-			return make_error(classify_errno(errno), "pwrite_full",
-			                  std::strerror(errno));
+			const int e = errno;
+			return make_errno_error(e, "pwrite_full", std::strerror(e));
 		}
 		written += static_cast<size_t>(n);
 	}

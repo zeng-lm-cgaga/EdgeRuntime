@@ -97,8 +97,9 @@ Result<UniqueFd> fd_broker_bind(const std::string& socket_path);
 // design §18.1/§33.4). Accepts connections, enforces same-UID via SO_PEERCRED,
 // gates on the mapped bootstrap init_state == READY, validates channel_hash and
 // (when non-zero) schema fingerprint, and replies with a dup/reopen of shm_fd
-// via SCM_RIGHTS plus the fixed reply record. Blocks on accept until `stop` is
-// set and the listen fd is shutdown() — never closes the fd itself.
+// via SCM_RIGHTS plus the fixed reply record. Connection reads periodically
+// recheck `stop`, so a half-open peer cannot pin shutdown. The loop never closes
+// the listening fd itself.
 void fd_broker_serve_loop(int listen_fd, int shm_fd, std::byte* base,
                           const uint32_t* channel_hash,
                           const std::array<std::byte, 32>* schema_fingerprint,

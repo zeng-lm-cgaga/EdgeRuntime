@@ -17,6 +17,17 @@ constexpr bool checked_mul_u64(uint64_t a, uint64_t b, uint64_t* out) noexcept {
 	return true;
 }
 
+constexpr uint64_t saturating_mul_u64(uint64_t a, uint64_t b) noexcept {
+	uint64_t out = 0;
+	return checked_mul_u64(a, b, &out) ? out : UINT64_MAX;
+}
+
+// A future timestamp is not classified as stale. This fails closed when a
+// clock source or shared field moves backwards instead of wrapping subtraction.
+constexpr bool elapsed_exceeds(uint64_t now, uint64_t then, uint64_t limit) noexcept {
+	return now >= then && now - then > limit;
+}
+
 // Rounds v up to the next multiple of align (align must be nonzero). Used to
 // keep every slot on a 64-byte boundary (design §8.1).
 constexpr bool round_up_to_multiple_u64(uint64_t v, uint64_t align, uint64_t* out) noexcept {

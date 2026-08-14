@@ -53,6 +53,13 @@ Error::Error(ErrorCode c, const char* op, const char* ctx) : code(c), operation(
 	}
 }
 
+Error::Error(ErrorCode c, int saved_errno, const char* op, const char* ctx)
+    : code(c), errno_value(saved_errno), operation(op) {
+	if (ctx != nullptr) {
+		std::snprintf(context, sizeof(context), "%s", ctx);
+	}
+}
+
 const char* to_string(ErrorCode code) noexcept {
 	const uint32_t index = static_cast<uint32_t>(code);
 	if (index > static_cast<uint32_t>(ErrorCode::kSupervisionExhausted)) return "UnknownError";
@@ -75,6 +82,15 @@ ErrorCode classify_errno(int errno_value) noexcept {
 
 Error make_error(ErrorCode code, const char* operation, const char* context) noexcept {
 	return Error(code, operation, context);
+}
+
+Error make_errno_error(int saved_errno, const char* operation, const char* context) noexcept {
+	return Error(classify_errno(saved_errno), saved_errno, operation, context);
+}
+
+Error make_errno_error(ErrorCode code, int saved_errno, const char* operation,
+                       const char* context) noexcept {
+	return Error(code, saved_errno, operation, context);
 }
 
 }  // namespace edge_runtime

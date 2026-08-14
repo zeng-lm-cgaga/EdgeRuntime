@@ -5,6 +5,7 @@
 
 #include "edge_runtime/detail/channel_abi.hpp"
 #include "edge_runtime/detail/channel_layout.hpp"
+#include "edge_runtime/detail/checked_math.hpp"
 #include "edge_runtime/detail/clock.hpp"
 #include "edge_runtime/detail/fd_broker.hpp"
 #include "edge_runtime/detail/shared_atomic.hpp"
@@ -75,7 +76,12 @@ Result<ChannelObserverView> open_once(const std::string& channel_name, Transport
 Result<ChannelObserverView> open_channel_readonly(const std::string& channel_name,
                                                   Transport transport,
                                                   uint64_t retry_ms) noexcept {
-	const uint64_t deadline = monotonic_deadline_ns(retry_ms * 1'000'000ull);
+	uint64_t retry_ns = 0;
+	if (!checked_mul_u64(retry_ms, 1'000'000ull, &retry_ns)) {
+		return make_error(ErrorCode::kInvalidOptions, "open_channel_readonly",
+		                  "retry timeout out of range");
+	}
+	const uint64_t deadline = monotonic_deadline_ns(retry_ns);
 	if (deadline == 0) {
 		return make_error(ErrorCode::kClockAnomaly, "open_channel_readonly",
 		                  "monotonic clock unavailable");
@@ -123,10 +129,11 @@ StallClass classify_stall(const ChannelHeaderAbi* header, uint64_t now_boot_ns,
 	const uint64_t last_publish = shared_load_acquire(&header->last_publish_boot_ns);
 	const uint64_t last_beat = shared_load_acquire(&header->heartbeat_boot_ns);
 	if (now_boot_ns == 0) return StallClass::kNotApplicable;  // clock down: never kill
-	if (last_publish != 0 && now_boot_ns - last_publish <= interval) {
+	if (last_publish != 0 && !elapsed_exceeds(now_boot_ns, last_publish, interval)) {
 		return StallClass::kFresh;
 	}
-	if (last_beat == 0 || now_boot_ns - last_beat > interval * kHeartbeatStallFactor) {
+	const uint64_t stall_limit = saturating_mul_u64(interval, kHeartbeatStallFactor);
+	if (last_beat == 0 || elapsed_exceeds(now_boot_ns, last_beat, stall_limit)) {
 		return StallClass::kStalled;
 	}
 	return StallClass::kFresh;

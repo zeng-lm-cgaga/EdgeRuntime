@@ -34,6 +34,7 @@ struct ProducerHandle {
 	uint32_t schema_version{0};
 	uint32_t payload_size{0};
 	ProcessIdentity self{};
+	std::atomic<bool> operation_in_use{false};  // same-handle overlap guard (§18.1)
 
 	// v0.2 fd-pass transport (design §33). Members are declared AFTER shm
 	// (whose mapping the serving thread reads) so destruction joins the thread

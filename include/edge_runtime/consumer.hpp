@@ -41,6 +41,8 @@ Result<ReadSnapshot> consumer_try_read_latest_impl(const std::shared_ptr<Consume
 Result<ReadSnapshot> consumer_wait_latest_impl(const std::shared_ptr<ConsumerHandle>& handle,
                                                std::byte* encoded_out, uint32_t encoded_cap,
                                                uint64_t timeout_ns) noexcept;
+Result<ReconnectInfo> consumer_reconnect_impl(
+        const std::shared_ptr<ConsumerHandle>& handle) noexcept;
 Result<ChannelStatus> consumer_status_impl(const std::shared_ptr<ConsumerHandle>& handle) noexcept;
 void consumer_shutdown_impl(const std::shared_ptr<ConsumerHandle>& handle) noexcept;
 
@@ -128,7 +130,9 @@ class Consumer {
 	}
 
 	// Reopen against a replaced instance (ER4).
-	Result<ReconnectInfo> reconnect() noexcept;
+	Result<ReconnectInfo> reconnect() noexcept {
+		return detail::consumer_reconnect_impl(handle_);
+	}
 
 	// Slow-check diagnostic (design §15.6).
 	Result<ChannelStatus> status() const noexcept {

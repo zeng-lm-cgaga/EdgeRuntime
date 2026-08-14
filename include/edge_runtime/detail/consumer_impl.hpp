@@ -20,7 +20,7 @@ namespace edge_runtime::detail {
 
 // State owned by a Consumer<T> handle. Read-path cursors (last_sequence,
 // first_sample_in_generation) live here so the impl can mutate them without
-// touching T; read_in_use enforces the single-reader rule (§12.3).
+// touching T; operation_in_use enforces the same-handle rule (§18.1).
 struct ConsumerHandle {
 	ShmObject shm;
 	std::string channel_name;
@@ -34,9 +34,10 @@ struct ConsumerHandle {
 	uint32_t payload_size{0};
 	ProcessIdentity self{};
 
+	uint64_t reconnect_timeout_ms{1000};
 	uint64_t last_sequence{0};
 	bool first_sample_in_generation{true};
-	std::atomic<bool> read_in_use{false};  // overlap guard, not shared memory
+	std::atomic<bool> operation_in_use{false};  // same-handle overlap guard (§18.1)
 };
 
 // Full §9.2 open sequence: bootstrap/header validation, control-lock
@@ -64,6 +65,9 @@ Result<ReadSnapshot> consumer_try_read_latest_impl(const std::shared_ptr<Consume
 Result<ReadSnapshot> consumer_wait_latest_impl(const std::shared_ptr<ConsumerHandle>& handle,
                                                std::byte* encoded_out, uint32_t encoded_cap,
                                                uint64_t timeout_ns) noexcept;
+
+Result<ReconnectInfo> consumer_reconnect_impl(
+        const std::shared_ptr<ConsumerHandle>& handle) noexcept;
 
 Result<ChannelStatus> consumer_status_impl(const std::shared_ptr<ConsumerHandle>& handle) noexcept;
 

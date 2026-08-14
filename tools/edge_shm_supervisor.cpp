@@ -7,7 +7,7 @@
 //   STALL_DETECTED pid=N           heartbeat stale -> takeover sequence
 //   KILLED sig=9 pid=N             escalated to SIGKILL during a kill sequence
 //   RESTART attempt=N delay=Ns     failure counted, backoff armed
-//   GAVE_UP attempts=N            crash-loop cap hit
+//   GAVE_UP attempts=N restarts=N crash-loop cap hit
 //   CLEAN_EXIT pid=N              child exited cleanly on its own
 //   STOPPED                        request_stop / SIGTERM/SIGINT
 //
@@ -159,7 +159,7 @@ int main(int argc, char** argv) {
 			std::printf("STOPPED\n");
 			break;
 		case edge_runtime::SupervisionOutcome::kRestartsExhausted:
-			std::printf("GAVE_UP attempts=%u\n", r.spawn_attempts);
+			std::printf("GAVE_UP attempts=%u restarts=%u\n", r.spawn_attempts, r.restarts);
 			break;
 	}
 	if (forward_stdout && !r.stdout_tail.empty()) {

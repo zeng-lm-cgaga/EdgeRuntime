@@ -25,4 +25,6 @@ edgeruntime_unit_test(failpoint_test)         # §20.3 registry + env modes + hi
 edgeruntime_unit_test(fd_broker_test)         # v0.2 §33 wire record layouts + checksum
 edgeruntime_unit_test(channel_observer_test)  # v0.3 §35.3 readonly view + stall classification
 edgeruntime_unit_test(liveness_watch_test)    # v0.3 §35.3 long-held pidfd + CLOEXEC
-edgeruntime_unit_test(process_spawn_test)     # v0.3 §35.3 fork+exec + nonblock stdout pipe
+edgeruntime_unit_test(process_spawn_test)     # v0.3 §35.3 posix_spawn + nonblock stdout pipe
+edgeruntime_unit_test(producer_concurrency_test)  # §18.1 same-handle overlap contract
+edgeruntime_unit_test(supervisor_policy_test) # v0.3 restart cap/backoff + option bounds

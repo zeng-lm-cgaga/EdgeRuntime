@@ -1,4 +1,4 @@
-// v0.3 §35.3 process_spawn unit tests: fork+exec of a separate binary, stdout
+// v0.3 §35.3 process_spawn unit tests: posix_spawn of a separate binary, stdout
 // capture with a non-blocking drain (a verbose child must never wedge the
 // supervisor), and exec-failure handling. The helper binary is the unit test
 // itself re-invoked with --spawn-child (a SEPARATE exec, never a shared
@@ -8,6 +8,8 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -27,6 +29,12 @@ using edge_runtime::detail::spawn_process;
 
 // Child mode of THIS binary: prints `n` lines of `len` bytes each.
 int run_child_mode(int argc, char** argv) {
+	if (argc == 2 && std::strcmp(argv[1], "--check-sigmask") == 0) {
+		sigset_t current;
+		if (::pthread_sigmask(SIG_SETMASK, nullptr, &current) != 0) return 3;
+		std::printf("sigterm_blocked=%d\n", ::sigismember(&current, SIGTERM));
+		return 0;
+	}
 	if (argc < 4 || std::strcmp(argv[1], "--spawn-child") != 0) return -1;
 	const int lines = std::atoi(argv[2]);
 	const int len = std::atoi(argv[3]);
@@ -111,13 +119,32 @@ TEST(ProcessSpawn, VerboseChildNeverBlocks) {
 	EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
-TEST(ProcessSpawn, ExecFailureExits127) {
+TEST(ProcessSpawn, ExecFailureReturnsErrno) {
 	auto sp = spawn_process({"/nonexistent/definitely/not/a/binary"});
+	ASSERT_FALSE(sp);
+	EXPECT_EQ(sp.error().code, edge_runtime::ErrorCode::kNotFound);
+	EXPECT_EQ(sp.error().errno_value, ENOENT);
+}
+
+TEST(ProcessSpawn, ChildSignalMaskIsReset) {
+	sigset_t blocked;
+	sigset_t old_mask;
+	::sigemptyset(&blocked);
+	::sigaddset(&blocked, SIGTERM);
+	ASSERT_EQ(::pthread_sigmask(SIG_BLOCK, &blocked, &old_mask), 0);
+	auto sp = spawn_process({"/proc/self/exe", "--check-sigmask"});
+	const int restore_rc = ::pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
+	ASSERT_EQ(restore_rc, 0);
 	ASSERT_TRUE(sp) << edge_runtime::to_string(sp.error().code);
+
+	bool timed_out = false;
+	const std::string out = drain_with_deadline(sp.value().stdout_read, 5000, &timed_out);
+	ASSERT_FALSE(timed_out);
+	EXPECT_NE(out.find("sigterm_blocked=0"), std::string::npos) << out;
 	int status = 0;
 	ASSERT_EQ(::waitpid(sp.value().pid, &status, 0), sp.value().pid);
 	ASSERT_TRUE(WIFEXITED(status));
-	EXPECT_EQ(WEXITSTATUS(status), 127);
+	EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
 TEST(ProcessSpawn, EmptyArgvRejected) {

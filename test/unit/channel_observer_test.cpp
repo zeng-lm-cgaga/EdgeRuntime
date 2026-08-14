@@ -105,6 +105,14 @@ TEST(ChannelObserver, ClassifyStallBranches) {
 	ASSERT_TRUE(p.value().publish(TestPayloadV1{0x5A000001u, 1, 0}));
 	const uint64_t now2 = edge_runtime::detail::boottime_now_ns();
 	EXPECT_EQ(classify_stall(header, now2, pid, start), StallClass::kFresh);
+	// A future observation in shared memory must not underflow into a false stall.
+	EXPECT_EQ(classify_stall(header, 1, pid, start), StallClass::kFresh);
+}
+
+TEST(ChannelObserver, RetryTimeoutOverflowRejected) {
+	auto view = open_channel_readonly("overflow", Transport::kPosixShm, UINT64_MAX);
+	ASSERT_FALSE(view);
+	EXPECT_EQ(view.error().code, edge_runtime::ErrorCode::kInvalidOptions);
 }
 
 TEST(ChannelObserver, HeartbeatDisabledNotApplicable) {

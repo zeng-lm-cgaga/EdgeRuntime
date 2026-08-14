@@ -54,6 +54,7 @@ struct Error {
 
 	constexpr Error() = default;
 	Error(ErrorCode c, const char* op, const char* ctx = nullptr);
+	Error(ErrorCode c, int saved_errno, const char* op, const char* ctx = nullptr);
 };
 
 const char* to_string(ErrorCode code) noexcept;
@@ -62,6 +63,14 @@ const char* to_string(ErrorCode code) noexcept;
 ErrorCode classify_errno(int errno_value) noexcept;
 
 Error make_error(ErrorCode code, const char* operation, const char* context = nullptr) noexcept;
+
+// Syscall failure helpers. Capture errno at the call site before any other
+// libc call can overwrite it; the first overload derives the stable code,
+// while the second preserves a domain-specific code such as TransportFailed.
+Error make_errno_error(int saved_errno, const char* operation,
+                       const char* context = nullptr) noexcept;
+Error make_errno_error(ErrorCode code, int saved_errno, const char* operation,
+                       const char* context = nullptr) noexcept;
 
 }  // namespace edge_runtime
 

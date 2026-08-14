@@ -135,17 +135,18 @@ TEST(Supervisor, CrashLoopCappedByGaveUp) {  // S4
 	// /bin/false exits 1 instantly without ever creating the channel: a
 	// deterministic crash loop (death before READY counts as a failure).
 	auto sa = supervisor_args(name, "/bin/false",
-	                          {"--max-restarts", "3", "--max-delay-ms", "200",
+	                          {"--max-restarts", "3", "--max-delay-ms", "1000",
+	                           "--multiplier", "2",
 	                           "--create-timeout-ms", "1000"});
 	SpawnedChild sup;
 	ASSERT_TRUE(sup.spawn(sa));
 	std::string out;
 	ASSERT_TRUE(sup.wait(30000, &out)) << "supervisor hung: " << out;
 	EXPECT_EQ(sup.exit_code(), 3) << out;  // GAVE_UP exit code
-	EXPECT_TRUE(out_contains(out, "GAVE_UP")) << out;
-	EXPECT_TRUE(out_contains(out, "RESTART attempt=1")) << out;
-	EXPECT_TRUE(out_contains(out, "RESTART attempt=2")) << out;
-	EXPECT_TRUE(out_contains(out, "RESTART attempt=3")) << out;
+	EXPECT_TRUE(out_contains(out, "GAVE_UP attempts=4 restarts=3")) << out;
+	EXPECT_TRUE(out_contains(out, "RESTART attempt=1 delay=200000000ns")) << out;
+	EXPECT_TRUE(out_contains(out, "RESTART attempt=2 delay=400000000ns")) << out;
+	EXPECT_TRUE(out_contains(out, "RESTART attempt=3 delay=800000000ns")) << out;
 	EXPECT_FALSE(out_contains(out, "RESTART attempt=4")) << out;
 }
 

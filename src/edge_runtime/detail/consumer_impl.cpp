@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "edge_runtime/detail/channel_abi.hpp"
+#include "edge_runtime/detail/checked_math.hpp"
 #include "edge_runtime/detail/checksum.hpp"
 #include "edge_runtime/detail/clock.hpp"
 #include "edge_runtime/detail/failpoint.hpp"
@@ -72,6 +73,16 @@ Result<std::shared_ptr<ConsumerHandle>> consumer_open_impl(const ChannelOptions&
 		return make_error(ErrorCode::kInvalidOptions, "Consumer::open",
 		                  "payload size out of range");
 	}
+	if (options.transport != Transport::kPosixShm &&
+	    options.transport != Transport::kMemfdFdPass) {
+		return make_error(ErrorCode::kInvalidOptions, "Consumer::open", "unsupported transport");
+	}
+	const int64_t reconnect_timeout_ms = options.reconnect_timeout.count();
+	if (reconnect_timeout_ms < 0 ||
+	    static_cast<uint64_t>(reconnect_timeout_ms) > UINT64_MAX / 1'000'000ull) {
+		return make_error(ErrorCode::kInvalidOptions, "Consumer::open",
+		                  "reconnect timeout out of range");
+	}
 	bool fingerprint_set = false;
 	for (const std::byte b : schema.fingerprint) {
 		if (b != std::byte{0}) {
@@ -100,9 +111,7 @@ Result<std::shared_ptr<ConsumerHandle>> consumer_open_impl(const ChannelOptions&
 	if (fd_mode) {
 		// Receive the one-shot fd from the broker (bounded retry, §33.6).
 		auto rf = fd_broker_request_fd(socket_path, name_hash, schema, /*readonly=*/false,
-		                               &fd_reply,
-		                               static_cast<uint64_t>(
-		                                       options.reconnect_timeout.count()));
+		                               &fd_reply, static_cast<uint64_t>(reconnect_timeout_ms));
 		if (!rf) return rf.error();
 		fd = std::move(rf.value());
 		auto fst = memfd_fstat_and_capture(fd, &dev, &ino, &size);
@@ -271,17 +280,19 @@ Result<std::shared_ptr<ConsumerHandle>> consumer_open_impl(const ChannelOptions&
 	handle->schema_version = schema.version;
 	handle->payload_size = payload_size;
 	handle->self = self;
+	handle->reconnect_timeout_ms = static_cast<uint64_t>(reconnect_timeout_ms);
 	return Result<std::shared_ptr<ConsumerHandle>>(std::move(handle));
 }
 
 namespace {
 inline constexpr uint32_t kMaxReadRetries = 8;  // bounded chase (design §12.1)
 
-// RAII overlap guard for the single-reader rule (§12.3).
-struct ReadGuard {
+// RAII overlap guard for the same-handle rule (§18.1). wait_latest holds this
+// across futex sleep, so reconnect cannot unmap the address being waited on.
+struct ConsumerUseGuard {
 	std::atomic<bool>* in_use = nullptr;
 	bool armed = false;
-	~ReadGuard() {
+	~ConsumerUseGuard() {
 		if (armed) in_use->store(false, std::memory_order_release);
 	}
 };
@@ -294,18 +305,9 @@ void pack_nonce(const ConsumerHandle& handle, std::array<std::byte, 16>* out) {
 	std::memcpy(out->data(), &hi, 8);
 	std::memcpy(out->data() + 8, &lo, 8);
 }
-}  // namespace
-
-Result<ReadSnapshot> consumer_try_read_latest_impl(const std::shared_ptr<ConsumerHandle>& handle,
-                                                   std::byte* encoded_out,
-                                                   uint32_t encoded_cap) noexcept {
-	ReadGuard guard;
-	guard.in_use = &handle->read_in_use;
-	if (handle->read_in_use.exchange(true, std::memory_order_acquire)) {
-		return make_error(ErrorCode::kConcurrentHandleUse, "Consumer::try_read_latest",
-		                  "concurrent read");
-	}
-	guard.armed = true;
+Result<ReadSnapshot> try_read_latest_unlocked(const std::shared_ptr<ConsumerHandle>& handle,
+                                             std::byte* encoded_out,
+                                             uint32_t encoded_cap) noexcept {
 
 	auto* base = static_cast<std::byte*>(handle->shm.mapping.get());
 	auto* header = reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset);
@@ -390,6 +392,21 @@ Result<ReadSnapshot> consumer_try_read_latest_impl(const std::shared_ptr<Consume
 	                  "retry bound exceeded");
 }
 
+}  // namespace
+
+Result<ReadSnapshot> consumer_try_read_latest_impl(const std::shared_ptr<ConsumerHandle>& handle,
+                                                   std::byte* encoded_out,
+                                                   uint32_t encoded_cap) noexcept {
+	ConsumerUseGuard guard;
+	guard.in_use = &handle->operation_in_use;
+	if (handle->operation_in_use.exchange(true, std::memory_order_acq_rel)) {
+		return make_error(ErrorCode::kConcurrentHandleUse, "Consumer::try_read_latest",
+		                  "concurrent handle use");
+	}
+	guard.armed = true;
+	return try_read_latest_unlocked(handle, encoded_out, encoded_cap);
+}
+
 namespace {
 // §15.5 wait-timeout classification: producer liveness decides whether the
 // timeout means "alive but idle" (DataStale), "gone" (ProducerOffline), or
@@ -430,9 +447,11 @@ Result<ReadSnapshot> classify_wait_timeout(const std::shared_ptr<ConsumerHandle>
 			// 2. Data still advancing: normal DataStale.
 			// 3. Heartbeat enabled and stale beyond 3x the interval: stalled.
 			// 4. Otherwise: within tolerance, plain DataStale.
+			const uint64_t stall_limit =
+			        saturating_mul_u64(interval, kHeartbeatStallFactor);
 			if (interval != 0 && now != 0 &&
-			    (last_publish == 0 || now - last_publish > interval) &&
-			    (last_beat == 0 || now - last_beat > interval * kHeartbeatStallFactor)) {
+			    (last_publish == 0 || elapsed_exceeds(now, last_publish, interval)) &&
+			    (last_beat == 0 || elapsed_exceeds(now, last_beat, stall_limit))) {
 				return make_error(ErrorCode::kProducerStalled, "Consumer::wait_latest",
 				                  "producer alive, heartbeat stale");
 			}
@@ -455,6 +474,14 @@ Result<ReadSnapshot> classify_wait_timeout(const std::shared_ptr<ConsumerHandle>
 Result<ReadSnapshot> consumer_wait_latest_impl(const std::shared_ptr<ConsumerHandle>& handle,
                                                std::byte* encoded_out, uint32_t encoded_cap,
                                                uint64_t timeout_ns) noexcept {
+	ConsumerUseGuard guard;
+	guard.in_use = &handle->operation_in_use;
+	if (handle->operation_in_use.exchange(true, std::memory_order_acq_rel)) {
+		return make_error(ErrorCode::kConcurrentHandleUse, "Consumer::wait_latest",
+		                  "concurrent handle use");
+	}
+	guard.armed = true;
+
 	// deadline == 0 is the clock-failure sentinel (monotonic_now_ns == 0).
 	const uint64_t deadline = monotonic_deadline_ns(timeout_ns);
 	if (deadline == 0) {
@@ -466,7 +493,7 @@ Result<ReadSnapshot> consumer_wait_latest_impl(const std::shared_ptr<ConsumerHan
 	auto* header = reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset);
 
 	for (;;) {
-		const auto read = consumer_try_read_latest_impl(handle, encoded_out, encoded_cap);
+		const auto read = try_read_latest_unlocked(handle, encoded_out, encoded_cap);
 		if (read) return read;  // a sample, or a real error already returned
 		const ErrorCode ec = read.error().code;
 		if (ec != ErrorCode::kNoNewSample && ec != ErrorCode::kReadContention) {
@@ -500,13 +527,80 @@ Result<ReadSnapshot> consumer_wait_latest_impl(const std::shared_ptr<ConsumerHan
 			return classify_wait_timeout(handle, header);
 		}
 		if (rc < 0) {
-			return make_error(ErrorCode::kSystemError, "Consumer::wait_latest",
-			                  "futex_wait failed");
+			const int e = errno;
+			return make_errno_error(ErrorCode::kSystemError, e,
+			                        "Consumer::wait_latest", "futex_wait failed");
 		}
 	}
 }
 
+Result<ReconnectInfo> consumer_reconnect_impl(
+        const std::shared_ptr<ConsumerHandle>& handle) noexcept {
+	ConsumerUseGuard guard;
+	guard.in_use = &handle->operation_in_use;
+	if (handle->operation_in_use.exchange(true, std::memory_order_acq_rel)) {
+		return make_error(ErrorCode::kConcurrentHandleUse, "Consumer::reconnect",
+		                  "concurrent handle use");
+	}
+	guard.armed = true;
+
+	try {
+		ChannelOptions options;
+		options.name = handle->channel_name;
+		options.transport = handle->transport;
+		options.reconnect_timeout =
+		        std::chrono::milliseconds(static_cast<int64_t>(handle->reconnect_timeout_ms));
+		SchemaDescriptor schema;
+		schema.fingerprint = handle->schema_fingerprint;
+		schema.version = handle->schema_version;
+		schema.debug_name = "Consumer::reconnect";
+
+		auto opened = consumer_open_impl(options, schema, handle->payload_size);
+		if (!opened) return opened.error();
+		std::shared_ptr<ConsumerHandle> fresh = std::move(opened.value());
+
+		ReconnectInfo info;
+		info.old_generation = handle->generation;
+		info.new_generation = fresh->generation;
+		pack_nonce(*handle, &info.old_instance_nonce);
+		pack_nonce(*fresh, &info.new_instance_nonce);
+		info.schema_changed = handle->schema_fingerprint != fresh->schema_fingerprint ||
+		                      handle->schema_version != fresh->schema_version;
+
+		// The candidate is fully validated and registered. Only now retire the old
+		// registration and replace the resources, so any open failure leaves this
+		// handle usable for diagnostics or a later reconnect attempt.
+		consumer_shutdown_impl(handle);
+		handle->shm = std::move(fresh->shm);
+		handle->channel_name = std::move(fresh->channel_name);
+		handle->transport = fresh->transport;
+		handle->generation = fresh->generation;
+		handle->role_epoch = fresh->role_epoch;
+		handle->instance_nonce_hi = fresh->instance_nonce_hi;
+		handle->instance_nonce_lo = fresh->instance_nonce_lo;
+		handle->schema_fingerprint = fresh->schema_fingerprint;
+		handle->schema_version = fresh->schema_version;
+		handle->payload_size = fresh->payload_size;
+		handle->self = fresh->self;
+		handle->reconnect_timeout_ms = fresh->reconnect_timeout_ms;
+		handle->last_sequence = 0;
+		handle->first_sample_in_generation = true;
+		return Result<ReconnectInfo>(std::move(info));
+	} catch (...) {
+		return make_error(ErrorCode::kSystemError, "Consumer::reconnect",
+		                  "allocation failed while reopening channel");
+	}
+}
+
 Result<ChannelStatus> consumer_status_impl(const std::shared_ptr<ConsumerHandle>& handle) noexcept {
+	ConsumerUseGuard guard;
+	guard.in_use = &handle->operation_in_use;
+	if (handle->operation_in_use.exchange(true, std::memory_order_acq_rel)) {
+		return make_error(ErrorCode::kConcurrentHandleUse, "Consumer::status",
+		                  "concurrent handle use");
+	}
+	guard.armed = true;
+
 	if (handle->transport == Transport::kPosixShm) {
 		const std::string shm_name = channel_shm_name(handle->channel_name);
 		auto re = shm_open_existing(shm_name);

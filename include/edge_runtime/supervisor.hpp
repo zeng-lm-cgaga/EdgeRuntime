@@ -2,7 +2,7 @@
 #define EDGE_RUNTIME_SUPERVISOR_HPP
 
 // v0.3 ProducerSupervisor (design §35): a long-lived pidfd watcher that
-// supervises ONE producer child process per channel — it forks+execs the
+// supervises ONE producer child process per channel — it posix_spawn()s the
 // producer, detects crashes and heartbeat stalls, and restarts with a bounded
 // backoff. run() blocks the CALLING thread in an epoll loop; request_stop()
 // wakes it from any other thread (the library never spawns threads for this,
@@ -53,7 +53,7 @@ struct SupervisorOptions {
 	std::chrono::milliseconds initial_delay{100};          // first restart delay
 	std::chrono::milliseconds max_delay{10000};            // backoff cap
 	uint32_t multiplier{2};                                // integer factor, >= 1
-	uint32_t max_restarts{10};                             // crash-loop cap
+	uint32_t max_restarts{10};                             // retries after initial spawn
 	std::chrono::milliseconds stable_reset_window{60000};  // uptime that resets the counter
 	std::chrono::milliseconds stall_grace{5000};           // SIGTERM -> SIGKILL window
 	std::chrono::milliseconds watch_interval{500};         // stall-check cadence
@@ -92,8 +92,8 @@ class ProducerSupervisor {
 	Result<SupervisionResult> run();
 
 	// Thread-safe stop request: wakes the epoll loop via eventfd. Safe to call
-	// from a signal handler? No — call it from a regular thread; the tool
-	// wires SIGTERM to it via its own signal handler + atomic flag.
+	// from a signal handler? No — call it from a regular thread. run() receives
+	// SIGTERM/SIGINT through signalfd in its calling thread.
 	void request_stop() noexcept;
 
 	ProducerSupervisor(const ProducerSupervisor&) = delete;
