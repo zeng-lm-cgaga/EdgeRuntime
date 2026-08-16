@@ -11,8 +11,7 @@ bool checked_next_sequence(uint64_t current_ticket, uint64_t* out) noexcept {
 
 uint64_t saturated_gap(uint64_t last_sequence, uint64_t current_sequence) noexcept {
 	if (current_sequence <= last_sequence) return 0;  // defensive: same/older
-	if (current_sequence - last_sequence >= UINT64_MAX) return UINT64_MAX;
-	return current_sequence - last_sequence;
+	return current_sequence - last_sequence - 1;
 }
 
 bool slot_claim_writable(SlotHeaderAbi* slot, uint32_t observed_state) noexcept {

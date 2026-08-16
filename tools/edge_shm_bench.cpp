@@ -9,6 +9,10 @@
 //   environment.txt  command.txt  samples.csv  summary.json
 //   perf_stat.txt    process_status.txt       RESULT.md
 //
+// Controlled transport pairs also produce LATENCY_COMPARISON.md. A latency
+// ratio is valid only for paced runs that fully deliver every sample without a
+// sequence gap or a receive overlapping the next publish.
+//
 // Sets: --smoke (CTest dev-loop gate), --evidence (the curated §21.1 Q1-Q6
 // answer set), --matrix (the full grid — long), --spec <csv> (one ad-hoc cell).
 // Every result is labeled VM_ONLY: this host's perf_event_paranoid=4 blocks
@@ -30,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -57,6 +62,7 @@ struct RunSpec {
 	uint64_t samples = 1000000;
 	uint64_t max_time_ms = 60000;
 	uint64_t warmup = 10000;
+	bool require_comparable = false;
 };
 
 struct Config {
@@ -336,6 +342,58 @@ struct LatencyStats {
 	uint64_t max = 0;
 };
 
+struct ComparisonValidity {
+	bool eligible = false;
+	uint64_t queue_overlap_count = 0;
+	std::string reason;
+};
+
+void append_reason(std::string* reason, const std::string& item) {
+	if (!reason->empty()) *reason += "; ";
+	*reason += item;
+}
+
+ComparisonValidity assess_comparison_validity(const RunSpec& spec,
+                                              const std::vector<RawSample>& rows,
+                                              size_t warmup, const ProducerMarkers& producer,
+                                              const ConsumerMarkers& consumer) {
+	ComparisonValidity validity;
+	if (spec.rate_hz == 0) {
+		validity.reason =
+		        "unpaced max-rate run: latest-value overwrite and socket backpressure differ";
+		return validity;
+	}
+
+	const size_t first = std::min(warmup, rows.size());
+	for (size_t i = first; i + 1 < rows.size(); ++i) {
+		if (rows[i].receive_ns > rows[i + 1].publish_ns) {
+			++validity.queue_overlap_count;
+		}
+	}
+
+	if (!producer.ok) append_reason(&validity.reason, "producer marker missing");
+	if (!consumer.ok) append_reason(&validity.reason, "consumer marker missing");
+	if (spec.samples == 0) append_reason(&validity.reason, "sample target is unbounded");
+	if (producer.ok && producer.published != spec.samples) {
+		append_reason(&validity.reason, "producer did not reach the sample target");
+	}
+	if (consumer.ok && consumer.reads != spec.samples) {
+		append_reason(&validity.reason, "consumer did not read the sample target");
+	}
+	if (consumer.ok && rows.size() != consumer.reads) {
+		append_reason(&validity.reason, "CSV row count does not match consumer reads");
+	}
+	if (consumer.missed_total != 0) {
+		append_reason(&validity.reason, "missed_samples is nonzero");
+	}
+	if (validity.queue_overlap_count != 0) {
+		append_reason(&validity.reason, "a receive overlapped the next publish");
+	}
+	if (rows.size() <= warmup) append_reason(&validity.reason, "no post-warmup samples");
+	validity.eligible = validity.reason.empty();
+	return validity;
+}
+
 uint64_t percentile_sorted(const std::vector<uint64_t>& v, double pct) {
 	if (v.empty()) return 0;
 	const double idx = std::ceil(pct / 100.0 * static_cast<double>(v.size())) - 1.0;
@@ -480,7 +538,8 @@ void write_perf_stat(const Config& cfg, const std::string& dir) {
 void write_summary_json(const Config& cfg, const RunSpec& spec, const std::string& dir,
                         const std::vector<RawSample>& rows, size_t warmup, const LatencyStats& st,
                         const ChildResult& prod, const ChildResult& cons, uint64_t published,
-                        uint64_t missed_total, uint64_t torn) {
+                        uint64_t missed_total, uint64_t torn,
+                        const ComparisonValidity& comparison) {
 	const size_t measured = rows.size() > warmup ? rows.size() - warmup : 0;
 	uint64_t read_span_ns = 0;
 	if (measured >= 2) {
@@ -502,6 +561,8 @@ void write_summary_json(const Config& cfg, const RunSpec& spec, const std::strin
 	j += "  \"placement\": \"" + spec.placement + "\",\n";
 	j += "  \"rate_hz\": " + std::to_string(spec.rate_hz) + ",\n";
 	j += "  \"rate_label\": \"" + spec.rate_label + "\",\n";
+	j += std::string("  \"comparison_required\": ") +
+	     (spec.require_comparable ? "true" : "false") + ",\n";
 	j += "  \"count\": " + std::to_string(rows.size()) + ",\n";
 	j += "  \"warmup_count\": " + std::to_string(warmup) + ",\n";
 	j += "  \"measured_count\": " + std::to_string(measured) + ",\n";
@@ -534,6 +595,12 @@ void write_summary_json(const Config& cfg, const RunSpec& spec, const std::strin
 	j += "  },\n";
 	j += "  \"missed_samples\": " + std::to_string(missed_total) + ",\n";
 	j += "  \"torn_reads\": " + std::to_string(torn) + ",\n";
+	j += "  \"latency_comparison\": {\n";
+	j += std::string("    \"eligible\": ") + (comparison.eligible ? "true" : "false") + ",\n";
+	j += "    \"queue_overlap_count\": " +
+	     std::to_string(comparison.queue_overlap_count) + ",\n";
+	j += "    \"reason\": \"" + comparison.reason + "\"\n";
+	j += "  },\n";
 	j += "  \"git_commit\": \"" + cfg.git_commit + "\",\n";
 	j += "  \"environment\": \"VM_ONLY\"\n";
 	j += "}\n";
@@ -547,7 +614,9 @@ void write_summary_json(const Config& cfg, const RunSpec& spec, const std::strin
 
 void write_result_md(const RunSpec& spec, const std::string& dir, const LatencyStats& st,
                      const ChildResult& prod, const ChildResult& cons, uint64_t published,
-                     uint64_t missed_total, bool ok, const std::string& fail_reason) {
+                     uint64_t reads, uint64_t missed_total,
+                     const ComparisonValidity& comparison, bool ok,
+                     const std::string& fail_reason) {
 	std::string s;
 	s += "# " + spec.id + "\n\n";
 	s += "- transport: " + spec.transport + ", mode: " + spec.mode +
@@ -565,9 +634,16 @@ void write_result_md(const RunSpec& spec, const std::string& dir, const LatencyS
 	     json_num(static_cast<double>(rusage_cpu_us(prod.ru)) / 1000.0) + " |\n";
 	s += "| consumer cpu (ms) | " +
 	     json_num(static_cast<double>(rusage_cpu_us(cons.ru)) / 1000.0) + " |\n";
-	s += "| published / read | " + std::to_string(published) + " / " + std::to_string(st.n) +
+	s += "| published / read | " + std::to_string(published) + " / " + std::to_string(reads) +
 	     " |\n";
+	s += "| latency comparison eligible | " +
+	     std::string(comparison.eligible ? "yes" : "no") + " |\n";
+	s += "| post-warmup queue overlaps | " +
+	     std::to_string(comparison.queue_overlap_count) + " |\n";
 	s += "\n";
+	if (!comparison.eligible) {
+		s += "Latency comparison excluded: " + comparison.reason + ".\n\n";
+	}
 	if (!ok) s += "**RUN FAILED**: " + fail_reason + "\n";
 	const std::string path = dir + "/RESULT.md";
 	FILE* f = std::fopen(path.c_str(), "w");
@@ -612,6 +688,10 @@ struct RunOutcome {
 	uint64_t p99 = 0;
 	uint64_t max_lat = 0;
 	uint64_t missed = 0;
+	uint64_t published = 0;
+	uint64_t reads = 0;
+	bool comparison_eligible = false;
+	std::string comparison_reason;
 };
 
 RunOutcome run_shm(const Config& cfg, const RunSpec& spec, size_t ordinal) {
@@ -641,6 +721,10 @@ RunOutcome run_shm(const Config& cfg, const RunSpec& spec, size_t ordinal) {
 	pargv.push_back(std::to_string(spec.max_time_ms));
 	pargv.push_back("--rate");
 	pargv.push_back(std::to_string(spec.rate_hz));
+	if (spec.rate_hz > 0) {
+		pargv.push_back("--wait-consumer-ms");
+		pargv.push_back("5000");
+	}
 	pargv.push_back("--checksum");
 	pargv.push_back("1");
 
@@ -685,13 +769,16 @@ RunOutcome run_shm(const Config& cfg, const RunSpec& spec, size_t ordinal) {
 	const LatencyStats st = compute_stats(rows, warmup);
 
 	const uint64_t missed_total = cm.missed_total;
+	const ComparisonValidity comparison =
+	        assess_comparison_validity(spec, rows, warmup, pm, cm);
 	write_process_status(cfg, dir, prod, cons);
 	write_perf_stat(cfg, dir);
 	write_environment(cfg, spec, dir);
 	write_summary_json(cfg, spec, dir, rows, warmup, st, prod, cons, pm.published, missed_total,
-	                   cm.torn);
+	                   cm.torn, comparison);
 	compose_samples_csv(dir, rows, rusage_cpu_us(prod.ru), rusage_cpu_us(cons.ru));
-	write_result_md(spec, dir, st, prod, cons, pm.published, missed_total, true, "");
+	write_result_md(spec, dir, st, prod, cons, pm.published, cm.reads, missed_total, comparison,
+	                true, "");
 
 	std::string reason;
 	if (prod.signum != 0) reason += "producer killed by signal " + std::to_string(prod.signum);
@@ -709,6 +796,12 @@ RunOutcome run_shm(const Config& cfg, const RunSpec& spec, size_t ordinal) {
 	}
 	if (cm.torn > 0) reason += "; torn_reads=" + std::to_string(cm.torn);
 	if (rows.empty()) reason += "; empty samples";
+	if (!pm.ok) reason += "; producer marker missing";
+	if (!cm.ok) reason += "; consumer marker missing";
+	if (cm.ok && rows.size() != cm.reads) reason += "; CSV/read count mismatch";
+	if (spec.require_comparable && !comparison.eligible) {
+		append_reason(&reason, "required latency comparison is invalid: " + comparison.reason);
+	}
 
 	oc.ok = reason.empty();
 	oc.fail_reason = reason;
@@ -718,10 +811,14 @@ RunOutcome run_shm(const Config& cfg, const RunSpec& spec, size_t ordinal) {
 	oc.p99 = st.p99;
 	oc.max_lat = st.max;
 	oc.missed = missed_total;
+	oc.published = pm.published;
+	oc.reads = cm.reads;
+	oc.comparison_eligible = comparison.eligible;
+	oc.comparison_reason = comparison.reason;
 
 	if (!oc.ok)
-		write_result_md(spec, dir, st, prod, cons, pm.published, missed_total, false,
-		                reason);
+		write_result_md(spec, dir, st, prod, cons, pm.published, cm.reads, missed_total,
+		                comparison, false, reason);
 
 	// Best-effort forensic + cleanup (never fail the run on these).
 	if (!cfg.ctl_bin.empty()) {
@@ -745,7 +842,8 @@ RunOutcome run_socket(const Config& cfg, const RunSpec& spec) {
 		oc.fail_reason = "mkdir " + dir + " failed";
 		return oc;
 	}
-	const std::string sock_path = dir + "/channel.sock";
+	const std::string sock_path = "/tmp/er7_" + std::to_string(::getpid()) + "_" +
+	                              std::to_string(std::hash<std::string>{}(spec.id)) + ".sock";
 	const std::string csv_raw = dir + "/samples.raw.csv";
 
 	std::vector<std::string> pargv;
@@ -797,6 +895,7 @@ RunOutcome run_socket(const Config& cfg, const RunSpec& spec) {
 	const ChildHandle ch = spawn_child(cargv);
 	ChildResult prod = collect_child(ph);
 	ChildResult cons = collect_child(ch);
+	::unlink(sock_path.c_str());
 
 	const ProducerMarkers pm = parse_producer(prod.out);
 	const ConsumerMarkers cm = parse_consumer(cons.out);
@@ -805,14 +904,17 @@ RunOutcome run_socket(const Config& cfg, const RunSpec& spec) {
 	parse_raw_csv(csv_raw, &rows);
 	const size_t warmup = spec.warmup <= rows.size() ? spec.warmup : 0;
 	const LatencyStats st = compute_stats(rows, warmup);
+	const ComparisonValidity comparison =
+	        assess_comparison_validity(spec, rows, warmup, pm, cm);
 
 	write_process_status(cfg, dir, prod, cons);
 	write_perf_stat(cfg, dir);
 	write_environment(cfg, spec, dir);
 	write_summary_json(cfg, spec, dir, rows, warmup, st, prod, cons, pm.published,
-	                   cm.missed_total, cm.torn);
+	                   cm.missed_total, cm.torn, comparison);
 	compose_samples_csv(dir, rows, rusage_cpu_us(prod.ru), rusage_cpu_us(cons.ru));
-	write_result_md(spec, dir, st, prod, cons, pm.published, cm.missed_total, true, "");
+	write_result_md(spec, dir, st, prod, cons, pm.published, cm.reads, cm.missed_total,
+	                comparison, true, "");
 
 	std::string reason;
 	if (!prod.exec_ok || prod.exit_code != 0 || prod.signum != 0) {
@@ -826,6 +928,12 @@ RunOutcome run_socket(const Config& cfg, const RunSpec& spec) {
 	}
 	if (cm.torn > 0) reason += "; torn_reads=" + std::to_string(cm.torn);
 	if (rows.empty()) reason += "; empty samples";
+	if (!pm.ok) reason += "; producer marker missing";
+	if (!cm.ok) reason += "; consumer marker missing";
+	if (cm.ok && rows.size() != cm.reads) reason += "; CSV/read count mismatch";
+	if (spec.require_comparable && !comparison.eligible) {
+		append_reason(&reason, "required latency comparison is invalid: " + comparison.reason);
+	}
 
 	oc.ok = reason.empty();
 	oc.fail_reason = reason;
@@ -835,9 +943,13 @@ RunOutcome run_socket(const Config& cfg, const RunSpec& spec) {
 	oc.p99 = st.p99;
 	oc.max_lat = st.max;
 	oc.missed = cm.missed_total;
+	oc.published = pm.published;
+	oc.reads = cm.reads;
+	oc.comparison_eligible = comparison.eligible;
+	oc.comparison_reason = comparison.reason;
 	if (!oc.ok)
-		write_result_md(spec, dir, st, prod, cons, pm.published, cm.missed_total, false,
-		                reason);
+		write_result_md(spec, dir, st, prod, cons, pm.published, cm.reads, cm.missed_total,
+		                comparison, false, reason);
 	return oc;
 }
 
@@ -851,7 +963,7 @@ RunOutcome run_one(const Config& cfg, const RunSpec& spec, size_t ordinal) {
 // ---------------------------------------------------------------------------
 RunSpec spec_of(std::string id, std::string transport, std::string mode, uint32_t payload,
                 std::string placement, std::string rate_label, uint64_t rate_hz, uint64_t samples,
-                uint64_t max_time_ms, uint64_t warmup) {
+                uint64_t max_time_ms, uint64_t warmup, bool require_comparable = false) {
 	RunSpec s;
 	s.id = std::move(id);
 	s.transport = std::move(transport);
@@ -863,6 +975,7 @@ RunSpec spec_of(std::string id, std::string transport, std::string mode, uint32_
 	s.samples = samples;
 	s.max_time_ms = max_time_ms;
 	s.warmup = warmup;
+	s.require_comparable = require_comparable;
 	return s;
 }
 
@@ -872,6 +985,10 @@ std::vector<RunSpec> smoke_specs() {
 	                200000, 30000, 0),
 	        spec_of("smoke-socket-64B-same-max", "socket", "block", 64, "same", "max", 0,
 	                100000, 30000, 0),
+	        spec_of("smoke-shm-futex-64B-same-100-controlled", "shm", "futex", 64, "same",
+	                "100", 100, 50, 2000, 5, true),
+	        spec_of("smoke-socket-64B-same-100-controlled", "socket", "block", 64, "same",
+	                "100", 100, 50, 2000, 5, true),
 	};
 }
 
@@ -894,19 +1011,72 @@ std::vector<RunSpec> evidence_specs() {
 	                2000000, 60000, 50000),
 	        spec_of("shm-poll-64B-different-max", "shm", "poll", 64, "different", "max", 0,
 	                2000000, 60000, 50000),
-	        // Q4: Unix domain socket baseline (same size, same placement).
+	        // Q4 throughput/backpressure baseline. Max-rate latency is not comparable
+	        // because SOCK_STREAM queues while ShmChannel overwrites old samples.
 	        spec_of("socket-64B-same-max", "socket", "block", 64, "same", "max", 0, 1000000,
 	                60000, 10000),
 	        spec_of("socket-1KiB-same-max", "socket", "block", 1024, "same", "max", 0, 1000000,
 	                60000, 10000),
 	        spec_of("socket-64KiB-same-max", "socket", "block", 65536, "same", "max", 0, 300000,
 	                60000, 5000),
-	        // Q5: slow consumer (bounded latency, observable gaps) at fixed rates.
+	        // Q5: slow consumer (bounded latency, observable gaps) at 10 kHz.
 	        spec_of("shm-futex-64B-same-10k", "shm", "futex", 64, "same", "10k", 10000, 1000000,
 	                60000, 0),
-	        spec_of("shm-futex-64B-same-100", "shm", "futex", 64, "same", "100", 100, 100000,
-	                60000, 0),
+	        // Controlled latency pair: producer waits for the SHM consumer; both
+	        // transports must deliver every sample before the next 100 Hz publish.
+	        spec_of("shm-futex-64B-same-100-controlled", "shm", "futex", 64, "same", "100", 100,
+	                1000, 15000, 100, true),
+	        spec_of("socket-64B-same-100-controlled", "socket", "block", 64, "same", "100", 100,
+	                1000, 15000, 100, true),
 	};
+}
+
+bool same_comparison_cell(const RunSpec& shm, const RunSpec& socket) {
+	return shm.transport == "shm" && socket.transport == "socket" && shm.payload == socket.payload &&
+	       shm.placement == socket.placement && shm.rate_hz == socket.rate_hz &&
+	       shm.samples == socket.samples && shm.warmup == socket.warmup;
+}
+
+void write_latency_comparisons(const Config& cfg, const std::vector<RunSpec>& runs,
+                               const std::vector<RunOutcome>& outcomes) {
+	const std::string path = cfg.out_dir + "/LATENCY_COMPARISON.md";
+	FILE* f = std::fopen(path.c_str(), "w");
+	if (f == nullptr) return;
+	std::fputs("# Controlled Latency Comparisons\n\n", f);
+	std::fputs(
+	        "A ratio is valid only when both paced runs reached the sample target, delivered "
+	        "every sample, reported zero gaps, and had no receive overlap the next publish. "
+	        "Max-rate runs are excluded because latest-value overwrite and SOCK_STREAM "
+	        "backpressure have different overload semantics.\n\n",
+	        f);
+	std::fputs("| SHM run | socket run | validity | SHM p50 (ns) | socket p50 (ns) | "
+	           "socket / SHM |\n",
+	           f);
+	std::fputs("|---|---|---|---:|---:|---:|\n", f);
+	uint64_t pairs = 0;
+	for (size_t i = 0; i < runs.size(); ++i) {
+		if (runs[i].transport != "shm") continue;
+		for (size_t j = 0; j < runs.size(); ++j) {
+			if (!same_comparison_cell(runs[i], runs[j])) continue;
+			++pairs;
+			const bool valid = outcomes[i].ok && outcomes[j].ok &&
+			                   outcomes[i].comparison_eligible &&
+			                   outcomes[j].comparison_eligible && outcomes[i].p50 > 0;
+			if (valid) {
+				const double ratio = static_cast<double>(outcomes[j].p50) /
+				                     static_cast<double>(outcomes[i].p50);
+				std::fprintf(f, "| %s | %s | valid | %" PRIu64 " | %" PRIu64 " | %.3fx |\n",
+				             runs[i].id.c_str(), runs[j].id.c_str(), outcomes[i].p50,
+				             outcomes[j].p50, ratio);
+			} else {
+				std::fprintf(f, "| %s | %s | excluded | %" PRIu64 " | %" PRIu64 " | n/a |\n",
+				             runs[i].id.c_str(), runs[j].id.c_str(), outcomes[i].p50,
+				             outcomes[j].p50);
+			}
+		}
+	}
+	if (pairs == 0) std::fputs("\nNo matched paced SHM/socket cells were selected.\n", f);
+	std::fclose(f);
 }
 
 struct RateDim {
@@ -1015,6 +1185,10 @@ int main(int argc, char** argv) {
 	} else {
 		cfg.git_commit = "n/a (no commits or not a git repo)";
 	}
+	const std::vector<std::string> git_status = {
+	        "git", "-C", cfg.git_dir, "status", "--porcelain", "--untracked-files=normal"};
+	const ChildResult sr = spawn_collect(git_status);
+	if (sr.exec_ok && sr.exit_code == 0 && !sr.out.empty()) cfg.git_commit += " (dirty)";
 
 	// perf capability probe (VM_ONLY: paranoid=4 normally blocks it).
 	const std::vector<std::string> perf = {"perf", "stat", "-e",
@@ -1064,9 +1238,12 @@ int main(int argc, char** argv) {
 
 	uint64_t passed = 0;
 	uint64_t failed = 0;
+	std::vector<RunOutcome> outcomes;
+	outcomes.reserve(runs.size());
 	for (size_t i = 0; i < runs.size(); ++i) {
 		const RunSpec& s = runs[i];
 		const RunOutcome oc = run_one(cfg, s, i + 1);
+		outcomes.push_back(oc);
 		if (oc.ok) {
 			++passed;
 			std::printf("RUN %-40s PASS measured=%-8" PRIu64 " p50=%-8" PRIu64
@@ -1080,6 +1257,7 @@ int main(int argc, char** argv) {
 		}
 		std::fflush(stdout);
 	}
+	write_latency_comparisons(cfg, runs, outcomes);
 	std::printf("SUMMARY total=%zu passed=%" PRIu64 " failed=%" PRIu64 "\n", runs.size(),
 	            passed, failed);
 	return failed > 0 ? 1 : 0;

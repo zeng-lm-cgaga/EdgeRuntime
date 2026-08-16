@@ -15,7 +15,8 @@ struct PublishInfo {
 };
 
 // A decoded sample plus its provenance (design §16.2). value is only valid when
-// the codec's decode() succeeded; missed_samples saturates at gap overflow.
+// the codec's decode() succeeded; missed_samples is the number of unobserved
+// sequences strictly between the previous and current sample, without wrap.
 template <typename T>
 struct Sample {
 	T value{};

@@ -20,6 +20,7 @@
 
 #include "bench_payload.hpp"
 #include "edge_runtime/channel_options.hpp"
+#include "edge_runtime/detail/channel_layout.hpp"
 #include "edge_runtime/error.hpp"
 #include "edge_runtime/producer.hpp"
 #include "edge_runtime/result.hpp"
@@ -41,6 +42,7 @@ struct Args {
 	uint64_t samples = 1000000;    // stop at this many publishes
 	uint64_t max_time_ms = 60000;  // ... or this wall cap
 	uint64_t rate_hz = 0;          // 0 = max throughput
+	uint64_t wait_consumer_ms = 0;
 	bool checksum = true;
 };
 
@@ -61,6 +63,29 @@ int run_producer_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) 
 	}
 	std::printf("READY generation=%" PRIu64 "\n", p.value().generation());
 	std::fflush(stdout);
+	if (a.wait_consumer_ms > 0) {
+		const int64_t wait_deadline = edge_tool::monotonic_ms_now() +
+		                              static_cast<int64_t>(a.wait_consumer_ms);
+		for (;;) {
+			auto status = p.value().status();
+			if (!status) {
+				std::printf("WAIT_CONSUMER_FAIL code=%s\n",
+				            edge_runtime::to_string(status.error().code));
+				return 2;
+			}
+			if (status.value().consumer_state == static_cast<uint32_t>(
+			                                             edge_runtime::detail::EndpointState::kOnline)) {
+				break;
+			}
+			if (edge_tool::monotonic_ms_now() >= wait_deadline) {
+				std::printf("WAIT_CONSUMER_FAIL code=Timeout\n");
+				return 2;
+			}
+			struct timespec ts {};
+			ts.tv_nsec = 1000000L;
+			::nanosleep(&ts, nullptr);
+		}
+	}
 
 	const int64_t deadline_ms = a.max_time_ms > 0 ? edge_tool::monotonic_ms_now() +
 	                                                        static_cast<int64_t>(a.max_time_ms)
@@ -102,7 +127,8 @@ int main(int argc, char** argv) {
 	if (name == nullptr || *name == '\0') {
 		std::fprintf(stderr,
 		             "usage: edge_shm_bench_producer --name <name> --payload <bytes> "
-		             "[--samples N] [--max-time-ms T] [--rate hz] [--checksum 0|1]\n");
+		             "[--samples N] [--max-time-ms T] [--rate hz] "
+		             "[--wait-consumer-ms N] [--checksum 0|1]\n");
 		return 2;
 	}
 	Args a;
@@ -111,6 +137,7 @@ int main(int argc, char** argv) {
 	a.samples = edge_tool::arg_u64(argc, argv, "--samples", 1000000);
 	a.max_time_ms = edge_tool::arg_u64(argc, argv, "--max-time-ms", 60000);
 	a.rate_hz = edge_tool::arg_u64(argc, argv, "--rate", 0);
+	a.wait_consumer_ms = edge_tool::arg_u64(argc, argv, "--wait-consumer-ms", 0);
 	a.checksum = edge_tool::arg_u64(argc, argv, "--checksum", 1) != 0;
 	if (edge_tool::arg_flag(argc, argv, "--checksum-off")) a.checksum = false;
 

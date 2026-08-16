@@ -63,8 +63,7 @@ class Consumer {
 	// revalidation, consumer identity registration (rejects a live consumer).
 	static Result<Consumer> open(const ChannelOptions& options,
 	                             const SchemaDescriptor& schema) {
-		static_assert(kSupportedPayload<T>,
-		              "T must satisfy the PayloadCodec<T> contract (schema.hpp)");
+		detail::validate_payload_codec<T>();
 		auto h = detail::consumer_open_impl(options, schema, PayloadCodec<T>::kEncodedSize);
 		if (!h) return h.error();
 		return Consumer(std::move(h.value()));
@@ -109,8 +108,7 @@ class Consumer {
 	// EAGAIN/EINTR/spurious wakeups loop without resetting the deadline. A zero
 	// timeout degrades to one bounded probe + immediate classification.
 	Result<Sample<T>> wait_latest(std::chrono::nanoseconds timeout) noexcept {
-		static_assert(kSupportedPayload<T>,
-		              "T must satisfy the PayloadCodec<T> contract (schema.hpp)");
+		detail::validate_payload_codec<T>();
 		typename PayloadCodec<T>::EncodedBuffer encoded{};
 		const int64_t count = timeout.count();
 		const uint64_t timeout_ns = count > 0 ? static_cast<uint64_t>(count) : 0;

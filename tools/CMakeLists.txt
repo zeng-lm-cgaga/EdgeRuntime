@@ -66,8 +66,8 @@ if(BUILD_TESTING)
   set_tests_properties(
     crash_matrix PROPERTIES TIMEOUT 900 LABELS crash DISABLED TRUE)
 
-  # The ER7 smoke subset (shm-futex 64B max + socket 64B max) exercises the
-  # full fork+exec pipeline and evidence writer in the normal dev loop; the
+  # The ER7 smoke subset exercises max-rate pipelines plus a short controlled
+  # SHM/socket pair whose no-gap/no-backlog comparison gate is mandatory. The
   # curated --evidence set and the full --matrix grid are opt-in runs.
   add_test(
     NAME bench_smoke

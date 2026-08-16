@@ -18,6 +18,7 @@ edgeruntime_unit_test(error_test)             # U08 error table + classification
 edgeruntime_unit_test(process_identity_test)  # U06/U11/U13 pidfd + starttime
 edgeruntime_unit_test(control_journal_test)   # U11/U13 journal round-trip
 edgeruntime_unit_test(checksum_test)          # fnv1a64 golden vectors
+edgeruntime_unit_test(schema_contract_test)   # PayloadCodec signatures + noexcept
 edgeruntime_unit_test(slot_protocol_test)     # U07/U09/U14 slot machine
 edgeruntime_unit_test(futex_test)             # U10 futex wait/wake/EAGAIN/EINTR/timeout
 edgeruntime_unit_test(clock_test)             # §15.7 deadline + remaining-time helpers

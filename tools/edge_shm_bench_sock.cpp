@@ -5,8 +5,9 @@
 //       BenchPayloadV1<N> bytes (publish_ns stamped right before send) paced by
 //       --rate — the natural backpressure baseline (every sample delivered,
 //       no latest-value semantics, no futex).
-//   --role consumer: connect, recv exactly N bytes per sample, stamp a RAW
-//       receive_ns immediately, decode+validate, and write the same 7-column
+//   --role consumer: connect, recv exactly N bytes per sample, decode+validate,
+//       stamp a RAW receive_ns at the same public-read boundary as ShmChannel,
+//       and write the same 7-column
 //       rows as the ShmChannel consumer (generation/missed are 0 here) so the
 //       bench driver produces a comparable samples.csv.
 //
@@ -107,13 +108,30 @@ int run_sock_producer_n(const Args& a) {
 			::close(cfd);
 			return 3;
 		}
-		const ssize_t wr = ::send(cfd, buf.data(), buf.size(), 0);
-		if (wr < 0) {
-			if (errno == EPIPE) break;  // consumer closed the connection: run over
+		size_t sent = 0;
+		bool consumer_closed = false;
+		while (sent < buf.size()) {
+			const ssize_t wr =
+			        ::send(cfd, buf.data() + sent, buf.size() - sent, MSG_NOSIGNAL);
+			if (wr > 0) {
+				sent += static_cast<size_t>(wr);
+				continue;
+			}
+			if (wr < 0 && errno == EINTR) continue;
+			if (wr < 0 && (errno == EPIPE || errno == ECONNRESET)) {
+				consumer_closed = true;
+				break;
+			}
+			if (wr == 0) {
+				std::fprintf(stderr, "send returned zero\n");
+				::close(cfd);
+				return 3;
+			}
 			std::fprintf(stderr, "send: %s\n", std::strerror(errno));
 			::close(cfd);
 			return 3;
 		}
+		if (consumer_closed) break;  // consumer reached its run cap
 		++published;
 		if (a.samples > 0 && published >= a.samples) break;
 		if (deadline_ms != 0 && edge_tool::monotonic_ms_now() >= deadline_ms) break;
@@ -199,13 +217,15 @@ int run_sock_consumer_n(const Args& a) {
 			break;
 		}
 
-		const uint64_t receive_ns = monotonic_raw_now_ns();
 		bench::BenchPayloadV1<N> v{};
 		if (!edge_runtime::PayloadCodec<bench::BenchPayloadV1<N>>::decode(
 		            buf.data(), static_cast<size_t>(N), &v)) {
 			++torn;
 			break;
 		}
+		// Match ShmChannel's public read boundary: wait_latest() returns only after
+		// local copy, checksum, and codec decode have completed.
+		const uint64_t receive_ns = monotonic_raw_now_ns();
 		const uint64_t latency = receive_ns >= v.publish_ns ? receive_ns - v.publish_ns : 0;
 		std::fprintf(csv, "%" PRIu64 ",0,%u,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0\n",
 		             reads + 1, static_cast<unsigned>(N), v.publish_ns, receive_ns,

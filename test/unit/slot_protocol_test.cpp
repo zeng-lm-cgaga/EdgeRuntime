@@ -40,11 +40,12 @@ TEST(SlotProtocol, NextSequence) {  // U07
 }
 
 TEST(SlotProtocol, SaturatedGap) {  // U07
-	EXPECT_EQ(saturated_gap(1, 5), 4u);
-	EXPECT_EQ(saturated_gap(0, 1), 1u);
+	EXPECT_EQ(saturated_gap(1, 2), 0u);  // consecutive samples: nothing missed
+	EXPECT_EQ(saturated_gap(1, 5), 3u);
+	EXPECT_EQ(saturated_gap(0, 1), 0u);
 	EXPECT_EQ(saturated_gap(9, 9), 0u);                   // same sequence (defensive)
 	EXPECT_EQ(saturated_gap(5, 2), 0u);                   // stale/older (defensive)
-	EXPECT_EQ(saturated_gap(0, UINT64_MAX), UINT64_MAX);  // saturate, no wrap
+	EXPECT_EQ(saturated_gap(0, UINT64_MAX), UINT64_MAX - 1);  // no wrap
 }
 
 TEST(SlotProtocol, ProducerTransitions) {  // U09

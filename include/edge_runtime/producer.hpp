@@ -41,8 +41,7 @@ class Producer {
 	// replacement of a dead predecessor, commit at bootstrap READY.
 	static Result<Producer> create(const ChannelOptions& options,
 	                               const SchemaDescriptor& schema) {
-		static_assert(kSupportedPayload<T>,
-		              "T must satisfy the PayloadCodec<T> contract (schema.hpp)");
+		detail::validate_payload_codec<T>();
 		auto h = detail::producer_create_impl(options, schema,
 		                                      PayloadCodec<T>::kEncodedSize);
 		if (!h) return h.error();
