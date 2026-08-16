@@ -1,7 +1,7 @@
 // consume_demo: the minimal downstream consumer for the INSTALLED EdgeRuntime
 // package. It mirrors what an application does: include only public headers
 // (detail/ is deliberately NOT installed), supply its own PayloadCodec<T>, and
-// run one create -> publish -> open -> try_read_latest round trip.
+// run one create -> write loan -> open -> read loan round trip.
 //
 // Compile-and-run is validated by the release-audit CI gate and the local
 // scripts/ci.sh (evidence: er8_install_consume.txt).
@@ -13,6 +13,7 @@
 #include <cstring>
 
 #include "edge_runtime/consumer.hpp"
+#include "edge_runtime/loan.hpp"
 #include "edge_runtime/producer.hpp"
 #include "edge_runtime/sample.hpp"
 #include "edge_runtime/schema.hpp"
@@ -70,18 +71,28 @@ int main() {
 		return 1;
 	}
 
-	auto pub = p.value().publish(Point{3, 4});
+	auto write = p.value().loan();
+	if (!write || !edge_runtime::PayloadCodec<Point>::encode(
+	                      Point{3, 4}, write.value().data(), write.value().size())) {
+		std::fprintf(stderr, "write loan failed\n");
+		return 1;
+	}
+	auto pub = write.value().commit();
 	if (!pub) {
-		std::fprintf(stderr, "publish failed\n");
+		std::fprintf(stderr, "commit failed\n");
 		return 1;
 	}
-	auto r = c.value().try_read_latest();
+	auto r = c.value().try_loan_latest();
 	if (!r) {
-		std::fprintf(stderr, "read failed\n");
+		std::fprintf(stderr, "read loan failed\n");
 		return 1;
 	}
-	const Point& got = r.value().value;
-	const uint64_t seq = r.value().sequence;
+	Point got{};
+	if (!edge_runtime::PayloadCodec<Point>::decode(r.value().data(), r.value().size(), &got)) {
+		std::fprintf(stderr, "decode failed\n");
+		return 1;
+	}
+	const uint64_t seq = r.value().sequence();
 	std::printf("OK x=%d y=%d seq=%" PRIu64 "\n", got.x, got.y, seq);
 	return (got.x == 3 && got.y == 4) ? 0 : 2;
 }

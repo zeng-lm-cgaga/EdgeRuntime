@@ -61,6 +61,49 @@ struct ProducerUseGuard {
 	explicit operator bool() const noexcept { return armed; }
 };
 
+void mark_producer_offline(ProducerHandle& handle) noexcept {
+	// Best-effort clean shutdown: only mark OFFLINE if the header still carries
+	// this handle's producer identity.
+	auto* base = static_cast<std::byte*>(handle.shm.mapping.get());
+	auto* header = reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset);
+	auto pid_res = identity_snapshot_read(&header->producer);
+	if (!pid_res || pid_res.value().role_epoch != handle.role_epoch) return;
+
+	shared_store_release(&header->producer_state,
+	                     static_cast<uint32_t>(EndpointState::kOffline));
+	if (handle.transport != Transport::kMemfdFdPass || handle.socket_unlinked) return;
+
+	handle.serve_stop.store(true, std::memory_order_relaxed);
+	if (handle.listen_fd.get() >= 0) (void)::shutdown(handle.listen_fd.get(), SHUT_RDWR);
+	auto lock_res = ControlLock::acquire(channel_lock_path(handle.channel_name));
+	if (!lock_res) return;
+	auto jr = lock_res.value().read_journal();
+	if (jr && jr.value().new_generation == handle.generation &&
+	    jr.value().new_nonce_hi == handle.instance_nonce_hi &&
+	    jr.value().new_nonce_lo == handle.instance_nonce_lo) {
+		(void)::unlink(handle.socket_path.c_str());
+		handle.socket_unlinked = true;
+	}
+}
+
+void service_producer_shutdown(const std::shared_ptr<ProducerHandle>& handle) noexcept {
+	if (!handle->shutdown_pending.load(std::memory_order_acquire)) return;
+	bool idle = false;
+	if (!handle->operation_in_use.compare_exchange_strong(idle, true, std::memory_order_acq_rel)) {
+		return;
+	}
+	bool first = false;
+	if (handle->shutdown_started.compare_exchange_strong(first, true, std::memory_order_acq_rel)) {
+		mark_producer_offline(*handle);
+	}
+	handle->operation_in_use.store(false, std::memory_order_release);
+}
+
+void release_producer_loan_operation(const std::shared_ptr<ProducerHandle>& handle) noexcept {
+	handle->operation_in_use.store(false, std::memory_order_release);
+	service_producer_shutdown(handle);
+}
+
 // Shared stale-guard block for publish() and heartbeat() (design §15.6/§34):
 // the instance must still be READY, the frozen generation/nonce must still
 // match, the producer role must still belong to this handle, and the producer
@@ -742,39 +785,125 @@ Result<ChannelStatus> producer_status_impl(const std::shared_ptr<ProducerHandle>
 }
 
 void producer_shutdown_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept {
-	// Best-effort clean shutdown (design §15.2): only mark OFFLINE if the header
-	// still carries our producer identity (no replacement happened under us).
-	auto* base = static_cast<std::byte*>(handle->shm.mapping.get());
-	auto* header = reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset);
-	auto pid_res = identity_snapshot_read(&header->producer);
-	if (!pid_res || pid_res.value().role_epoch != handle->role_epoch) {
-		return;  // not ours (anymore) — leave the header untouched
-	}
-	shared_store_release(&header->producer_state,
-	                     static_cast<uint32_t>(EndpointState::kOffline));
+	handle->shutdown_pending.store(true, std::memory_order_release);
+	service_producer_shutdown(handle);
+}
 
-	if (handle->transport == Transport::kMemfdFdPass && !handle->socket_unlinked) {
-		// v0.2 §33.5: clean shutdown releases the channel by removing the broker
-		// socket (the fd-mode reachability point), so a successor can bind
-		// directly — the equivalent of v0.1's OFFLINE -> replace. Best-effort and
-		// under the control lock: only unlink if the journal still records OUR
-		// instance, so a late shutdown can never remove a successor's socket
-		// (socket name-ABA guard, mirror of §9.4).
-		handle->serve_stop.store(true, std::memory_order_relaxed);
-		if (handle->listen_fd.get() >= 0) {
-			(void)::shutdown(handle->listen_fd.get(), SHUT_RDWR);
+Result<WriteLoan> producer_loan_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept {
+	if (handle->operation_in_use.exchange(true, std::memory_order_acq_rel)) {
+		return make_error(ErrorCode::kConcurrentHandleUse, "Producer::loan",
+		                  "concurrent handle use");
+	}
+	auto release_on_error = [&handle]() {
+		handle->operation_in_use.store(false, std::memory_order_release);
+	};
+
+	auto verified = verify_handle_ownership(*handle, "Producer::loan");
+	if (!verified) {
+		release_on_error();
+		return verified.error();
+	}
+	auto* header = verified.value();
+	auto* base = static_cast<std::byte*>(handle->shm.mapping.get());
+	const uint64_t current = shared_load_acquire(&header->latest_ticket);
+	uint64_t next_sequence = 0;
+	if (!checked_next_sequence(current, &next_sequence)) {
+		release_on_error();
+		return make_error(ErrorCode::kSequenceExhausted, "Producer::loan",
+		                  "sequence exhausted");
+	}
+
+	uint64_t stride = 0;
+	if (!round_up_to_multiple_u64(kSlotHeaderSize + handle->payload_size, 64, &stride)) {
+		release_on_error();
+		return make_error(ErrorCode::kInvalidOptions, "Producer::loan", "stride overflow");
+	}
+	const uint32_t current_slot = current == 0 ? kInvalidSlot : ticket_slot(current);
+	SlotHeaderAbi* chosen = nullptr;
+	uint32_t chosen_index = 0;
+	for (uint32_t i = 0; i < kSlotCount; ++i) {
+		if (i == current_slot) continue;
+		uint64_t offset = 0;
+		if (!slot_byte_offset(i, stride, &offset)) continue;
+		auto* slot = reinterpret_cast<SlotHeaderAbi*>(base + offset);
+		const uint32_t observed = shared_load_relaxed(&slot->state);
+		if (observed != static_cast<uint32_t>(SlotState::kFree) &&
+		    observed != static_cast<uint32_t>(SlotState::kPublished)) {
+			continue;
 		}
-		auto lock_res = ControlLock::acquire(channel_lock_path(handle->channel_name));
-		if (lock_res) {
-			auto jr = lock_res.value().read_journal();
-			if (jr && jr.value().new_generation == handle->generation &&
-			    jr.value().new_nonce_hi == handle->instance_nonce_hi &&
-			    jr.value().new_nonce_lo == handle->instance_nonce_lo) {
-				(void)::unlink(handle->socket_path.c_str());
-				handle->socket_unlinked = true;
-			}
+		if (slot_claim_writable(slot, observed)) {
+			chosen = slot;
+			chosen_index = i;
+			break;
 		}
 	}
+	if (chosen == nullptr) {
+		release_on_error();
+		return make_error(ErrorCode::kNoWritableSlot, "Producer::loan", "all slots busy");
+	}
+	EDGE_FAILPOINT(C22);
+	auto* payload = reinterpret_cast<std::byte*>(chosen) + kSlotHeaderSize;
+	return WriteLoan(handle, chosen, payload, handle->payload_size, chosen_index, next_sequence);
+}
+
+Result<PublishInfo> producer_commit_loan_impl(WriteLoan* loan) noexcept {
+	if (loan == nullptr || !loan->active_ || !loan->handle_ || loan->slot_ == nullptr) {
+		return make_error(ErrorCode::kInvalidOptions, "WriteLoan::commit", "loan inactive");
+	}
+	const std::shared_ptr<ProducerHandle> handle = loan->handle_;
+	auto* slot = static_cast<SlotHeaderAbi*>(loan->slot_);
+	auto fail = [loan, &handle, slot](const Error& error) -> Result<PublishInfo> {
+		slot_abort_write(slot);
+		loan->active_ = false;
+		loan->slot_ = nullptr;
+		loan->data_ = nullptr;
+		loan->handle_.reset();
+		release_producer_loan_operation(handle);
+		return error;
+	};
+
+	auto verified = verify_handle_ownership(*handle, "WriteLoan::commit");
+	if (!verified) return fail(verified.error());
+	const uint64_t publish_boot_ns = boottime_now_ns();
+	if (publish_boot_ns == 0) {
+		return fail(make_error(ErrorCode::kClockAnomaly, "WriteLoan::commit",
+		                       "boottime unavailable"));
+	}
+	const uint64_t checksum = fnv1a64(loan->data_, static_cast<size_t>(loan->size_));
+
+	shared_store_relaxed(&slot->payload_size, loan->size_);
+	shared_store_relaxed(&slot->sample_sequence, loan->sequence_);
+	shared_store_relaxed(&slot->publish_boot_ns, publish_boot_ns);
+	EDGE_FAILPOINT(C04);
+	shared_store_relaxed(&slot->payload_checksum, checksum);
+	slot_publish(slot);
+	EDGE_FAILPOINT(C05);
+	auto* header = verified.value();
+	shared_store_release(&header->latest_ticket, make_ticket(loan->sequence_, loan->slot_index_));
+	EDGE_FAILPOINT(C06);
+	shared_fetch_add_relaxed(&header->publish_count, uint64_t{1});
+	shared_store_relaxed(&header->last_publish_boot_ns, publish_boot_ns);
+	shared_fetch_add_relaxed(&header->notify_epoch, uint32_t{1});
+	(void)futex_wake(&header->notify_epoch, 1);
+
+	const PublishInfo info{handle->generation, loan->sequence_, publish_boot_ns};
+	loan->active_ = false;
+	loan->slot_ = nullptr;
+	loan->data_ = nullptr;
+	loan->handle_.reset();
+	release_producer_loan_operation(handle);
+	return Result<PublishInfo>(info);
+}
+
+void producer_abort_loan_impl(WriteLoan* loan) noexcept {
+	if (loan == nullptr || !loan->active_ || !loan->handle_) return;
+	const std::shared_ptr<ProducerHandle> handle = loan->handle_;
+	if (loan->slot_ != nullptr) slot_abort_write(static_cast<SlotHeaderAbi*>(loan->slot_));
+	loan->active_ = false;
+	loan->slot_ = nullptr;
+	loan->data_ = nullptr;
+	loan->handle_.reset();
+	release_producer_loan_operation(handle);
 }
 
 Result<void> producer_remove_if_owner_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept {

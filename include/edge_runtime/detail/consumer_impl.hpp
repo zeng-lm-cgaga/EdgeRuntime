@@ -38,6 +38,8 @@ struct ConsumerHandle {
 	uint64_t last_sequence{0};
 	bool first_sample_in_generation{true};
 	std::atomic<bool> operation_in_use{false};  // same-handle overlap guard (§18.1)
+	std::atomic<bool> shutdown_pending{false};
+	std::atomic<bool> shutdown_started{false};
 };
 
 // Full §9.2 open sequence: bootstrap/header validation, control-lock

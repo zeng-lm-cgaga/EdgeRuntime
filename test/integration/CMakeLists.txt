@@ -115,3 +115,24 @@ add_test(
           $<TARGET_FILE:edge_shm_producer>
           $<TARGET_FILE:edge_shm_consumer>)
 set_tests_properties(supervisor_er13 PROPERTIES TIMEOUT 150 LABELS integration)
+
+# ER15 v0.4 loaned-buffer driver: the helper independently reopens both POSIX
+# shm and memfd channels, then parses the shared READING slot in place.
+add_executable(edge_shm_loan_helper helpers/loan_child.cpp)
+edgeruntime_apply_project_options(edge_shm_loan_helper)
+target_link_libraries(
+  edge_shm_loan_helper PRIVATE edge_runtime Threads::Threads rt)
+target_include_directories(
+  edge_shm_loan_helper PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
+
+add_executable(loan_integration_test loan_test.cpp)
+edgeruntime_apply_project_options(loan_integration_test)
+target_link_libraries(
+  loan_integration_test PRIVATE edge_runtime GTest::gtest_main Threads::Threads rt)
+target_include_directories(
+  loan_integration_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
+
+add_test(
+  NAME loan_er15
+  COMMAND loan_integration_test $<TARGET_FILE:edge_shm_loan_helper>)
+set_tests_properties(loan_er15 PROPERTIES TIMEOUT 30 LABELS integration)

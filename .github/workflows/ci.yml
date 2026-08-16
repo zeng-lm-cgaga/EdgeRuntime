@@ -11,7 +11,7 @@
 #   Stage 3  release configure + build
 #   Stage 4  install to a temp prefix + build & run examples/consume_demo
 #
-# Full crash matrix (C01-C13) and the ER7 12-run benchmark evidence set are
+# Full crash matrix (C01-C23) and the ER7 12-run benchmark evidence set are
 # opt-in on the development host, not part of per-commit CI (see design §20.3
 # and §21). CI runs the same default ctest suite the presets ship.
 

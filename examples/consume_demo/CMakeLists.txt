@@ -1,7 +1,7 @@
 # consume_demo — standalone downstream consumer (design §26: "public API 和
 # target 可安装"). This project does NOT belong to the EdgeRuntime build; it
 # consumes the INSTALLED package via find_package, proving the exported target
-# and the 7 installed public headers work in a fresh, independent CMake project.
+# and the installed public headers work in a fresh, independent CMake project.
 #
 #   cmake -S . -B build -DCMAKE_PREFIX_PATH=/path/to/install-prefix
 #   cmake --build build

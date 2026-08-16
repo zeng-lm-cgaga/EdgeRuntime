@@ -10,6 +10,7 @@
 
 #include "edge_runtime/channel_options.hpp"
 #include "edge_runtime/error.hpp"
+#include "edge_runtime/loan.hpp"
 #include "edge_runtime/result.hpp"
 #include "edge_runtime/sample.hpp"
 #include "edge_runtime/schema.hpp"
@@ -96,6 +97,12 @@ class Consumer {
 		return Result<Sample<T>>(std::move(out));
 	}
 
+	// Borrow the latest encoded payload in place. The slot stays READING and
+	// cannot be overwritten until the ReadLoan is released or destroyed.
+	Result<ReadLoan> try_loan_latest() noexcept {
+		return detail::consumer_try_loan_latest_impl(handle_);
+	}
+
 	// Blocking read with an absolute MONOTONIC deadline (design §14.2, ER3).
 	// Timeout is classified by producer liveness (§15.5): alive-but-idle ->
 	// kDataStale, offline/dead -> kProducerOffline, unverifiable -> kRecoveryBlocked.
@@ -129,6 +136,12 @@ class Consumer {
 		return Result<Sample<T>>(std::move(out));
 	}
 
+	Result<ReadLoan> wait_loan_latest(std::chrono::nanoseconds timeout) noexcept {
+		const int64_t count = timeout.count();
+		const uint64_t timeout_ns = count > 0 ? static_cast<uint64_t>(count) : 0;
+		return detail::consumer_wait_loan_latest_impl(handle_, timeout_ns);
+	}
+
 	// Reopen against a replaced instance (ER4).
 	Result<ReconnectInfo> reconnect() noexcept {
 		return detail::consumer_reconnect_impl(handle_);
@@ -141,8 +154,13 @@ class Consumer {
 
 	Consumer(const Consumer&) = delete;
 	Consumer& operator=(const Consumer&) = delete;
-	Consumer(Consumer&&) noexcept = default;
-	Consumer& operator=(Consumer&&) noexcept = default;
+	Consumer(Consumer&& other) noexcept : handle_(std::move(other.handle_)) {}
+	Consumer& operator=(Consumer&& other) noexcept {
+		if (this == &other) return *this;
+		if (handle_) detail::consumer_shutdown_impl(handle_);
+		handle_ = std::move(other.handle_);
+		return *this;
+	}
 
 	// Best-effort clean shutdown (design §15.2): marks consumer_state OFFLINE so
 	// a later open in the same process is not rejected as an active owner.

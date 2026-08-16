@@ -7,6 +7,7 @@
 
 #include "edge_runtime/channel_options.hpp"
 #include "edge_runtime/error.hpp"
+#include "edge_runtime/loan.hpp"
 #include "edge_runtime/result.hpp"
 #include "edge_runtime/sample.hpp"
 #include "edge_runtime/schema.hpp"
@@ -60,6 +61,10 @@ class Producer {
 		return detail::producer_publish_impl(handle_, encoded.data(), size);
 	}
 
+	// Borrow one shared-memory slot for direct canonical encoding. The returned
+	// WRITING slot is invisible until commit(); dropping it aborts the write.
+	Result<WriteLoan> loan() noexcept { return detail::producer_loan_impl(handle_); }
+
 	// Slow-check diagnostic: revalidates the name still resolves to this
 	// instance's inode, then snapshots the channel state.
 	Result<ChannelStatus> status() const noexcept {
@@ -86,8 +91,13 @@ class Producer {
 
 	Producer(const Producer&) = delete;
 	Producer& operator=(const Producer&) = delete;
-	Producer(Producer&&) noexcept = default;
-	Producer& operator=(Producer&&) noexcept = default;
+	Producer(Producer&& other) noexcept : handle_(std::move(other.handle_)) {}
+	Producer& operator=(Producer&& other) noexcept {
+		if (this == &other) return *this;
+		if (handle_) detail::producer_shutdown_impl(handle_);
+		handle_ = std::move(other.handle_);
+		return *this;
+	}
 
 	// Best-effort clean shutdown (design §15.2): marks the shared producer_state
 	// OFFLINE so a same-process recreate is not mistaken for a live owner.

@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.22)
 
 project(
   EdgeRuntime
-  VERSION 0.1.0
+  VERSION 0.4.0
   DESCRIPTION "Linux SPSC latest-value shared-memory runtime"
   LANGUAGES CXX)
 
@@ -15,7 +15,7 @@ find_package(Threads REQUIRED)
 option(EDGERUNTIME_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(EDGERUNTIME_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
-# Compile-time failpoints (design §22 / crash matrix C01-C13). Default ON for
+# Compile-time failpoints (design §22 / crash matrix C01-C23). Default ON for
 # Debug builds so the fault-injection toolchain is exercisable; OFF for Release
 # so production binaries carry zero failpoint cost.
 set(_edgeruntime_failpoints_default OFF)
@@ -31,7 +31,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     list(APPEND EDGERUNTIME_PRIVATE_COMPILE_OPTIONS -Werror)
   endif()
 else()
-  message(FATAL_ERROR "EdgeRuntime v0.1 currently supports GCC or Clang on Linux only")
+  message(FATAL_ERROR "EdgeRuntime currently supports GCC or Clang on Linux only")
 endif()
 
 # First-party flags applied PRIVATE to every target in this repo (library,
@@ -70,6 +70,7 @@ add_library(edge_runtime STATIC
   src/edge_runtime/detail/failpoint.cpp
   src/edge_runtime/detail/fd_broker.cpp
   src/edge_runtime/detail/futex.cpp
+  src/edge_runtime/detail/loan.cpp
   src/edge_runtime/detail/process_identity.cpp
   src/edge_runtime/detail/process_spawn.cpp
   src/edge_runtime/detail/producer_impl.cpp

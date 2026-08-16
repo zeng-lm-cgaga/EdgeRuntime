@@ -47,6 +47,7 @@ struct Args {
 	uint64_t use_wait_ms = 0;          // >0: wait_latest(ms) instead of polling (ER3)
 	bool checksum = true;
 	bool use_v2 = false;
+	bool loaned = false;  // v0.4: parse directly from a ReadLoan
 	edge_runtime::Transport transport{edge_runtime::Transport::kPosixShm};
 };
 
@@ -104,12 +105,35 @@ int run_consume(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 	uint64_t waits = 0;      // wait_latest calls that returned no sample
 	uint64_t timed_out = 0;  // 1 when a wait ended in a timeout classification
 	const char* last_error = "none";
+	auto read_one = [&]() -> edge_runtime::Result<edge_runtime::Sample<T>> {
+		if (!a.loaned) {
+			return a.use_wait_ms > 0
+			               ? consumer.value().wait_latest(std::chrono::milliseconds(
+			                         static_cast<int64_t>(a.use_wait_ms)))
+			               : consumer.value().try_read_latest();
+		}
+		auto borrowed = a.use_wait_ms > 0
+		                        ? consumer.value().wait_loan_latest(std::chrono::milliseconds(
+		                                  static_cast<int64_t>(a.use_wait_ms)))
+		                        : consumer.value().try_loan_latest();
+		if (!borrowed) return borrowed.error();
+		edge_runtime::Sample<T> sample;
+		if (!edge_runtime::PayloadCodec<T>::decode(borrowed.value().data(),
+		                                           borrowed.value().size(), &sample.value)) {
+			return edge_runtime::make_error(edge_runtime::ErrorCode::kPayloadDecodeFailed,
+			                                "edge_shm_consumer", "loan decode failed");
+		}
+		sample.generation = borrowed.value().generation();
+		sample.instance_nonce = borrowed.value().instance_nonce();
+		sample.sequence = borrowed.value().sequence();
+		sample.publish_boot_ns = borrowed.value().publish_boot_ns();
+		sample.receive_boot_ns = borrowed.value().receive_boot_ns();
+		sample.missed_samples = borrowed.value().missed_samples();
+		return sample;
+	};
 
 	while (true) {
-		auto snap = a.use_wait_ms > 0
-		                    ? consumer.value().wait_latest(std::chrono::milliseconds(
-		                              static_cast<int64_t>(a.use_wait_ms)))
-		                    : consumer.value().try_read_latest();
+		auto snap = read_one();
 		if (snap) {
 			edge_runtime::Sample<T> s = std::move(snap.value());
 			last_seq = s.sequence;
@@ -213,6 +237,8 @@ int main(int argc, char** argv) {
 	a.read_timeout_ms = edge_tool::arg_u64(argc, argv, "--read-timeout-ms", 30000);
 	a.seq_start = edge_tool::arg_u64(argc, argv, "--seq-start", 0);
 	a.use_wait_ms = edge_tool::arg_u64(argc, argv, "--use-wait-ms", 0);
+	a.loaned = edge_tool::arg_flag(argc, argv, "--loaned") ||
+	           edge_tool::arg_u64(argc, argv, "--loaned", 0) != 0;
 	a.checksum = edge_tool::arg_u64(argc, argv, "--checksum", 1) != 0;
 	{
 		const char* transport_arg = edge_tool::arg_value(argc, argv, "--transport");
@@ -229,7 +255,8 @@ int main(int argc, char** argv) {
 		             "[--reads N] [--expect-last-seq N] "
 		             "[--read-interval-ms N] [--read-timeout-ms N] "
 		             "[--open-retry-ms N] [--seq-start N] "
-		             "[--use-wait-ms N] [--checksum 0|1] [--transport fd|posix]\n");
+		             "[--use-wait-ms N] [--checksum 0|1] [--transport fd|posix] "
+		             "[--loaned 0|1]\n");
 		return 2;
 	}
 

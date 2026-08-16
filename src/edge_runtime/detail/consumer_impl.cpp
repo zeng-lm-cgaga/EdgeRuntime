@@ -297,6 +297,33 @@ struct ConsumerUseGuard {
 	}
 };
 
+void mark_consumer_offline(ConsumerHandle& handle) noexcept {
+	auto* base = static_cast<std::byte*>(handle.shm.mapping.get());
+	auto* header = reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset);
+	auto cid_res = identity_snapshot_read(&header->consumer);
+	if (!cid_res || cid_res.value().role_epoch != handle.role_epoch) return;
+	shared_store_release(&header->consumer_state,
+	                     static_cast<uint32_t>(EndpointState::kOffline));
+}
+
+void service_consumer_shutdown(const std::shared_ptr<ConsumerHandle>& handle) noexcept {
+	if (!handle->shutdown_pending.load(std::memory_order_acquire)) return;
+	bool idle = false;
+	if (!handle->operation_in_use.compare_exchange_strong(idle, true, std::memory_order_acq_rel)) {
+		return;
+	}
+	bool first = false;
+	if (handle->shutdown_started.compare_exchange_strong(first, true, std::memory_order_acq_rel)) {
+		mark_consumer_offline(*handle);
+	}
+	handle->operation_in_use.store(false, std::memory_order_release);
+}
+
+void release_consumer_loan_operation(const std::shared_ptr<ConsumerHandle>& handle) noexcept {
+	handle->operation_in_use.store(false, std::memory_order_release);
+	service_consumer_shutdown(handle);
+}
+
 // Pack the two u64 nonce halves into the 16-byte instance nonce (host order;
 // endianness is pinned by the endian_marker and the same-process-producer rule).
 void pack_nonce(const ConsumerHandle& handle, std::array<std::byte, 16>* out) {
@@ -305,36 +332,42 @@ void pack_nonce(const ConsumerHandle& handle, std::array<std::byte, 16>* out) {
 	std::memcpy(out->data(), &hi, 8);
 	std::memcpy(out->data() + 8, &lo, 8);
 }
-Result<ReadSnapshot> try_read_latest_unlocked(const std::shared_ptr<ConsumerHandle>& handle,
-                                             std::byte* encoded_out,
-                                             uint32_t encoded_cap) noexcept {
+struct ClaimedRead {
+	SlotHeaderAbi* slot{nullptr};
+	const std::byte* payload{nullptr};
+	ReadSnapshot snapshot{};
+};
+
+Result<ClaimedRead> claim_latest_unlocked(const std::shared_ptr<ConsumerHandle>& handle,
+                                         const char* operation, bool loaned = false) noexcept {
 
 	auto* base = static_cast<std::byte*>(handle->shm.mapping.get());
 	auto* header = reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset);
 
 	uint64_t stride = 0;
 	if (!round_up_to_multiple_u64(kSlotHeaderSize + handle->payload_size, 64, &stride)) {
-		return make_error(ErrorCode::kInvalidOptions, "Consumer::try_read_latest",
-		                  "stride overflow");
+		return make_error(ErrorCode::kInvalidOptions, operation, "stride overflow");
 	}
 
 	for (uint32_t attempt = 0; attempt < kMaxReadRetries; ++attempt) {
 		const uint64_t ticket = shared_load_acquire(&header->latest_ticket);
 		if (ticket == 0 || ticket_sequence(ticket) <= handle->last_sequence) {
-			return make_error(ErrorCode::kNoNewSample, "Consumer::try_read_latest",
-			                  "no new sample");
+			return make_error(ErrorCode::kNoNewSample, operation, "no new sample");
 		}
 		const uint32_t slot_index = ticket_slot(ticket);
 		uint64_t offset = 0;
 		if (!slot_byte_offset(slot_index, stride, &offset)) {
-			return make_error(ErrorCode::kCorruptSlot, "Consumer::try_read_latest",
-			                  "ticket slot out of range");
+			return make_error(ErrorCode::kCorruptSlot, operation, "ticket slot out of range");
 		}
 		auto* slot = reinterpret_cast<SlotHeaderAbi*>(base + offset);
 		if (!slot_claim_readable(slot)) continue;  // producer overwrote; retry
 		EDGE_FAILPOINT(C07);  // crash matrix: READING_CLAIMING, epoch not yet set
 		slot_mark_reading(slot, handle->role_epoch);
-		EDGE_FAILPOINT(C08);  // crash matrix: READING, before the copy
+		if (loaned) {
+			EDGE_FAILPOINT(C23);  // loan owner dies while the slot remains READING
+		} else {
+			EDGE_FAILPOINT(C08);  // crash matrix: READING, before the copy
+		}
 
 		// Linearization recheck (design §12.2): the slot must still be the current
 		// latest at this instant.
@@ -344,35 +377,31 @@ Result<ReadSnapshot> try_read_latest_unlocked(const std::shared_ptr<ConsumerHand
 			continue;
 		}
 
-		// Freeze all metadata BEFORE release (§12.2: no slot access after release).
+		// Freeze and validate while READING. The producer cannot overwrite this slot
+		// until a copy completes or the returned ReadLoan releases it.
 		const uint32_t slot_payload_size = slot->payload_size;
 		const uint64_t sample_sequence = slot->sample_sequence;
 		const uint64_t publish_boot_ns = slot->publish_boot_ns;
 		const uint64_t expected_checksum = slot->payload_checksum;
 		auto* payload =
 		        reinterpret_cast<std::byte*>(slot) + static_cast<uint64_t>(kSlotHeaderSize);
-		if (slot_payload_size != handle->payload_size || slot_payload_size > encoded_cap) {
+		if (slot_payload_size != handle->payload_size) {
 			slot_release_read(slot);
-			return make_error(ErrorCode::kPayloadCorrupt, "Consumer::try_read_latest",
-			                  "payload size mismatch");
+			return make_error(ErrorCode::kPayloadCorrupt, operation, "payload size mismatch");
 		}
-		std::memcpy(encoded_out, payload, static_cast<size_t>(slot_payload_size));
 		const uint64_t receive_boot_ns = boottime_now_ns();
-		slot_release_read(slot);
-		EDGE_FAILPOINT(C09);  // crash matrix: released, epoch cleared, claim finished
-
 		if (receive_boot_ns == 0) {
-			return make_error(ErrorCode::kClockAnomaly, "Consumer::try_read_latest",
-			                  "monotonic clock unavailable");
+			slot_release_read(slot);
+			return make_error(ErrorCode::kClockAnomaly, operation, "monotonic clock unavailable");
 		}
-
-		const bool checksum_ok =
-		        fnv1a64(encoded_out, static_cast<size_t>(slot_payload_size)) ==
-		        expected_checksum;
+		if (fnv1a64(payload, static_cast<size_t>(slot_payload_size)) != expected_checksum) {
+			slot_release_read(slot);
+			return make_error(ErrorCode::kPayloadCorrupt, operation, "checksum mismatch");
+		}
 
 		ReadSnapshot snap;
 		snap.encoded_size = slot_payload_size;
-		snap.checksum_ok = checksum_ok;
+		snap.checksum_ok = true;
 		snap.sample_sequence = sample_sequence;
 		snap.publish_boot_ns = publish_boot_ns;
 		snap.receive_boot_ns = receive_boot_ns;
@@ -385,11 +414,27 @@ Result<ReadSnapshot> try_read_latest_unlocked(const std::shared_ptr<ConsumerHand
 		handle->last_sequence = sample_sequence;
 		handle->first_sample_in_generation = false;
 		shared_fetch_add_relaxed(&header->read_count, uint64_t{1});
-		return Result<ReadSnapshot>(std::move(snap));
+		return ClaimedRead{slot, payload, std::move(snap)};
 	}
 
-	return make_error(ErrorCode::kReadContention, "Consumer::try_read_latest",
-	                  "retry bound exceeded");
+	return make_error(ErrorCode::kReadContention, operation, "retry bound exceeded");
+}
+
+Result<ReadSnapshot> try_read_latest_unlocked(const std::shared_ptr<ConsumerHandle>& handle,
+                                             std::byte* encoded_out,
+                                             uint32_t encoded_cap) noexcept {
+	auto claimed = claim_latest_unlocked(handle, "Consumer::try_read_latest");
+	if (!claimed) return claimed.error();
+	if (claimed.value().snapshot.encoded_size > encoded_cap) {
+		slot_release_read(claimed.value().slot);
+		return make_error(ErrorCode::kPayloadCorrupt, "Consumer::try_read_latest",
+		                  "output capacity too small");
+	}
+	std::memcpy(encoded_out, claimed.value().payload,
+	            static_cast<size_t>(claimed.value().snapshot.encoded_size));
+	slot_release_read(claimed.value().slot);
+	EDGE_FAILPOINT(C09);
+	return Result<ReadSnapshot>(std::move(claimed.value().snapshot));
 }
 
 }  // namespace
@@ -414,24 +459,25 @@ namespace {
 // the heartbeat branch: alive + heartbeat enabled + no fresh publish + no fresh
 // heartbeat -> ProducerStalled (an observation only; never a takeover grant).
 Result<ReadSnapshot> classify_wait_timeout(const std::shared_ptr<ConsumerHandle>&,
-                                           ChannelHeaderAbi* header) noexcept {
+                                           ChannelHeaderAbi* header,
+                                           const char* operation) noexcept {
 	const uint32_t pstate = shared_load_acquire(&header->producer_state);
 	const bool actively_owned = pstate == static_cast<uint32_t>(EndpointState::kOnline) ||
 	                            pstate == static_cast<uint32_t>(EndpointState::kStopping) ||
 	                            pstate == static_cast<uint32_t>(EndpointState::kFault);
 	if (!actively_owned) {
 		// OFFLINE (clean shutdown) or never registered: the producer is gone.
-		return make_error(ErrorCode::kProducerOffline, "Consumer::wait_latest",
+		return make_error(ErrorCode::kProducerOffline, operation,
 		                  "producer offline on wait timeout");
 	}
 	auto pid_res = identity_snapshot_read(&header->producer);
 	if (!pid_res) {
-		return make_error(ErrorCode::kRecoveryBlocked, "Consumer::wait_latest",
+		return make_error(ErrorCode::kRecoveryBlocked, operation,
 		                  "producer identity unreadable");
 	}
 	const ProcessIdentityAbi& pid_abi = pid_res.value();
 	if (pid_abi.pid == 0) {
-		return make_error(ErrorCode::kRecoveryBlocked, "Consumer::wait_latest",
+		return make_error(ErrorCode::kRecoveryBlocked, operation,
 		                  "producer identity unknown");
 	}
 	switch (probe_liveness(pid_abi.pid, pid_abi.proc_start_ticks)) {
@@ -452,21 +498,21 @@ Result<ReadSnapshot> classify_wait_timeout(const std::shared_ptr<ConsumerHandle>
 			if (interval != 0 && now != 0 &&
 			    (last_publish == 0 || elapsed_exceeds(now, last_publish, interval)) &&
 			    (last_beat == 0 || elapsed_exceeds(now, last_beat, stall_limit))) {
-				return make_error(ErrorCode::kProducerStalled, "Consumer::wait_latest",
+				return make_error(ErrorCode::kProducerStalled, operation,
 				                  "producer alive, heartbeat stale");
 			}
-			return make_error(ErrorCode::kDataStale, "Consumer::wait_latest",
+			return make_error(ErrorCode::kDataStale, operation,
 			                  "producer alive but no new sample");
 		}
 		case Liveness::kExited:
-			return make_error(ErrorCode::kProducerOffline, "Consumer::wait_latest",
+			return make_error(ErrorCode::kProducerOffline, operation,
 			                  "producer exited");
 		case Liveness::kPidReused:
 		case Liveness::kUnverifiable:
-			return make_error(ErrorCode::kRecoveryBlocked, "Consumer::wait_latest",
+			return make_error(ErrorCode::kRecoveryBlocked, operation,
 			                  "producer identity unverifiable");
 	}
-	return make_error(ErrorCode::kRecoveryBlocked, "Consumer::wait_latest",
+	return make_error(ErrorCode::kRecoveryBlocked, operation,
 	                  "producer identity unverifiable");
 }
 }  // namespace
@@ -513,7 +559,7 @@ Result<ReadSnapshot> consumer_wait_latest_impl(const std::shared_ptr<ConsumerHan
 
 		const uint64_t remaining = remaining_time_ns(deadline);
 		if (remaining == 0) {
-			return classify_wait_timeout(handle, header);
+			return classify_wait_timeout(handle, header, "Consumer::wait_latest");
 		}
 		struct timespec ts {};
 		ts.tv_sec = static_cast<time_t>(remaining / 1000000000ull);
@@ -524,12 +570,88 @@ Result<ReadSnapshot> consumer_wait_latest_impl(const std::shared_ptr<ConsumerHan
 			continue;  // epoch changed before arming, or signal: loop, deadline intact
 		}
 		if (rc < 0 && errno == ETIMEDOUT) {
-			return classify_wait_timeout(handle, header);
+			return classify_wait_timeout(handle, header, "Consumer::wait_latest");
 		}
 		if (rc < 0) {
 			const int e = errno;
 			return make_errno_error(ErrorCode::kSystemError, e,
 			                        "Consumer::wait_latest", "futex_wait failed");
+		}
+	}
+}
+
+Result<ReadLoan> consumer_try_loan_latest_impl(
+        const std::shared_ptr<ConsumerHandle>& handle) noexcept {
+	if (handle->operation_in_use.exchange(true, std::memory_order_acq_rel)) {
+		return make_error(ErrorCode::kConcurrentHandleUse, "Consumer::try_loan_latest",
+		                  "concurrent handle use");
+	}
+	auto claimed = claim_latest_unlocked(handle, "Consumer::try_loan_latest", true);
+	if (!claimed) {
+		release_consumer_loan_operation(handle);
+		return claimed.error();
+	}
+	ReadSnapshot& snap = claimed.value().snapshot;
+	return ReadLoan(handle, claimed.value().slot, claimed.value().payload, snap.encoded_size,
+	                snap.generation, snap.instance_nonce, snap.sample_sequence,
+	                snap.publish_boot_ns, snap.receive_boot_ns, snap.missed_samples);
+}
+
+Result<ReadLoan> consumer_wait_loan_latest_impl(const std::shared_ptr<ConsumerHandle>& handle,
+                                               uint64_t timeout_ns) noexcept {
+	if (handle->operation_in_use.exchange(true, std::memory_order_acq_rel)) {
+		return make_error(ErrorCode::kConcurrentHandleUse, "Consumer::wait_loan_latest",
+		                  "concurrent handle use");
+	}
+	auto fail = [&handle](const Error& error) -> Result<ReadLoan> {
+		release_consumer_loan_operation(handle);
+		return error;
+	};
+	const uint64_t deadline = monotonic_deadline_ns(timeout_ns);
+	if (deadline == 0) {
+		return fail(make_error(ErrorCode::kClockAnomaly, "Consumer::wait_loan_latest",
+		                       "monotonic clock unavailable"));
+	}
+
+	auto* base = static_cast<std::byte*>(handle->shm.mapping.get());
+	auto* header = reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset);
+	for (;;) {
+		auto claimed = claim_latest_unlocked(handle, "Consumer::wait_loan_latest", true);
+		if (claimed) {
+			ReadSnapshot& snap = claimed.value().snapshot;
+			return ReadLoan(handle, claimed.value().slot, claimed.value().payload,
+			                snap.encoded_size, snap.generation, snap.instance_nonce,
+			                snap.sample_sequence, snap.publish_boot_ns, snap.receive_boot_ns,
+			                snap.missed_samples);
+		}
+		const ErrorCode code = claimed.error().code;
+		if (code != ErrorCode::kNoNewSample && code != ErrorCode::kReadContention) {
+			return fail(claimed.error());
+		}
+
+		const uint32_t expected = shared_load_acquire(&header->notify_epoch);
+		const uint64_t ticket = shared_load_acquire(&header->latest_ticket);
+		if (ticket != 0 && ticket_sequence(ticket) > handle->last_sequence) continue;
+		const uint64_t remaining = remaining_time_ns(deadline);
+		if (remaining == 0) {
+			auto classified =
+			        classify_wait_timeout(handle, header, "Consumer::wait_loan_latest");
+			return fail(classified.error());
+		}
+		struct timespec ts {};
+		ts.tv_sec = static_cast<time_t>(remaining / 1000000000ull);
+		ts.tv_nsec = static_cast<long>(remaining % 1000000000ull);
+		const int rc = futex_wait(&header->notify_epoch, expected, &ts);
+		if (rc == 0 || (rc < 0 && (errno == EAGAIN || errno == EINTR))) continue;
+		if (rc < 0 && errno == ETIMEDOUT) {
+			auto classified =
+			        classify_wait_timeout(handle, header, "Consumer::wait_loan_latest");
+			return fail(classified.error());
+		}
+		if (rc < 0) {
+			const int saved_errno = errno;
+			return fail(make_errno_error(ErrorCode::kSystemError, saved_errno,
+			                             "Consumer::wait_loan_latest", "futex_wait failed"));
 		}
 	}
 }
@@ -570,7 +692,7 @@ Result<ReconnectInfo> consumer_reconnect_impl(
 		// The candidate is fully validated and registered. Only now retire the old
 		// registration and replace the resources, so any open failure leaves this
 		// handle usable for diagnostics or a later reconnect attempt.
-		consumer_shutdown_impl(handle);
+		mark_consumer_offline(*handle);
 		handle->shm = std::move(fresh->shm);
 		handle->channel_name = std::move(fresh->channel_name);
 		handle->transport = fresh->transport;
@@ -622,16 +744,20 @@ Result<ChannelStatus> consumer_status_impl(const std::shared_ptr<ConsumerHandle>
 }
 
 void consumer_shutdown_impl(const std::shared_ptr<ConsumerHandle>& handle) noexcept {
-	// Best-effort clean shutdown (design §15.2): only mark OFFLINE if the header
-	// still carries our consumer identity.
-	auto* base = static_cast<std::byte*>(handle->shm.mapping.get());
-	auto* header = reinterpret_cast<ChannelHeaderAbi*>(base + kChannelHeaderOffset);
-	auto cid_res = identity_snapshot_read(&header->consumer);
-	if (!cid_res || cid_res.value().role_epoch != handle->role_epoch) {
-		return;  // not ours (anymore) — leave the header untouched
-	}
-	shared_store_release(&header->consumer_state,
-	                     static_cast<uint32_t>(EndpointState::kOffline));
+	handle->shutdown_pending.store(true, std::memory_order_release);
+	service_consumer_shutdown(handle);
+}
+
+void consumer_release_loan_impl(ReadLoan* loan) noexcept {
+	if (loan == nullptr || !loan->active_ || !loan->handle_) return;
+	const std::shared_ptr<ConsumerHandle> handle = loan->handle_;
+	if (loan->slot_ != nullptr) slot_release_read(static_cast<SlotHeaderAbi*>(loan->slot_));
+	EDGE_FAILPOINT(C09);
+	loan->active_ = false;
+	loan->slot_ = nullptr;
+	loan->data_ = nullptr;
+	loan->handle_.reset();
+	release_consumer_loan_operation(handle);
 }
 
 }  // namespace edge_runtime::detail

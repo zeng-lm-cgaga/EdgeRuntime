@@ -27,7 +27,7 @@ edgeruntime_tool(edge_shm_consumer)
 edgeruntime_tool(edge_shm_ctl)
 edgeruntime_tool(edge_shm_supervisor)
 
-# ER4 crash matrix (design §20.3/§24): the C01-C13 table-driven runner. It
+# Crash matrix (design §20.3/§24/§36): the C01-C23 table-driven runner. It
 # pauses victims at failpoints, dumps forensics via edge_shm_ctl, runs the
 # recovery actor, and writes evidence under <out-dir>/<run_id>/<case>/.
 edgeruntime_tool(edge_crash_matrix)

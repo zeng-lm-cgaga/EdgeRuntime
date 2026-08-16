@@ -45,11 +45,12 @@ struct Args {
 	edge_runtime::Transport transport{edge_runtime::Transport::kPosixShm};
 	uint64_t heartbeat_interval_us = 0;  // v0.2: 0 = heartbeat disabled
 	bool heartbeat_only = false;         // v0.2: heartbeat loop, never publish (C18)
+	bool loaned = false;                 // v0.4: encode directly into a WriteLoan
 };
 
 // Publish one sample; returns the published sequence or 0 on failure.
 template <typename ProducerT>
-uint64_t publish_one(ProducerT& producer, uint64_t counter) {
+uint64_t publish_one(ProducerT& producer, uint64_t counter, bool loaned) {
 	using ValueT = typename ProducerT::value_type;
 	ValueT v;
 	if constexpr (std::is_same_v<ValueT, TestPayloadV1>) {
@@ -59,6 +60,16 @@ uint64_t publish_one(ProducerT& producer, uint64_t counter) {
 	} else {
 		v.magic = 0x5A000002u;
 		v.value = static_cast<uint32_t>(counter & 0xFFFFFFFFu);
+	}
+	if (loaned) {
+		auto borrowed = producer.loan();
+		if (!borrowed ||
+		    !edge_runtime::PayloadCodec<ValueT>::encode(v, borrowed.value().data(),
+		                                                  borrowed.value().size())) {
+			return 0;
+		}
+		auto res = borrowed.value().commit();
+		return res ? res.value().sequence : 0;
 	}
 	auto res = producer.publish(v);
 	return res ? res.value().sequence : 0;
@@ -117,7 +128,7 @@ int run_publish(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 		}
 	} else {
 		while (true) {
-			const uint64_t seq = publish_one(producer.value(), counter);
+			const uint64_t seq = publish_one(producer.value(), counter, a.loaned);
 			if (seq == 0) {
 				std::printf("PUBLISH_FAIL seq=%" PRIu64 "\n",
 				            static_cast<uint64_t>(last_seq));
@@ -158,6 +169,8 @@ int main(int argc, char** argv) {
 	a.heartbeat_interval_us = edge_tool::arg_u64(argc, argv, "--heartbeat-interval-us", 0);
 	a.heartbeat_only = edge_tool::arg_flag(argc, argv, "--heartbeat-only") ||
 	                   edge_tool::arg_u64(argc, argv, "--heartbeat-only", 0) != 0;
+	a.loaned = edge_tool::arg_flag(argc, argv, "--loaned") ||
+	           edge_tool::arg_u64(argc, argv, "--loaned", 0) != 0;
 	{
 		const char* transport_arg = edge_tool::arg_value(argc, argv, "--transport");
 		if (transport_arg != nullptr && std::string(transport_arg) == "fd") {
@@ -173,7 +186,8 @@ int main(int argc, char** argv) {
 		             "[--count N] [--interval-us N] [--seq-start N] "
 		             "[--sleep-first-us N] [--no-publish 0|1] "
 		             "[--checksum 0|1] [--transport fd|posix] "
-		             "[--heartbeat-interval-us N] [--heartbeat-only 0|1]\n");
+		             "[--heartbeat-interval-us N] [--heartbeat-only 0|1] "
+		             "[--loaned 0|1]\n");
 		return 2;
 	}
 

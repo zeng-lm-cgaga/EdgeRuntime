@@ -27,4 +27,5 @@ edgeruntime_unit_test(channel_observer_test)  # v0.3 §35.3 readonly view + stal
 edgeruntime_unit_test(liveness_watch_test)    # v0.3 §35.3 long-held pidfd + CLOEXEC
 edgeruntime_unit_test(process_spawn_test)     # v0.3 §35.3 posix_spawn + nonblock stdout pipe
 edgeruntime_unit_test(producer_concurrency_test)  # §18.1 same-handle overlap contract
+edgeruntime_unit_test(loan_test)                  # v0.4 loan ownership + deferred shutdown
 edgeruntime_unit_test(supervisor_policy_test) # v0.3 restart cap/backoff + option bounds

@@ -14,6 +14,7 @@
 #include "edge_runtime/channel_options.hpp"
 #include "edge_runtime/detail/process_identity.hpp"
 #include "edge_runtime/detail/shm_object.hpp"
+#include "edge_runtime/loan.hpp"
 #include "edge_runtime/result.hpp"
 #include "edge_runtime/sample.hpp"
 #include "edge_runtime/schema.hpp"
@@ -35,6 +36,8 @@ struct ProducerHandle {
 	uint32_t payload_size{0};
 	ProcessIdentity self{};
 	std::atomic<bool> operation_in_use{false};  // same-handle overlap guard (§18.1)
+	std::atomic<bool> shutdown_pending{false};
+	std::atomic<bool> shutdown_started{false};
 
 	// v0.2 fd-pass transport (design §33). Members are declared AFTER shm
 	// (whose mapping the serving thread reads) so destruction joins the thread

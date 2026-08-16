@@ -1,4 +1,4 @@
-// edge_crash_matrix: C01-C13 table-driven crash matrix (design §20.3/§24).
+// edge_crash_matrix: C01-C23 table-driven crash matrix (design §20.3/§24/§36).
 //
 // For each case it pauses a victim at a named kill point (SIGSTOP via a
 // failpoint), records forensic evidence, runs the recovery actor, and verifies
@@ -505,13 +505,15 @@ static bool run_c02(CaseDriver& d) {
 // what the ticket exposes — old current stays readable, a WRITING or
 // published-but-unticketed sample is invisible, a ticketed one is visible.
 static bool run_c_publish(CaseDriver& d, const char* id, const char* fp, const char* description,
-                          bool expect_ticketed) {
+                          bool expect_ticketed, bool loaned = false) {
 	d.begin_case(id, description);
 	const std::string name = d.channel_name(id);
 
 	CrashChild victim;
-	if (!victim.spawn({d.prod_bin, "--name", name, "--count", "0", "--interval-us", "50000"},
-	                  fp_env(fp, "4")) ||
+	std::vector<std::string> victim_args = {
+	        d.prod_bin, "--name", name, "--count", "0", "--interval-us", "50000"};
+	if (loaned) victim_args.emplace_back("--loaned");
+	if (!victim.spawn(victim_args, fp_env(fp, "4")) ||
 	    !victim.wait_stop(8000)) {
 		d.fail("crash child never stopped");
 		d.finish_case(gen_pids_line(id, victim));
@@ -551,7 +553,7 @@ static bool run_c_publish(CaseDriver& d, const char* id, const char* fp, const c
 // contain ("reading_claiming " / "reading "); nullptr means assert its absence
 // (C09: the release completed, nothing leaked).
 static bool run_c_consumer(CaseDriver& d, const char* id, const char* fp, const char* description,
-                           const char* expect_slot) {
+                           const char* expect_slot, bool loaned = false) {
 	d.begin_case(id, description);
 	const std::string name = d.channel_name(id);
 
@@ -567,7 +569,9 @@ static bool run_c_consumer(CaseDriver& d, const char* id, const char* fp, const 
 	::nanosleep(&ts, nullptr);
 
 	CrashChild victim;
-	if (!victim.spawn({d.cons_bin, "--name", name, "--reads", "1"}, fp_env(fp, nullptr)) ||
+	std::vector<std::string> victim_args = {d.cons_bin, "--name", name, "--reads", "1"};
+	if (loaned) victim_args.emplace_back("--loaned");
+	if (!victim.spawn(victim_args, fp_env(fp, nullptr)) ||
 	    !victim.wait_stop(8000)) {
 		d.fail("crash consumer never stopped");
 		prod.kill_and_reap();
@@ -1398,9 +1402,23 @@ static const CaseDef kCases[] = {
         {"C19", "supervisor stall takeover (STALL_DETECTED -> KILLED -> RESTART gen+1)", run_c19},
         {"C20", "supervisor crash loop (RESTART x3 -> GAVE_UP)", run_c20},
         {"C21", "supervisor clean exit (CLEAN_EXIT, no restart)", run_c21},
+        {"C22", "loaned producer dies while holding WRITING (invisible)",
+         [](CaseDriver& d) {
+	         return run_c_publish(d, "C22", "C22",
+	                              "write-loan owner killed while WRITING; the borrowed "
+	                              "bytes stay invisible and the old ticket is readable",
+	                              /*expect_ticketed=*/false, /*loaned=*/true);
+         }},
+        {"C23", "loaned consumer dies while holding READING (reclaimed)",
+         [](CaseDriver& d) {
+	         return run_c_consumer(d, "C23", "C23",
+	                               "read-loan owner killed while READING; a new consumer "
+	                               "reclaims the slot by role epoch",
+	                               "state=reading ", /*loaned=*/true);
+         }},
 };
 
-static const char* kSmokeCases[] = {"C01", "C03", "C08", "C16"};
+static const char* kSmokeCases[] = {"C01", "C03", "C08", "C16", "C22", "C23"};
 
 const char* arg_value(int argc, char** argv, const char* flag) {
 	for (int i = 1; i + 1 < argc; ++i) {
