@@ -40,6 +40,10 @@ struct PayloadCodecContract {
 	static constexpr bool kDecodeReturnsBool = false;
 	static constexpr bool kEncodeNoexcept = false;
 	static constexpr bool kDecodeNoexcept = false;
+	static constexpr bool kPayloadNothrowDefaultConstructible =
+	        std::is_nothrow_default_constructible_v<T>;
+	static constexpr bool kPayloadNothrowMoveConstructible =
+	        std::is_nothrow_move_constructible_v<T>;
 	static constexpr bool kSatisfied = false;
 };
 
@@ -79,9 +83,14 @@ struct PayloadCodecContract<
 	        std::declval<const T&>(), std::declval<std::byte*>(), std::declval<size_t>()));
 	static constexpr bool kDecodeNoexcept = noexcept(Codec::decode(
 	        std::declval<const std::byte*>(), std::declval<size_t>(), std::declval<T*>()));
+	static constexpr bool kPayloadNothrowDefaultConstructible =
+	        std::is_nothrow_default_constructible_v<T>;
+	static constexpr bool kPayloadNothrowMoveConstructible =
+	        std::is_nothrow_move_constructible_v<T>;
 	static constexpr bool kSatisfied =
 	        kDefined && kEncodedSizeValid && kEncodedBufferValid && kEncodeReturnsBool &&
-	        kDecodeReturnsBool && kEncodeNoexcept && kDecodeNoexcept;
+	        kDecodeReturnsBool && kEncodeNoexcept && kDecodeNoexcept &&
+	        kPayloadNothrowDefaultConstructible && kPayloadNothrowMoveConstructible;
 };
 
 template <typename T>
@@ -106,6 +115,10 @@ constexpr void validate_payload_codec() {
 	              "PayloadCodec<T>::encode must be noexcept");
 	static_assert(!Contract::kHasRequiredMembers || Contract::kDecodeNoexcept,
 	              "PayloadCodec<T>::decode must be noexcept");
+	static_assert(Contract::kPayloadNothrowDefaultConstructible,
+	              "T must be nothrow default constructible for noexcept consumer reads");
+	static_assert(Contract::kPayloadNothrowMoveConstructible,
+	              "T must be nothrow move constructible for noexcept consumer reads");
 }
 
 }  // namespace detail
