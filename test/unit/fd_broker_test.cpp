@@ -1,7 +1,4 @@
-// v0.2 §33 fd-broker wire records: frozen 64-byte layouts, magic/version
-// handling, and checksum discipline (pure functions — no socket involved here;
-// the socket behavior is covered by the fd_transport integration driver and
-// the crash matrix C14-C17).
+
 
 #include <gtest/gtest.h>
 
@@ -104,11 +101,11 @@ TEST(FdBroker, ChecksumCoversContent) {
 	r.abi_major = 1;
 	const uint64_t c1 = fd_broker_checksum(&r, sizeof(r));
 	EXPECT_NE(c1, 0u);
-	// any content change changes the checksum
+
 	FdBrokerReplyAbi r2 = r;
 	r2.generation = 4;
 	EXPECT_NE(fd_broker_checksum(&r2, sizeof(r2)), c1);
-	// the checksum field itself is excluded (zeroed before hashing)
+
 	FdBrokerReplyAbi r3 = r;
 	r3.checksum = c1;
 	EXPECT_EQ(fd_broker_checksum(&r3, sizeof(r3)), c1);
@@ -124,7 +121,7 @@ TEST(FdBroker, RequestRoundTripShape) {
 	const uint64_t c = fd_broker_checksum(&q, sizeof(q));
 	q.checksum = c;
 	EXPECT_EQ(fd_broker_checksum(&q, sizeof(q)), c);
-	// bit flip in the fingerprint must break the checksum
+
 	q.schema_fingerprint[0] ^= 1u;
 	EXPECT_NE(fd_broker_checksum(&q, sizeof(q)), c);
 }
@@ -234,7 +231,7 @@ TEST(FdBroker, MalformedReplyDoesNotLeakReceivedFd) {
 			if (conn >= 0) {
 				FdBrokerRequestAbi request{};
 				const ssize_t n = ::recv(conn, &request, sizeof(request), MSG_WAITALL);
-				FdBrokerReplyAbi malformed{};  // bad magic/checksum, but a real fd attached
+				FdBrokerReplyAbi malformed{};
 				served = n == static_cast<ssize_t>(sizeof(request)) &&
 				         send_test_reply_with_fd(conn, malformed, payload_fd);
 				::close(conn);
@@ -288,11 +285,11 @@ TEST(FdBroker, HalfOpenClientDoesNotPinProducerShutdown) {
 
 	const auto status = stopped_future.wait_for(std::chrono::seconds(2));
 	if (status != std::future_status::ready) {
-		::close(client);  // unblock an old implementation so the test can fail cleanly
+		::close(client);
 	}
 	shutdown_thread.join();
 	if (status == std::future_status::ready) ::close(client);
 	EXPECT_EQ(status, std::future_status::ready);
 }
 
-}  // namespace
+}

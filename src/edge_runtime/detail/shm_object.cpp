@@ -10,9 +10,10 @@
 namespace edge_runtime::detail {
 
 namespace {
-constexpr mode_t kExpectedShmMode = S_IRUSR | S_IWUSR;  // 0600
-}  // namespace
+constexpr mode_t kExpectedShmMode = S_IRUSR | S_IWUSR;
+}
 
+// 创建后先保持空对象，调用方完成截断、写头和 READY 提交后才对消费者可见。
 Result<UniqueFd> shm_open_create(const std::string& posix_name) {
 	const int fd = ::shm_open(posix_name.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC,
 	                          kExpectedShmMode);
@@ -109,7 +110,7 @@ Result<void> memfd_fstat_and_capture(const UniqueFd& fd, uint64_t* dev, uint64_t
 		return make_error(ErrorCode::kPermissionDenied, "memfd_fstat_and_capture",
 		                  "owner uid mismatch");
 	}
-	// memfd mode is typically 0700; forbid group/other write+execute (design §33.3).
+
 	const mode_t forbidden = static_cast<mode_t>(S_IWGRP | S_IXGRP | S_IWOTH | S_IXOTH);
 	if ((st.st_mode & forbidden) != 0) {
 		return make_error(ErrorCode::kPermissionDenied, "memfd_fstat_and_capture",
@@ -123,7 +124,7 @@ Result<void> memfd_fstat_and_capture(const UniqueFd& fd, uint64_t* dev, uint64_t
 
 Result<void> shm_unlink_checked(const std::string& posix_name, uint64_t expected_dev,
                                 uint64_t expected_ino) {
-	// Reopen and revalidate immediately before unlink (design §9.4 step 3).
+
 	auto re = shm_open_existing(posix_name);
 	if (!re) return re.error();
 	uint64_t dev = 0;
@@ -139,7 +140,7 @@ Result<void> shm_unlink_checked(const std::string& posix_name, uint64_t expected
 		const int e = errno;
 		return make_errno_error(e, "shm_unlink_checked", std::strerror(e));
 	}
-	// The name must now be ENOENT; a new object already present is a race.
+
 	const int probe = ::shm_open(posix_name.c_str(), O_RDWR | O_CLOEXEC, 0);
 	if (probe >= 0) {
 		::close(probe);
@@ -153,4 +154,4 @@ Result<void> shm_unlink_checked(const std::string& posix_name, uint64_t expected
 	return Result<void>::ok();
 }
 
-}  // namespace edge_runtime::detail
+}

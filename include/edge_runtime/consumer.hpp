@@ -19,11 +19,9 @@ namespace edge_runtime::detail {
 
 struct ConsumerHandle;
 
-// Metadata the read impl returns alongside the copied payload bytes (the impl
-// never touches T and never decodes; §12.2). Complete here because the inline
-// template method below copies these fields into Sample<T>.
+// 读取实现只复制编码字节和这些元数据，模板层再负责把本地字节解码为 T。
 struct ReadSnapshot {
-	uint32_t encoded_size{0};  // valid bytes written to encoded_out
+	uint32_t encoded_size{0};  // encoded_out 中实际有效的字节数
 	bool checksum_ok{true};
 	uint64_t sample_sequence{0};
 	uint64_t publish_boot_ns{0};
@@ -47,20 +45,17 @@ Result<ReconnectInfo> consumer_reconnect_impl(
 Result<ChannelStatus> consumer_status_impl(const std::shared_ptr<ConsumerHandle>& handle) noexcept;
 void consumer_shutdown_impl(const std::shared_ptr<ConsumerHandle>& handle) noexcept;
 
-}  // namespace edge_runtime::detail
+}  // 命名空间 edge_runtime::detail
 
 namespace edge_runtime {
 
-// SPSC consumer handle (design §9.2, §16.2). Move-only; the underlying fd and
-// MAP_SHARED mapping are released on destruction. Read-path methods arrive
-// with ER2/ER3; reconnect() with ER4.
+// 单生产者单消费者句柄。句柄独占映射，析构时释放资源；同一句柄不能并发调用。
 template <typename T>
 class Consumer {
        public:
 	using value_type = T;
+	// 打开时校验共享内存头、控制锁和消费者身份；已有存活消费者会被拒绝。
 
-	// Full §9.2 open sequence: bootstrap/header validation, control-lock
-	// revalidation, consumer identity registration (rejects a live consumer).
 	static Result<Consumer> open(const ChannelOptions& options,
 	                             const SchemaDescriptor& schema) {
 		detail::validate_payload_codec<T>();
@@ -68,10 +63,8 @@ class Consumer {
 		if (!h) return h.error();
 		return Consumer(std::move(h.value()));
 	}
+	// 读取过程先冻结槽、校验校验和并释放槽，再只在本地副本上解码。
 
-	// Latest-value read (design §12). The impl freezes the slot, copies the
-	// encoded payload, validates the checksum, then releases the slot; decode
-	// into T runs here over the local copy only (§12.2).
 	Result<Sample<T>> try_read_latest() noexcept {
 		typename PayloadCodec<T>::EncodedBuffer encoded{};
 		auto snap = detail::consumer_try_read_latest_impl(
@@ -95,18 +88,13 @@ class Consumer {
 		out.missed_samples = snap.value().missed_samples;
 		return Result<Sample<T>>(std::move(out));
 	}
+	// 借用编码数据时槽保持 READING，直到 ReadLoan 释放或析构后才能复用。
 
-	// Borrow the latest encoded payload in place. The slot stays READING and
-	// cannot be overwritten until the ReadLoan is released or destroyed.
 	Result<ReadLoan> try_loan_latest() noexcept {
 		return detail::consumer_try_loan_latest_impl(handle_);
 	}
-
-	// Blocking read with an absolute MONOTONIC deadline (design §14.2, ER3).
-	// Timeout is classified by producer liveness (§15.5): alive-but-idle ->
-	// kDataStale, offline/dead -> kProducerOffline, unverifiable -> kRecoveryBlocked.
-	// EAGAIN/EINTR/spurious wakeups loop without resetting the deadline. A zero
-	// timeout degrades to one bounded probe + immediate classification.
+	// 等待使用绝对 MONOTONIC 截止时间；超时再按 Producer 存活状态分类。
+	// EAGAIN、EINTR 和伪唤醒不会重置截止时间，零超时只做一次有限探测。
 	Result<Sample<T>> wait_latest(std::chrono::nanoseconds timeout) noexcept {
 		detail::validate_payload_codec<T>();
 		typename PayloadCodec<T>::EncodedBuffer encoded{};
@@ -133,19 +121,16 @@ class Consumer {
 		out.missed_samples = snap.value().missed_samples;
 		return Result<Sample<T>>(std::move(out));
 	}
-
 	Result<ReadLoan> wait_loan_latest(std::chrono::nanoseconds timeout) noexcept {
 		const int64_t count = timeout.count();
 		const uint64_t timeout_ns = count > 0 ? static_cast<uint64_t>(count) : 0;
 		return detail::consumer_wait_loan_latest_impl(handle_, timeout_ns);
 	}
-
-	// Reopen against a replaced instance (ER4).
+	// 针对已替换实例重新打开并更新句柄资源。
 	Result<ReconnectInfo> reconnect() noexcept {
 		return detail::consumer_reconnect_impl(handle_);
 	}
-
-	// Slow-check diagnostic (design §15.6).
+	// 慢路径诊断：重新确认名称与实例绑定关系后读取通道状态。
 	Result<ChannelStatus> status() const noexcept {
 		return detail::consumer_status_impl(handle_);
 	}
@@ -159,9 +144,7 @@ class Consumer {
 		handle_ = std::move(other.handle_);
 		return *this;
 	}
-
-	// Best-effort clean shutdown (design §15.2): marks consumer_state OFFLINE so
-	// a later open in the same process is not rejected as an active owner.
+	// 尽力执行干净关闭，将消费者状态标记为 OFFLINE，避免同进程重开被误判为占用。
 	~Consumer() {
 		if (handle_) detail::consumer_shutdown_impl(handle_);
 	}
@@ -172,6 +155,6 @@ class Consumer {
 	std::shared_ptr<detail::ConsumerHandle> handle_;
 };
 
-}  // namespace edge_runtime
+}  // 命名空间 edge_runtime
 
 #endif  // EDGE_RUNTIME_CONSUMER_HPP

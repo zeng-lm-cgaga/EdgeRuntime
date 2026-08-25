@@ -29,11 +29,9 @@ Result<ReadLoan> consumer_wait_loan_latest_impl(const std::shared_ptr<ConsumerHa
                                                uint64_t timeout_ns) noexcept;
 void consumer_release_loan_impl(ReadLoan* loan) noexcept;
 
-}  // namespace detail
+}  // 命名空间 detail
 
-// Move-only mutable view of one WRITING slot. The caller encodes directly into
-// data(); commit() publishes those bytes without a library payload memcpy.
-// Dropping an uncommitted loan returns the slot to FREE.
+// 可写槽的独占视图。调用方直接编码到 data()，commit() 发布；未提交时析构会退回 FREE。
 class WriteLoan {
        public:
 	WriteLoan(const WriteLoan&) = delete;
@@ -68,8 +66,7 @@ class WriteLoan {
 	bool active_{false};
 };
 
-// Move-only immutable view of one READING slot. The view is checksum-validated
-// before it is returned and remains stable until release() or destruction.
+// 可读槽的只读视图。返回前已完成校验和检查，直到 release() 或析构前数据保持稳定。
 class ReadLoan {
        public:
 	ReadLoan(const ReadLoan&) = delete;
@@ -116,6 +113,6 @@ class ReadLoan {
 	bool active_{false};
 };
 
-}  // namespace edge_runtime
+}  // 命名空间 edge_runtime
 
 #endif  // EDGE_RUNTIME_LOAN_HPP

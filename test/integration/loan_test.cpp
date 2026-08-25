@@ -44,7 +44,7 @@ TEST(LoanCrossExec, MemfdFdPass) {
 	run_cross_exec_loan(edge_runtime::Transport::kMemfdFdPass, "loan_xproc_fd");
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
 	::testing::InitGoogleTest(&argc, argv);

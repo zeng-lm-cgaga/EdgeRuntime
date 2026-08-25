@@ -10,18 +10,13 @@
 
 namespace edge_runtime::detail {
 
-// ---------------------------------------------------------------------------
-// Frozen cross-process ABI (design §8). All shared-memory records are
-// explicit-width integers only; offsets/sizes below are compile-time asserted
-// and are part of the v0.1 contract. Do not reorder fields.
-// ---------------------------------------------------------------------------
-
-inline constexpr char kBootstrapMagic[] = "EDGBOOT1";  // 8 chars, NUL not copied
+// 这些常量和结构体组成跨进程共享内存 ABI，字段顺序和大小不可随意调整。
+inline constexpr char kBootstrapMagic[] = "EDGBOOT1";
 inline constexpr char kChannelHeaderMagic[] = "EDGERT01";
 inline constexpr uint32_t kAbiMajor = 1;
-inline constexpr uint32_t kAbiMinor = 0;  // written when heartbeat is disabled
-inline constexpr uint32_t kAbiMinorMax = 1;  // v0.2: minor 1 == optional heartbeat (§34)
-inline constexpr uint32_t kHeartbeatStallFactor = 3;  // §34.3 stall threshold
+inline constexpr uint32_t kAbiMinor = 0;
+inline constexpr uint32_t kAbiMinorMax = 1;
+inline constexpr uint32_t kHeartbeatStallFactor = 3;
 inline constexpr uint32_t kEndianMarker = 0x01020304u;
 inline constexpr uint32_t kSlotCount = 3;
 inline constexpr uint32_t kMaxPayloadSize = 64u * 1024u;
@@ -29,10 +24,9 @@ inline constexpr uint32_t kMaxChannelNameLen = 64;
 inline constexpr uint64_t kMaxSampleSequence = (uint64_t{1} << 62) - 1;
 inline constexpr uint32_t kInvalidSlot = 0xFFFFFFFFu;
 
-// Mapping layout offsets (design §8.2).
 inline constexpr uint64_t kBootstrapHeaderOffset = 0;
 inline constexpr uint64_t kChannelHeaderOffset = 128;
-inline constexpr uint64_t kFirstSlotOffset = 128 + 320;  // 448
+inline constexpr uint64_t kFirstSlotOffset = 128 + 320;
 
 enum class InitState : uint32_t {
 	kEmpty = 0,
@@ -41,6 +35,7 @@ enum class InitState : uint32_t {
 	kAborted = 3,
 };
 
+// EndpointState 表示生产者或消费者在共享控制面上的生命周期状态。
 enum class EndpointState : uint32_t {
 	kOffline = 0,
 	kOnline = 1,
@@ -48,26 +43,24 @@ enum class EndpointState : uint32_t {
 	kFault = 3,
 };
 
-// ---- BootstrapHeaderAbi: fixed 128 bytes, written before the full header so
-// an interrupted creation is recoverable without guessing a half-written
-// header (design §8.2). ----
 struct alignas(64) BootstrapHeaderAbi {
-	char magic[8];                      // 0
-	uint16_t abi_major;                 // 8
-	uint16_t abi_minor;                 // 10
-	uint32_t header_size;               // 12
-	uint64_t expected_mapping_size;     // 16
-	uint64_t creator_nonce_hi;          // 24
-	uint64_t creator_nonce_lo;          // 32
-	uint64_t creator_pid;               // 40
-	uint64_t creator_proc_start_ticks;  // 48
-	uint64_t creator_boot_id_hash_hi;   // 56
-	uint64_t creator_boot_id_hash_lo;   // 64
-	uint32_t init_state;                // 72
-	uint32_t reserved0;                 // 76
-	uint64_t bootstrap_checksum;        // 80
-	uint8_t reserved[40];               // 88
+	char magic[8];
+	uint16_t abi_major;
+	uint16_t abi_minor;
+	uint32_t header_size;
+	uint64_t expected_mapping_size;
+	uint64_t creator_nonce_hi;
+	uint64_t creator_nonce_lo;
+	uint64_t creator_pid;
+	uint64_t creator_proc_start_ticks;
+	uint64_t creator_boot_id_hash_hi;
+	uint64_t creator_boot_id_hash_lo;
+	uint32_t init_state;
+	uint32_t reserved0;
+	uint64_t bootstrap_checksum;
+	uint8_t reserved[40];
 };
+// 引导区先独立写入并校验，READY 后消费者才允许读取完整头部和槽。
 static_assert(sizeof(BootstrapHeaderAbi) == 128, "BootstrapHeaderAbi size");
 static_assert(alignof(BootstrapHeaderAbi) == 64, "BootstrapHeaderAbi align");
 static_assert(offsetof(BootstrapHeaderAbi, abi_major) == 8, "bootstrap abi_major");
@@ -83,15 +76,13 @@ static_assert(offsetof(BootstrapHeaderAbi, creator_boot_id_hash_lo) == 64, "boot
 static_assert(offsetof(BootstrapHeaderAbi, init_state) == 72, "bootstrap init_state");
 static_assert(offsetof(BootstrapHeaderAbi, bootstrap_checksum) == 80, "bootstrap checksum");
 
-// ---- ProcessIdentityAbi: 64 bytes, alignas(64). Written only under the
-// control lock with the role_epoch publish protocol (design §7.2/§8.2). ----
 struct alignas(64) ProcessIdentityAbi {
-	alignas(8) uint64_t role_epoch;  // 0
-	alignas(8) uint64_t pid;         // 8
-	uint64_t proc_start_ticks;       // 16
-	uint64_t boot_id_hash_hi;        // 24
-	uint64_t boot_id_hash_lo;        // 32
-	uint64_t reserved[3];            // 40/48/56
+	alignas(8) uint64_t role_epoch;
+	alignas(8) uint64_t pid;
+	uint64_t proc_start_ticks;
+	uint64_t boot_id_hash_hi;
+	uint64_t boot_id_hash_lo;
+	uint64_t reserved[3];
 };
 static_assert(sizeof(ProcessIdentityAbi) == 64, "ProcessIdentityAbi size");
 static_assert(alignof(ProcessIdentityAbi) == 64, "ProcessIdentityAbi align");
@@ -101,39 +92,37 @@ static_assert(offsetof(ProcessIdentityAbi, proc_start_ticks) == 16, "pid start")
 static_assert(offsetof(ProcessIdentityAbi, boot_id_hash_hi) == 24, "pid boot hi");
 static_assert(offsetof(ProcessIdentityAbi, boot_id_hash_lo) == 32, "pid boot lo");
 
-// ---- ChannelHeaderAbi: 320 bytes. Immutable prefix written before READY;
-// runtime records accessed only through shared-atomic wrappers. ----
 struct alignas(64) ChannelHeaderAbi {
-	char magic[8];                   // 0
-	uint16_t abi_major;              // 8
-	uint16_t abi_minor;              // 10
-	uint32_t header_size;            // 12
-	uint32_t endian_marker;          // 16
-	uint32_t slot_count;             // 20
-	uint32_t payload_size;           // 24
-	uint32_t max_payload_size;       // 28
-	uint32_t schema_version;         // 32
-	uint64_t mapping_size;           // 40
-	uint8_t schema_fingerprint[32];  // 48
-	uint64_t generation;             // 80
-	uint64_t instance_nonce_hi;      // 88
-	uint64_t instance_nonce_lo;      // 96
-	ProcessIdentityAbi producer;     // 128
-	ProcessIdentityAbi consumer;     // 192
+	char magic[8];
+	uint16_t abi_major;
+	uint16_t abi_minor;
+	uint32_t header_size;
+	uint32_t endian_marker;
+	uint32_t slot_count;
+	uint32_t payload_size;
+	uint32_t max_payload_size;
+	uint32_t schema_version;
+	uint64_t mapping_size;
+	uint8_t schema_fingerprint[32];
+	uint64_t generation;
+	uint64_t instance_nonce_hi;
+	uint64_t instance_nonce_lo;
+	ProcessIdentityAbi producer;
+	ProcessIdentityAbi consumer;
 
-	alignas(8) uint64_t latest_ticket;         // 256
-	alignas(4) uint32_t notify_epoch;          // 264
-	alignas(4) uint32_t init_state;            // 268
-	alignas(4) uint32_t producer_state;        // 272
-	alignas(4) uint32_t consumer_state;        // 276
-	alignas(8) uint64_t publish_count;         // 280
-	alignas(8) uint64_t read_count;            // 288
-	alignas(8) uint64_t last_publish_boot_ns;  // 296
-	// v0.2 optional heartbeat (design §34): formerly trailing padding, so the
-	// struct size stays 320 and every v0.1 offset assertion below is untouched.
-	alignas(8) uint64_t heartbeat_boot_ns;             // 304
-	alignas(8) uint64_t producer_heartbeat_interval_ns;  // 312
+	alignas(8) uint64_t latest_ticket;
+	alignas(4) uint32_t notify_epoch;
+	alignas(4) uint32_t init_state;
+	alignas(4) uint32_t producer_state;
+	alignas(4) uint32_t consumer_state;
+	alignas(8) uint64_t publish_count;
+	alignas(8) uint64_t read_count;
+	alignas(8) uint64_t last_publish_boot_ns;
+
+	alignas(8) uint64_t heartbeat_boot_ns;
+	alignas(8) uint64_t producer_heartbeat_interval_ns;
 };
+// 头部保存 Schema、实例身份、槽状态和通知纪元；heartbeat 字段只在启用时有效。
 static_assert(sizeof(ChannelHeaderAbi) == 320, "ChannelHeaderAbi size");
 static_assert(alignof(ChannelHeaderAbi) == 64, "ChannelHeaderAbi align");
 static_assert(offsetof(ChannelHeaderAbi, abi_major) == 8, "hdr abi_major");
@@ -163,15 +152,14 @@ static_assert(offsetof(ChannelHeaderAbi, heartbeat_boot_ns) == 304, "hdr heartbe
 static_assert(offsetof(ChannelHeaderAbi, producer_heartbeat_interval_ns) == 312,
               "hdr heartbeat_interval");
 
-// ---- SlotHeaderAbi: 64 bytes, followed immediately by the payload bytes. ----
 struct alignas(64) SlotHeaderAbi {
-	alignas(4) uint32_t state;              // 0
-	uint32_t payload_size;                  // 4
-	uint64_t sample_sequence;               // 8
-	uint64_t publish_boot_ns;               // 16
-	uint64_t payload_checksum;              // 24
-	alignas(8) uint64_t reader_role_epoch;  // 32
-	uint8_t reserved[24];                   // 40
+	alignas(4) uint32_t state;
+	uint32_t payload_size;
+	uint64_t sample_sequence;
+	uint64_t publish_boot_ns;
+	uint64_t payload_checksum;
+	alignas(8) uint64_t reader_role_epoch;
+	uint8_t reserved[24];
 };
 static_assert(sizeof(SlotHeaderAbi) == 64, "SlotHeaderAbi size");
 static_assert(alignof(SlotHeaderAbi) == 64, "SlotHeaderAbi align");
@@ -182,8 +170,6 @@ static_assert(offsetof(SlotHeaderAbi, publish_boot_ns) == 16, "slot publish_ns")
 static_assert(offsetof(SlotHeaderAbi, payload_checksum) == 24, "slot checksum");
 static_assert(offsetof(SlotHeaderAbi, reader_role_epoch) == 32, "slot role_epoch");
 
-// ---- latest_ticket packing (design §10.3): bits [1:0] slot index,
-// bits [63:2] sample sequence. Ticket 0 == unpublished. ----
 constexpr uint64_t make_ticket(uint64_t sequence, uint32_t slot_index) noexcept {
 	return (sequence << 2) | static_cast<uint64_t>(slot_index & 3u);
 }
@@ -194,9 +180,9 @@ constexpr uint32_t ticket_slot(uint64_t ticket) noexcept {
 
 constexpr uint64_t ticket_sequence(uint64_t ticket) noexcept { return ticket >> 2; }
 
-// ---- Mapping size (design §8.1): every slot starts on a 64-byte boundary. ----
-constexpr uint64_t kSlotHeaderSize = sizeof(SlotHeaderAbi);  // 64
+constexpr uint64_t kSlotHeaderSize = sizeof(SlotHeaderAbi);
 
+// 三个槽的起始偏移和步长都经过溢出检查，防止异常 payload 计算出越界映射。
 inline bool mapping_size_for_payload(uint32_t payload_size, uint64_t* out) noexcept {
 	uint64_t slot_stride = 0;
 	if (!round_up_to_multiple_u64(kSlotHeaderSize + payload_size, 64, &slot_stride)) {
@@ -213,18 +199,14 @@ inline bool slot_byte_offset(uint32_t slot_index, uint64_t slot_stride, uint64_t
 	return checked_add_u64(kFirstSlotOffset, *out, out);
 }
 
-// ---- Channel naming (design §7.1). Control plane only; never hot path. ----
 bool validate_channel_name(const char* name, size_t len) noexcept;
 
-// /edgeruntime.<uid>.<channel_name>
 std::string channel_shm_name(const std::string& channel_name);
 
-// /run/user/<uid>/edgeruntime/<channel_name>.lock
 std::string channel_lock_path(const std::string& channel_name);
 
-// /run/user/<uid>/edgeruntime/<channel_name>.sock (v0.2 fd broker, design §33)
 std::string channel_socket_path(const std::string& channel_name);
 
-}  // namespace edge_runtime::detail
+}  // 命名空间 edge_runtime::detail
 
 #endif  // EDGE_RUNTIME_DETAIL_CHANNEL_LAYOUT_HPP

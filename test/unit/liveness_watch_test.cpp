@@ -1,6 +1,4 @@
-// v0.3 §35.3 LivenessWatch unit tests: long-held pidfd readability vs exit,
-// CLOEXEC discipline, and ESRCH classification. The watched process is this
-// binary re-exec'd as a child that sleeps/exits on demand.
+
 
 #include <gtest/gtest.h>
 
@@ -25,7 +23,7 @@ using edge_runtime::detail::spawn_process;
 pid_t spawn_sleeper(uint32_t ms) {
 	auto sp = spawn_process({"/proc/self/exe", "--watch-child", std::to_string(ms)});
 	if (!sp) return -1;
-	sp.value().stdout_read.reset();  // do not drain; the child prints nothing
+	sp.value().stdout_read.reset();
 	return sp.value().pid;
 }
 
@@ -60,10 +58,10 @@ TEST(LivenessWatch, NonexistentPidFailsClosed) {
 	ASSERT_FALSE(watch);
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
-	// Child mode: sleep argv[2] ms, print nothing, exit 0.
+
 	if (argc >= 3 && std::strcmp(argv[1], "--watch-child") == 0) {
 		const uint32_t ms = static_cast<uint32_t>(std::strtoul(argv[2], nullptr, 10));
 		std::this_thread::sleep_for(std::chrono::milliseconds(ms));

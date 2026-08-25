@@ -1,11 +1,6 @@
 #ifndef EDGE_RUNTIME_DETAIL_PROCESS_SPAWN_HPP
 #define EDGE_RUNTIME_DETAIL_PROCESS_SPAWN_HPP
 
-// Library-side posix_spawn for the v0.3 ProducerSupervisor (design §35.3).
-// The libc implementation owns the fork/vfork-to-exec window, so no application
-// code or allocator runs in a post-fork child of a multi-threaded process. Both
-// pipe ends are O_NONBLOCK so verbose output cannot wedge supervision.
-
 #include <string>
 #include <vector>
 
@@ -14,16 +9,14 @@
 
 namespace edge_runtime::detail {
 
+// 子进程通过 posix_spawn 启动，stdout 使用非阻塞管道，避免输出阻塞监督循环。
 struct SpawnedProcess {
 	pid_t pid = -1;
-	UniqueFd stdout_read;  // O_NONBLOCK read end; EOF when the child exits
+	UniqueFd stdout_read;
 };
 
-// Spawn argv[0] directly (no PATH search). The child's stdout goes to
-// stdout_read; stderr is inherited. The caller reaps the child with waitpid;
-// nothing here detaches or double-forks.
 Result<SpawnedProcess> spawn_process(const std::vector<std::string>& argv) noexcept;
 
-}  // namespace edge_runtime::detail
+}  // 命名空间 edge_runtime::detail
 
 #endif  // EDGE_RUNTIME_DETAIL_PROCESS_SPAWN_HPP

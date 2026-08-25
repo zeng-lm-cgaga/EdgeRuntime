@@ -1,18 +1,4 @@
-// edge_shm_ctl: diagnostic / forensic CLI for shared-memory channels
-// (design §22). Two subcommands:
-//
-//   edge_shm_ctl inspect <name>
-//       Read-only dump of an instance. Prints stable one-line records the
-//       crash-matrix driver parses into evidence files. Never dumps payload.
-//
-//   edge_shm_ctl remove <name> [--expect-generation N] [--expect-nonce HEX32]
-//       Verified removal: takes the control lock, re-binds the object against
-//       its journal / explicit expectations (inode/generation/nonce), refuses
-//       while the producer is provably alive, then unlinks inode-checked and
-//       journals the outcome.
-//
-// Exit codes: 0 success, 1 inspect-only "not present", 2 refused/failed.
-
+// 诊断工具只读取通道元数据或执行已校验的实例删除，绝不读取和输出载荷内容。
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -135,16 +121,12 @@ void print_identity_line(const char* tag,
 	            p.role_epoch, endpoint_state_name(endpoint_state), liveness_name(lv));
 }
 
-// ---- inspect --------------------------------------------------------------
-
 int cmd_inspect(const std::string& channel_name) {
 	const std::string shm_name = detail::channel_shm_name(channel_name);
 	const std::string lock_path = detail::channel_lock_path(channel_name);
 	const std::string socket_path = detail::channel_socket_path(channel_name);
 	std::printf("OBJECT name=%s\n", shm_name.c_str());
 
-	// Control lock + journal first: a consistent cross-check for the header dump
-	// (the journal is the binding record of the instance we are inspecting).
 	auto lock_res = detail::ControlLock::acquire(lock_path);
 	if (!lock_res) {
 		std::printf("JOURNAL lock_failed code=%s errno=%d op=%s\n",
@@ -175,8 +157,7 @@ int cmd_inspect(const std::string& channel_name) {
 	auto fd_res = detail::shm_open_existing(shm_name);
 	bool fd_mode = false;
 	if (!fd_res && fd_res.error().code == ErrorCode::kNotFound) {
-		// v0.2 fd-pass channel: no shm name; the broker socket is the only
-		// reachability point. Ask it for a READONLY fd (design §33.6).
+
 		const bool is_fd_channel =
 		        journal_transport == static_cast<uint32_t>(Transport::kMemfdFdPass) ||
 		        (::access(socket_path.c_str(), F_OK) == 0);
@@ -186,7 +167,7 @@ int cmd_inspect(const std::string& channel_name) {
 			        detail::channel_name_hash(channel_name.c_str(), channel_name.size());
 			detail::FdBrokerReplyAbi reply{};
 			auto rf = detail::fd_broker_request_fd(socket_path, hash, any,
-			                                       /*readonly=*/true, &reply, 500);
+			                                       true, &reply, 500);
 			if (!rf) {
 				std::printf("STATUS broker_failed code=%s (fd-pass channel; the "
 				            "producer process is gone — journal-only report)\n",
@@ -244,8 +225,6 @@ int cmd_inspect(const std::string& channel_name) {
 	            init_state_name(boot.init_state), boot.creator_nonce_hi, boot.creator_nonce_lo,
 	            boot.creator_pid, boot.creator_proc_start_ticks);
 
-	// A partial object (creator killed mid-create, design §9.1) has no full
-	// header yet; the bootstrap is all we can say about it.
 	if (size < detail::kChannelHeaderOffset + sizeof(detail::ChannelHeaderAbi)) {
 		std::printf("HEADER absent (partial object)\n");
 		return 0;
@@ -304,7 +283,6 @@ int cmd_inspect(const std::string& channel_name) {
 	print_identity_line("PRODUCER", detail::identity_snapshot_read(&h->producer), pstate);
 	print_identity_line("CONSUMER", detail::identity_snapshot_read(&h->consumer), cstate);
 
-	// Slot dump (metadata only; payload is never read).
 	if (payload_size > 0 && payload_size <= detail::kMaxPayloadSize) {
 		uint64_t slot_stride = 0;
 		if (detail::round_up_to_multiple_u64(detail::kSlotHeaderSize + payload_size, 64,
@@ -331,11 +309,6 @@ int cmd_inspect(const std::string& channel_name) {
 	return 0;
 }
 
-// ---- remove ---------------------------------------------------------------
-
-// Parses exactly 16 hex chars at s (the first half of a 32-char nonce is not
-// NUL-terminated, so no length check — the caller bounds it). False on any
-// non-hex digit.
 bool parse_u64_hex16(const char* s, uint64_t* out) {
 	uint64_t v = 0;
 	for (int i = 0; i < 16; ++i) {
@@ -356,7 +329,6 @@ bool parse_u64_hex16(const char* s, uint64_t* out) {
 	return true;
 }
 
-// --expect-nonce accepts 32 hex chars (128-bit nonce): hi = first 16 chars.
 bool parse_nonce_hex(const char* hex, uint64_t* hi, uint64_t* lo) {
 	if (hex == nullptr || std::strlen(hex) != 32) return false;
 	return parse_u64_hex16(hex, hi) && parse_u64_hex16(hex + 16, lo);
@@ -390,9 +362,6 @@ int cmd_remove(const std::string& channel_name, bool has_expect_gen, uint64_t ex
 		return 2;
 	}
 
-	// v0.2 fd-pass channel (design §33.6): no shm name — the object dies with
-	// its producer, so removal is journal-only. If the recorded creator is still
-	// alive, refuse (the object still exists inside it).
 	if (journal.transport == static_cast<uint32_t>(Transport::kMemfdFdPass)) {
 		if (journal.creator.pid != 0) {
 			const detail::Liveness lv =
@@ -408,7 +377,7 @@ int cmd_remove(const std::string& channel_name, bool has_expect_gen, uint64_t ex
 				return 2;
 			}
 		}
-		// Creator dead: the object is already gone; reconcile the journal to Idle.
+
 		auto idle = detail::make_control_journal(channel_name, detail::JournalState::kIdle,
 		                                         0, 0, 0, 0, 0, 0,
 		                                         detail::current_process_identity());
@@ -439,7 +408,6 @@ int cmd_remove(const std::string& channel_name, bool has_expect_gen, uint64_t ex
 		return 2;
 	}
 
-	// The journal's in-flight target must be the object we are about to unlink.
 	if (journal.state != static_cast<uint32_t>(detail::JournalState::kIdle) &&
 	    journal.target_ino != 0 && journal.target_ino != ino) {
 		std::printf("REFUSE inode_mismatch journal_target=%" PRIu64 " obj=%" PRIu64 "\n",
@@ -447,7 +415,6 @@ int cmd_remove(const std::string& channel_name, bool has_expect_gen, uint64_t ex
 		return 2;
 	}
 
-	// Recover the object's binding identity.
 	detail::BootstrapHeaderAbi boot{};
 	auto rboot = detail::pread_full(fd.get(), &boot, sizeof(boot), 0);
 	const bool boot_ok = rboot && detail::validate_bootstrap_parse(boot, size);
@@ -491,8 +458,7 @@ int cmd_remove(const std::string& channel_name, bool has_expect_gen, uint64_t ex
 		}
 		bound = true;
 	} else if (boot_ok) {
-		// Partial object (design §9.1): no generation yet; the bootstrap creator
-		// nonce is the authoritative binding. --expect-nonce is required.
+
 		std::printf("REMOVE partial_object size=%" PRIu64 " init=%s\n", size,
 		            init_state_name(boot.init_state));
 		if (journal.state != static_cast<uint32_t>(detail::JournalState::kIdle) &&
@@ -506,10 +472,7 @@ int cmd_remove(const std::string& channel_name, bool has_expect_gen, uint64_t ex
 		obj_nonce_lo = boot.creator_nonce_lo;
 		bound = true;
 	} else if (size == 0) {
-		// Narrow-window pre-object (design §9.1): the creator died right after
-		// shm_open, before the bootstrap was written. The only identity binding is
-		// the journal's in-flight new_nonce; failing that, an explicit
-		// --expect-nonce the operator is willing to vouch for.
+
 		std::printf("REMOVE preobject size=0\n");
 		if (journal.new_nonce_hi != 0 || journal.new_nonce_lo != 0) {
 			obj_nonce_hi = journal.new_nonce_hi;
@@ -539,8 +502,6 @@ int cmd_remove(const std::string& channel_name, bool has_expect_gen, uint64_t ex
 		return 2;
 	}
 
-	// The Idle journal records the completed instance identity; a channel that
-	// was replaced since must not be silently removed.
 	if (ready && journal.state == static_cast<uint32_t>(detail::JournalState::kIdle) &&
 	    journal.new_generation != 0 &&
 	    (journal.new_generation != obj_gen || journal.new_nonce_hi != obj_nonce_hi ||
@@ -549,8 +510,6 @@ int cmd_remove(const std::string& channel_name, bool has_expect_gen, uint64_t ex
 		return 2;
 	}
 
-	// Refuse while the producer is provably alive (design §22.2); a dead /
-	// pid-reused producer is safe to replace.
 	if (ready) {
 		if (has_prod_id && prod_pid != 0) {
 			const detail::Liveness lv = detail::probe_liveness(prod_pid, prod_start);
@@ -568,8 +527,6 @@ int cmd_remove(const std::string& channel_name, bool has_expect_gen, uint64_t ex
 		}
 	}
 
-	// Verified removal transaction (design §9.4): REMOVING journal -> inode
-	// checked unlink -> Idle journal recording the removed instance for audit.
 	auto remove_rec = detail::make_control_journal(
 	        channel_name, detail::JournalState::kRemoving, obj_gen, 0, obj_nonce_hi,
 	        obj_nonce_lo, 0, 0, detail::current_process_identity());
@@ -604,7 +561,7 @@ int cmd_remove(const std::string& channel_name, bool has_expect_gen, uint64_t ex
 	return 0;
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
 	if (argc < 3) {

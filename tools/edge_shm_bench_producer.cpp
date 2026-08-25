@@ -1,17 +1,4 @@
-// edge_shm_bench_producer: the ShmChannel producer side of the ER7 benchmark
-// (design §21). Publishes BenchPayloadV1<N> samples with a CLOCK_MONOTONIC_RAW
-// publish_ns stamped into the payload immediately before publish(), paced by
-// --rate (absolute schedule, no burst catch-up) or at max throughput, until
-// --samples or --max-time-ms is reached. Emits the stable markers the bench
-// driver parses:
-//
-//   READY generation=<n>
-//   PUBLISH_FAIL code=<name>
-//   DONE published=<n> cpu_us=<n>
-//
-// Like every benchmark helper it is a SEPARATE binary exec'd by the driver
-// (§18.3) — never an in-process thread.
-
+// 基准生产者按指定载荷大小和速率发布样本，时间戳写入载荷而不是依赖日志时间。
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -39,9 +26,9 @@ using edge_tool::monotonic_raw_now_ns;
 struct Args {
 	std::string name;
 	uint32_t payload = 64;
-	uint64_t samples = 1000000;    // stop at this many publishes
-	uint64_t max_time_ms = 60000;  // ... or this wall cap
-	uint64_t rate_hz = 0;          // 0 = max throughput
+	uint64_t samples = 1000000;
+	uint64_t max_time_ms = 60000;
+	uint64_t rate_hz = 0;
 	uint64_t wait_consumer_ms = 0;
 	bool checksum = true;
 };
@@ -96,10 +83,10 @@ int run_producer_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) 
 	pacer.start();
 	uint64_t published = 0;
 	for (;;) {
-		if (published > 0) pacer.wait_until_next();  // first sample is immediate
+		if (published > 0) pacer.wait_until_next();
 		const uint64_t publish_ns = monotonic_raw_now_ns();
 		bench::BenchPayloadV1<N> v{};
-		v.counter = published;  // sample_sequence starts at 1 -> seq - 1
+		v.counter = published;
 		v.publish_ns = publish_ns;
 		auto r = p.value().publish(v);
 		if (!r) {
@@ -120,7 +107,7 @@ int run_producer_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) 
 	return 0;
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
 	const char* name = edge_tool::arg_value(argc, argv, "--name");

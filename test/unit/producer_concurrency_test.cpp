@@ -79,4 +79,4 @@ TEST(ProducerConcurrency, RejectsOverlapAndPreservesUniqueSequences) {
 	EXPECT_TRUE(edge_runtime::detail::producer_remove_if_owner_impl(handle));
 }
 
-}  // namespace
+}

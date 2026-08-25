@@ -10,7 +10,7 @@
 
 namespace edge_runtime::detail {
 
-// getrandom() with EINTR retry. Used for instance nonce and test seeds.
+// getrandom 被 EINTR 打断时重试；随机值用于实例标识和测试种子。
 inline bool random_bytes(void* out, size_t size) noexcept {
 	auto* p = static_cast<uint8_t*>(out);
 	size_t got = 0;
@@ -25,6 +25,6 @@ inline bool random_bytes(void* out, size_t size) noexcept {
 	return true;
 }
 
-}  // namespace edge_runtime::detail
+}  // 命名空间 edge_runtime::detail
 
 #endif  // EDGE_RUNTIME_DETAIL_RANDOM_HPP

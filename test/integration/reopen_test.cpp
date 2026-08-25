@@ -1,8 +1,4 @@
-// ER1 I01: minimal cross-exec reopen. The driver creates a producer, fork+execs
-// a SEPARATE binary (reopen_child) that re-opens the channel by name and
-// verifies the frozen identity. After the child exits, the driver confirms the
-// child's consumer identity is still recorded in the header (dead) and that
-// clean shutdown lets a same-process recreate replace the instance.
+
 
 #include <gtest/gtest.h>
 
@@ -45,7 +41,7 @@ std::string fingerprint_hex(const std::array<std::byte, 32>& fp) {
 	return out;
 }
 
-TEST(Reopen, CrossExecReopen) {  // I01
+TEST(Reopen, CrossExecReopen) {
 	const std::string name = edge_test::unique_channel_name("reopen");
 	ChannelOptions opts;
 	opts.name = name;
@@ -72,13 +68,11 @@ TEST(Reopen, CrossExecReopen) {  // I01
 	EXPECT_NE(r.stdout_text.find("OPEN_RESULT ok=1"), std::string::npos)
 	        << "stdout: " << r.stdout_text;
 
-	// The child's consumer identity must be recorded in the header (now dead).
 	auto st2 = prod.value().status();
 	ASSERT_TRUE(st2);
 	EXPECT_EQ(st2.value().consumer_pid, static_cast<uint64_t>(r.child_pid));
 	EXPECT_FALSE(st2.value().consumer_alive);
 
-	// Cleanup: verified removal exercises §9.4 and leaves no stray shm object.
 	auto rm = prod.value().remove_if_owner();
 	ASSERT_TRUE(rm) << edge_runtime::to_string(rm.error().code);
 }
@@ -100,11 +94,9 @@ TEST(Reopen, SameProcessRecreateReplacesInstance) {
 		gen1 = s1.value().generation;
 		nonce1_hi = s1.value().instance_nonce_hi;
 		nonce1_lo = s1.value().instance_nonce_lo;
-		// p1 clean shutdown (destructor) marks producer_state OFFLINE.
+
 	}
 
-	// Same process, same name: the old instance is OFFLINE (not a live owner),
-	// so create replaces it with generation+1 and a fresh nonce.
 	auto p2 = Producer<TestPayloadV1>::create(opts, schema);
 	ASSERT_TRUE(p2) << edge_runtime::to_string(p2.error().code) << " " << p2.error().context;
 	auto s2 = p2.value().status();
@@ -113,7 +105,6 @@ TEST(Reopen, SameProcessRecreateReplacesInstance) {
 	EXPECT_NE(s2.value().instance_nonce_hi, nonce1_hi);
 	EXPECT_NE(s2.value().instance_nonce_lo, nonce1_lo);
 
-	// An active producer (p2 alive, ONLINE) must reject a second create.
 	auto dup = Producer<TestPayloadV1>::create(opts, schema);
 	ASSERT_FALSE(dup);
 	EXPECT_EQ(dup.error().code, ErrorCode::kAlreadyOwned);
@@ -135,15 +126,12 @@ TEST(Reopen, ConsumerOwnershipAndCleanShutdown) {
 		ASSERT_TRUE(c1) << edge_runtime::to_string(c1.error().code) << " "
 		                << c1.error().context;
 
-		// A live consumer owns the channel: second open is rejected.
 		auto c2 = edge_runtime::Consumer<TestPayloadV1>::open(opts, schema);
 		ASSERT_FALSE(c2);
 		EXPECT_EQ(c2.error().code, ErrorCode::kConsumerAlreadyOwned);
 
-		// c1 destructor marks consumer_state OFFLINE.
 	}
 
-	// Cleanly-shutdown consumer is reclaimable in the same process.
 	auto c3 = edge_runtime::Consumer<TestPayloadV1>::open(opts, schema);
 	ASSERT_TRUE(c3) << edge_runtime::to_string(c3.error().code) << " " << c3.error().context;
 
@@ -176,8 +164,6 @@ void verify_reconnect_to_replaced_instance(Transport transport) {
 		old_nonce = first.value().instance_nonce;
 		EXPECT_EQ(first.value().sequence, 1u);
 
-		// Reconnect is only for a replacement. Failure against the current live
-		// instance must leave the existing handle usable.
 		auto premature = consumer->reconnect();
 		ASSERT_FALSE(premature);
 		EXPECT_EQ(premature.error().code, ErrorCode::kConsumerAlreadyOwned);
@@ -185,7 +171,7 @@ void verify_reconnect_to_replaced_instance(Transport transport) {
 		auto second = consumer->try_read_latest();
 		ASSERT_TRUE(second);
 		EXPECT_EQ(second.value().value.counter, 12u);
-		// producer clean shutdown leaves the consumer holding the old mapping.
+
 	}
 
 	auto successor = Producer<TestPayloadV1>::create(opts, schema);
@@ -256,7 +242,7 @@ TEST(Reopen, ReconnectRejectsConcurrentWaitWithoutInvalidatingIt) {
 	EXPECT_TRUE(producer.value().remove_if_owner());
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
 	::testing::InitGoogleTest(&argc, argv);

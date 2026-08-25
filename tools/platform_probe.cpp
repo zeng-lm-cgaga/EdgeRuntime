@@ -148,7 +148,7 @@ bool check_shm_lifecycle() {
 	              "create-truncate-map-unmap-close-unlink");
 }
 
-}  // namespace
+}
 
 int main() {
 #if !defined(__linux__) || !defined(__x86_64__) || !defined(__GNUC__)

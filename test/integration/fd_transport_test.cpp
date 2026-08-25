@@ -1,15 +1,4 @@
-// ER10 integration driver (v0.2 §33): memfd + SCM_RIGHTS fd-pass transport
-// across processes. Every case fork+execs the SEPARATE tool binaries
-// (design §18.3):
-//
-//   F1  cross-exec create -> open -> read with the pattern check (torn == 0),
-//       and edge_shm_ctl inspect reports the channel as fd_pass via a
-//       READONLY broker fd
-//   F2  consumer starts first: bounded broker retry until the producer appears
-//   F3  transport mismatch: a posix consumer gets an explicit fd-pass diagnosis
-//       (not a silent NotFound)
-//   F4  clean shutdown (SIGTERM) releases the socket; a successor recreates
-//       at generation+1 and a new consumer reopens it
+
 
 #include <gtest/gtest.h>
 
@@ -62,7 +51,7 @@ bool out_contains(const std::string& out, const char* needle) {
 	return out.find(needle) != std::string::npos;
 }
 
-TEST(FdTransport, CrossExecCreateOpenReadInspect) {  // F1
+TEST(FdTransport, CrossExecCreateOpenReadInspect) {
 	const std::string name = unique_channel_name("fd1");
 	auto pa = fd_producer_args(name);
 	pa.push_back("--interval-us");
@@ -87,8 +76,6 @@ TEST(FdTransport, CrossExecCreateOpenReadInspect) {  // F1
 	EXPECT_EQ(summary_field(cons_out, "reads"), 3u) << cons_out;
 	EXPECT_EQ(summary_field(cons_out, "torn"), 0u) << cons_out;
 
-	// ctl inspect: broker serves a READONLY fd and the dump identifies the
-	// transport as fd_pass.
 	const std::vector<std::string> ctl_args = {g_ctl_tool, "inspect", name};
 	const auto ctl_res = edge_test::run_child_capture(ctl_args, 15000);
 	ASSERT_EQ(ctl_res.exit_code, 0) << ctl_res.stdout_text;
@@ -100,7 +87,7 @@ TEST(FdTransport, CrossExecCreateOpenReadInspect) {  // F1
 	ASSERT_TRUE(prod.wait(10000, &prod_out)) << "producer hung: " << prod_out;
 }
 
-TEST(FdTransport, ConsumerStartsFirstBoundedRetry) {  // F2
+TEST(FdTransport, ConsumerStartsFirstBoundedRetry) {
 	const std::string name = unique_channel_name("fd2");
 	auto ca = fd_consumer_args(name);
 	ca.push_back("--reads");
@@ -130,7 +117,7 @@ TEST(FdTransport, ConsumerStartsFirstBoundedRetry) {  // F2
 	EXPECT_EQ(summary_field(cons_out, "torn"), 0u) << cons_out;
 }
 
-TEST(FdTransport, PosixConsumerGetsExplicitMismatch) {  // F3
+TEST(FdTransport, PosixConsumerGetsExplicitMismatch) {
 	const std::string name = unique_channel_name("fd3");
 	auto pa = fd_producer_args(name);
 	pa.push_back("--interval-us");
@@ -139,8 +126,6 @@ TEST(FdTransport, PosixConsumerGetsExplicitMismatch) {  // F3
 	ASSERT_TRUE(prod.spawn(pa));
 	std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-	// A posix consumer must not silently report NotFound for a fd-pass channel;
-	// the library diagnoses the transport mismatch explicitly (§33.2).
 	auto ca = posix_consumer_args(name);
 	ca.push_back("--open-retry-ms");
 	ca.push_back("0");
@@ -157,7 +142,7 @@ TEST(FdTransport, PosixConsumerGetsExplicitMismatch) {  // F3
 	ASSERT_TRUE(prod.wait(10000, &prod_out)) << "producer hung: " << prod_out;
 }
 
-TEST(FdTransport, CleanShutdownReleasesSocketAndSuccessorRecreates) {  // F4
+TEST(FdTransport, CleanShutdownReleasesSocketAndSuccessorRecreates) {
 	const std::string name = unique_channel_name("fd4");
 	{
 		auto pa = fd_producer_args(name);
@@ -165,16 +150,12 @@ TEST(FdTransport, CleanShutdownReleasesSocketAndSuccessorRecreates) {  // F4
 		SpawnedChild prod;
 		ASSERT_TRUE(prod.spawn(pa));
 		std::this_thread::sleep_for(std::chrono::milliseconds(500));
-		prod.kill(SIGTERM);  // clean shutdown -> serving stops, socket unlinked
+		prod.kill(SIGTERM);
 		std::string prod_out;
 		ASSERT_TRUE(prod.wait(10000, &prod_out)) << "producer hung: " << prod_out;
 		EXPECT_TRUE(out_contains(prod_out, "DONE published=0")) << prod_out;
 	}
-	// Successor recreates at generation+1 (v0.1 OFFLINE->replace semantics) and
-	// keeps publishing; a consumer then opens the successor through the fresh
-	// socket. (The object dies with its creator — an exited successor leaves
-	// nothing to open, which is the design §33.3 lifecycle, so the successor
-	// must stay alive during the consumer's open.)
+
 	{
 		auto pa = fd_producer_args(name);
 		pa.push_back("--interval-us");
@@ -204,7 +185,7 @@ TEST(FdTransport, CleanShutdownReleasesSocketAndSuccessorRecreates) {  // F4
 	}
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
 	::testing::InitGoogleTest(&argc, argv);

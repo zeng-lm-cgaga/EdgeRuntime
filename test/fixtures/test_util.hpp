@@ -1,11 +1,7 @@
 #ifndef EDGE_TEST_TEST_UTIL_HPP
 #define EDGE_TEST_TEST_UTIL_HPP
 
-// Shared helpers for integration/crash drivers (design §18.3): unique channel
-// names, and the fork+exec harness used by every cross-process test. The child
-// is always a SEPARATE binary (never the driver image) so a reopen is a true
-// reopen and not an inherited mapping.
-
+// 测试夹具负责生成隔离通道名、启动独立子进程并收集退出状态和输出。
 #include <poll.h>
 #include <signal.h>
 #include <sys/types.h>
@@ -23,8 +19,6 @@
 
 namespace edge_test {
 
-// Unique channel name: <tag>_<pid>_<counter>. pids differ across processes and
-// the counter within a process, so concurrent/rerun instances never collide.
 inline std::string unique_channel_name(const char* tag) {
 	static std::atomic<uint64_t> counter{0};
 	const uint64_t n = counter.fetch_add(1);
@@ -41,15 +35,12 @@ inline int64_t monotonic_ms_now() {
 }
 
 struct ChildResult {
-	int exit_code = -1;  // -1: exec/launch failure, or killed on timeout
+	int exit_code = -1;
 	pid_t child_pid = 0;
 	std::string stdout_text;
 	bool timed_out = false;
 };
 
-// fork()+exec(argv[0], argv...) with stdout captured on a pipe; the driver
-// polls with a hard deadline and SIGKILLs the child on timeout. stderr is
-// inherited so the child's diagnostics surface in the test log.
 inline ChildResult run_child_capture(const std::vector<std::string>& argv, int timeout_ms) {
 	ChildResult result;
 	int pipefd[2] = {-1, -1};
@@ -115,11 +106,6 @@ inline ChildResult run_child_capture(const std::vector<std::string>& argv, int t
 	return result;
 }
 
-// SpawnedChild: like run_child_capture but non-blocking — the child keeps
-// running until wait()/kill()/destruction, which is what overlapping-process
-// tests (I04 consumer-first, I05/I06 duplicate endpoints) need. stdout is
-// captured on a pipe and drained by wait(). The destructor SIGKILLs any child
-// not yet reaped, so a leaked live child never outlives the driver.
 class SpawnedChild {
        public:
 	SpawnedChild() = default;
@@ -127,8 +113,6 @@ class SpawnedChild {
 	SpawnedChild& operator=(const SpawnedChild&) = delete;
 	~SpawnedChild() { stop(); }
 
-	// fork+exec; stdout -> pipe. Returns false on any failure (never leaves a
-	// half-spawned child).
 	bool spawn(const std::vector<std::string>& argv) {
 		if (pid_ > 0) return false;
 		int pipefd[2] = {-1, -1};
@@ -160,14 +144,10 @@ class SpawnedChild {
 	pid_t pid() const { return pid_; }
 	bool reaped() const { return reaped_; }
 
-	// Send a signal to the child (no-op if already reaped).
 	void kill(int sig = SIGTERM) {
 		if (pid_ > 0 && !reaped_) ::kill(pid_, sig);
 	}
 
-	// Block until the child exits (draining stdout), or timeout_ms passes. On
-	// timeout the child is SIGKILLed and reaped; returns false with partial
-	// stdout in *stdout_out. Returns true on clean reap.
 	bool wait(int timeout_ms, std::string* stdout_out) {
 		stdout_out->clear();
 		if (pid_ <= 0 || reaped_) return reaped_;
@@ -195,11 +175,11 @@ class SpawnedChild {
 			}
 			if ((pfd.revents & (POLLIN | POLLHUP)) == 0) continue;
 			const ssize_t n = ::read(pipe_read_, buf, sizeof(buf));
-			if (n <= 0) break;  // EOF (POLLHUP) or error: child closed stdout
+			if (n <= 0) break;
 			stdout_out->append(buf, static_cast<size_t>(n));
 		}
 		if (timed_out) ::kill(pid_, SIGKILL);
-		// drain any residual output then reap
+
 		while (true) {
 			const ssize_t n = ::read(pipe_read_, buf, sizeof(buf));
 			if (n <= 0) break;
@@ -234,6 +214,6 @@ class SpawnedChild {
 	int exit_code_ = -1;
 };
 
-}  // namespace edge_test
+}
 
-#endif  // EDGE_TEST_TEST_UTIL_HPP
+#endif

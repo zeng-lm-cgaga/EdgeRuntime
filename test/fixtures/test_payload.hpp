@@ -1,13 +1,7 @@
 #ifndef EDGE_TEST_TEST_PAYLOAD_HPP
 #define EDGE_TEST_TEST_PAYLOAD_HPP
 
-// Test payloads + codecs used by unit/integration/crash suites. byte-exact
-// little-endian, no padding enters the checksummed region; decode() validates
-// the magic and the reserved flag bits so torn reads are observable (ER2 I02).
-// The 32-byte schema fingerprint is a FIXED test constant shared verbatim by
-// every driver/helper binary; the *_FingerprintHex strings are the same bytes
-// as lowercase hex for the CLI tools.
-
+// 测试载荷使用固定字节布局和指纹，用于验证校验和、Schema 不匹配和撕裂读取。
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -15,9 +9,9 @@
 #include "edge_runtime/schema.hpp"
 
 struct TestPayloadV1 {
-	uint32_t magic = 0x5A000001u;  // family + version tag
+	uint32_t magic = 0x5A000001u;
 	uint64_t counter = 0;
-	uint32_t flags = 0;  // only bits [1:0] are valid
+	uint32_t flags = 0;
 };
 
 inline constexpr std::array<std::byte, 32> kTestPayloadV1Fingerprint = {
@@ -33,15 +27,10 @@ inline constexpr std::array<std::byte, 32> kTestPayloadV1Fingerprint = {
 inline constexpr uint32_t kTestPayloadV1Version = 1;
 inline constexpr const char* kTestPayloadV1Name = "TestPayloadV1";
 
-// The same fingerprint as a lowercase-hex string, for CLI tools that take a
-// --schema-hex argument (kept in sync with the array above).
 inline constexpr const char* kTestPayloadV1FingerprintHex =
         "0102030405060708090a0b0c0d0e0f10"
         "1112131415161718191a1b1c1d1e1f20";
 
-// Second payload type with a DIFFERENT encoded size (8 != 16): opening a
-// consumer<TestPayloadV2> against a producer<TestPayloadV1> channel must be
-// rejected as kSchemaMismatch (ER2 I08).
 struct TestPayloadV2 {
 	uint32_t magic = 0x5A000002u;
 	uint32_t value = 0;
@@ -79,7 +68,7 @@ namespace edge_runtime {
 template <>
 struct PayloadCodec<TestPayloadV1> {
 	static constexpr bool kDefined = true;
-	static constexpr uint32_t kEncodedSize = 16;  // 4 + 8 + 4, no padding
+	static constexpr uint32_t kEncodedSize = 16;
 	using EncodedBuffer = std::array<std::byte, kEncodedSize>;
 
 	static bool encode(const TestPayloadV1& v, std::byte* dst, size_t cap) noexcept {
@@ -117,7 +106,7 @@ struct PayloadCodec<TestPayloadV1> {
 			         << (8u * i);
 		}
 		if (magic != 0x5A000001u) return false;
-		if ((flags & ~0x3u) != 0) return false;  // reserved bits must stay zero
+		if ((flags & ~0x3u) != 0) return false;
 		out->magic = magic;
 		out->counter = counter;
 		out->flags = flags;
@@ -128,7 +117,7 @@ struct PayloadCodec<TestPayloadV1> {
 template <>
 struct PayloadCodec<TestPayloadV2> {
 	static constexpr bool kDefined = true;
-	static constexpr uint32_t kEncodedSize = 8;  // 4 + 4, no padding
+	static constexpr uint32_t kEncodedSize = 8;
 	using EncodedBuffer = std::array<std::byte, kEncodedSize>;
 
 	static bool encode(const TestPayloadV2& v, std::byte* dst, size_t cap) noexcept {
@@ -163,6 +152,6 @@ struct PayloadCodec<TestPayloadV2> {
 	}
 };
 
-}  // namespace edge_runtime
+}
 
-#endif  // EDGE_TEST_TEST_PAYLOAD_HPP
+#endif

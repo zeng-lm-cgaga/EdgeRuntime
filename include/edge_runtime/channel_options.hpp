@@ -7,11 +7,11 @@
 
 namespace edge_runtime {
 
-// Object transport (v0.2, design §33): how the shared-memory object is created
-// and handed to the consumer. Frozen at create; consumer must match.
 enum class Transport : uint32_t {
-	kPosixShm = 0,     // v0.1 named POSIX shm (default; behavior unchanged)
-	kMemfdFdPass = 1,  // memfd + SCM_RIGHTS via a per-channel broker socket
+	// 使用命名 POSIX 共享内存，兼容默认运行方式。
+	kPosixShm = 0,
+	// 使用 memfd，并通过每个通道的 Unix 套接字传递文件描述符。
+	kMemfdFdPass = 1,
 };
 
 struct ChannelOptions {
@@ -20,11 +20,10 @@ struct ChannelOptions {
 	std::chrono::milliseconds reconnect_timeout{1000};
 	bool enable_payload_checksum{true};
 	Transport transport{Transport::kPosixShm};
-	// v0.2 optional heartbeat (design §34): producer-side making-progress
-	// interval; 0 disables heartbeat (v0.1 behavior, abi_minor 0).
+	// 大于零时，Producer 可用 BOOTTIME 报告应用仍在推进；零表示关闭。
 	std::chrono::nanoseconds heartbeat_interval{0};
 };
 
-}  // namespace edge_runtime
+}  // 命名空间 edge_runtime
 
 #endif  // EDGE_RUNTIME_CHANNEL_OPTIONS_HPP

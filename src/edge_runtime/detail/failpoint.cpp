@@ -21,16 +21,16 @@ enum class Mode : uint8_t { kStop, kCrash, kLog };
 
 struct Activation {
 	bool enabled = false;
-	bool wildcard = false;  // EDGE_FAILPOINT=*
+	bool wildcard = false;
 	const char* single = nullptr;
-	uint64_t count = 1;  // fire on the COUNT-th hit (1-based)
+	uint64_t count = 1;
 	Mode mode = Mode::kStop;
 };
 
 Activation read_activation() noexcept {
 	Activation a;
 	const char* fp = std::getenv("EDGE_FAILPOINT");
-	if (fp == nullptr || fp[0] == '\0') return a;  // disabled: failpoints inert
+	if (fp == nullptr || fp[0] == '\0') return a;
 	a.enabled = true;
 	a.wildcard = std::strcmp(fp, "*") == 0;
 	a.single = fp;
@@ -49,16 +49,11 @@ Activation read_activation() noexcept {
 	return a;
 }
 
-// Lazy one-time activation read (C++11 magic static: thread-safe). Every hit
-// after the first pays one load + branch when disabled.
 Activation& activation() noexcept {
 	static Activation act = read_activation();
 	return act;
 }
 
-// Per-record hit counters so EDGE_FAILPOINT_COUNT=N fires on the N-th hit of a
-// specific failpoint (crash-matrix: let a producer publish N-1 samples cleanly,
-// then crash mid-publish).
 struct HitTable {
 	std::mutex mu;
 	std::map<const FailpointRecord*, uint64_t> hits;
@@ -69,8 +64,9 @@ HitTable& hit_table() noexcept {
 	return table;
 }
 
-}  // namespace
+}
 
+// 故障点只在首次命中时读取环境变量，命中后按次数执行停止、退出或记录。
 void failpoint_trigger(const FailpointRecord* fp) noexcept {
 	const Activation& act = activation();
 	if (!act.enabled) return;
@@ -83,18 +79,16 @@ void failpoint_trigger(const FailpointRecord* fp) noexcept {
 		std::lock_guard<std::mutex> lock(table.mu);
 		nth = ++table.hits[fp];
 	}
-	if (nth != act.count) return;  // not the configured hit yet
+	if (nth != act.count) return;
 
-	// Flush stdout/stderr first so the crash matrix's captured output includes
-	// everything the child emitted up to the kill point.
 	std::fflush(stdout);
 	std::fflush(stderr);
 	switch (act.mode) {
 		case Mode::kStop:
-			::raise(SIGSTOP);  // parent confirms the crash state, then SIGKILLs
+			::raise(SIGSTOP);
 			break;
 		case Mode::kCrash:
-			::_exit(134);  // deterministic "SIGABRT" exit code; no core dump
+			::_exit(134);
 			break;
 		case Mode::kLog:
 			std::fprintf(stderr, "FAILPOINT hit id=%s nth=%llu\n", fp->id,
@@ -117,6 +111,6 @@ size_t failpoint_list(const char* const** ids_out) noexcept {
 	return ids->size();
 }
 
-}  // namespace edge_runtime::detail
+}
 
-#endif  // EDGERUNTIME_ENABLE_FAILPOINTS
+#endif

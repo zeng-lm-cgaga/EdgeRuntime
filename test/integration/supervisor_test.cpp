@@ -1,14 +1,4 @@
-// ER13 integration driver (v0.3 §35): ProducerSupervisor restart semantics
-// across processes. Every case fork+execs the SEPARATE tool binaries
-// (design §18.3):
-//
-//   S1  clean exit (child finishes by itself) -> CLEAN_EXIT, no restart, exit 0
-//   S2  crash (SIGKILL) -> RESTART + SUPERVISED gen=2; a consumer then reads
-//       the replacement instance (generation+1 recovery path)
-//   S3  stall (SIGSTOP of the heartbeat-only child) -> STALL_DETECTED ->
-//       KILLED sig=9 (SIGTERM pending on a stopped process) -> RESTART
-//   S4  crash loop -> RESTART x max_restarts -> GAVE_UP, non-zero exit
-//   S5  stop: SIGTERM to the supervisor -> STOPPED, exit 0, child reaped
+
 
 #include <gtest/gtest.h>
 
@@ -49,16 +39,13 @@ bool out_contains(const std::string& out, const char* needle) {
 	return out.find(needle) != std::string::npos;
 }
 
-// Signal the supervised producer child. The pattern is anchored at ^ so it can
-// only match the exec'd producer's own cmdline — never the supervisor's
-// (which contains the pattern mid-string) and never this driver's shell.
 int signal_producer_child(const std::string& sig, const std::string& name) {
 	const std::string pattern = "^" + g_producer_tool + " --name " + name + " ";
 	const std::string cmd = "pkill -" + sig + " -f \"" + pattern + "\"";
 	return std::system(cmd.c_str());
 }
 
-TEST(Supervisor, CleanExitNoRestart) {  // S1
+TEST(Supervisor, CleanExitNoRestart) {
 	const std::string name = unique_channel_name("s1");
 	auto sa = supervisor_args(name, g_producer_tool + " --name " + name +
 	                                         " --count 2 --interval-us 20000");
@@ -72,7 +59,7 @@ TEST(Supervisor, CleanExitNoRestart) {  // S1
 	EXPECT_FALSE(out_contains(out, "RESTART")) << out;
 }
 
-TEST(Supervisor, CrashRestartsAtGenerationPlusOne) {  // S2
+TEST(Supervisor, CrashRestartsAtGenerationPlusOne) {
 	const std::string name = unique_channel_name("s2");
 	auto sa = supervisor_args(name, g_producer_tool + " --name " + name +
 	                                         " --interval-us 100000",
@@ -85,7 +72,6 @@ TEST(Supervisor, CrashRestartsAtGenerationPlusOne) {  // S2
 
 	std::this_thread::sleep_for(std::chrono::milliseconds(2500));
 
-	// A fresh consumer must be able to open and read the replacement instance.
 	std::vector<std::string> ca = {g_consumer_tool, "--name", name,
 	                               "--schema", "testpayloadv1", "--reads", "1",
 	                               "--read-interval-ms", "20", "--open-retry-ms",
@@ -101,11 +87,11 @@ TEST(Supervisor, CrashRestartsAtGenerationPlusOne) {  // S2
 	std::string out;
 	ASSERT_TRUE(sup.wait(15000, &out)) << "supervisor hung: " << out;
 	EXPECT_TRUE(out_contains(out, "RESTART attempt=1")) << out;
-	// gen=2 proves the replacement went through the dead-owner path.
+
 	EXPECT_TRUE(out_contains(out, "gen=2")) << out;
 }
 
-TEST(Supervisor, StallDetectedKillAndRestart) {  // S3
+TEST(Supervisor, StallDetectedKillAndRestart) {
 	const std::string name = unique_channel_name("s3");
 	auto sa = supervisor_args(name,
 	                          g_producer_tool + " --name " + name +
@@ -114,8 +100,6 @@ TEST(Supervisor, StallDetectedKillAndRestart) {  // S3
 	ASSERT_TRUE(sup.spawn(sa));
 	std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
-	// Freeze the heartbeat-only child (SIGSTOP victim, the C18 scenario): the
-	// supervisor must classify the stall and take over.
 	ASSERT_EQ(signal_producer_child("STOP", name), 0);
 	std::this_thread::sleep_for(std::chrono::milliseconds(3000));
 
@@ -123,17 +107,16 @@ TEST(Supervisor, StallDetectedKillAndRestart) {  // S3
 	std::string out;
 	ASSERT_TRUE(sup.wait(15000, &out)) << "supervisor hung: " << out;
 	EXPECT_TRUE(out_contains(out, "STALL_DETECTED")) << out;
-	// SIGTERM stays pending on the stopped process; the grace escalation kills.
+
 	EXPECT_TRUE(out_contains(out, "KILLED sig=9")) << out;
 	EXPECT_TRUE(out_contains(out, "RESTART attempt=1")) << out;
 	EXPECT_TRUE(out_contains(out, "gen=2")) << out;
 	EXPECT_TRUE(out_contains(out, "STOPPED")) << out;
 }
 
-TEST(Supervisor, CrashLoopCappedByGaveUp) {  // S4
+TEST(Supervisor, CrashLoopCappedByGaveUp) {
 	const std::string name = unique_channel_name("s4");
-	// /bin/false exits 1 instantly without ever creating the channel: a
-	// deterministic crash loop (death before READY counts as a failure).
+
 	auto sa = supervisor_args(name, "/bin/false",
 	                          {"--max-restarts", "3", "--max-delay-ms", "1000",
 	                           "--multiplier", "2",
@@ -142,7 +125,7 @@ TEST(Supervisor, CrashLoopCappedByGaveUp) {  // S4
 	ASSERT_TRUE(sup.spawn(sa));
 	std::string out;
 	ASSERT_TRUE(sup.wait(30000, &out)) << "supervisor hung: " << out;
-	EXPECT_EQ(sup.exit_code(), 3) << out;  // GAVE_UP exit code
+	EXPECT_EQ(sup.exit_code(), 3) << out;
 	EXPECT_TRUE(out_contains(out, "GAVE_UP attempts=4 restarts=3")) << out;
 	EXPECT_TRUE(out_contains(out, "RESTART attempt=1 delay=200000000ns")) << out;
 	EXPECT_TRUE(out_contains(out, "RESTART attempt=2 delay=400000000ns")) << out;
@@ -150,7 +133,7 @@ TEST(Supervisor, CrashLoopCappedByGaveUp) {  // S4
 	EXPECT_FALSE(out_contains(out, "RESTART attempt=4")) << out;
 }
 
-TEST(Supervisor, StopReapsChildCleanly) {  // S5
+TEST(Supervisor, StopReapsChildCleanly) {
 	const std::string name = unique_channel_name("s5");
 	auto sa = supervisor_args(name, g_producer_tool + " --name " + name +
 	                                         " --interval-us 100000");
@@ -158,7 +141,7 @@ TEST(Supervisor, StopReapsChildCleanly) {  // S5
 	ASSERT_TRUE(sup.spawn(sa));
 	std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
-	sup.kill(SIGTERM);  // supervisor receives it via signalfd -> stop sequence
+	sup.kill(SIGTERM);
 	std::string out;
 	ASSERT_TRUE(sup.wait(15000, &out)) << "supervisor hung: " << out;
 	EXPECT_EQ(sup.exit_code(), 0) << out;
@@ -166,7 +149,7 @@ TEST(Supervisor, StopReapsChildCleanly) {  // S5
 	EXPECT_FALSE(out_contains(out, "RESTART")) << out;
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
 	::testing::InitGoogleTest(&argc, argv);

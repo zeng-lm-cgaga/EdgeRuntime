@@ -1,7 +1,4 @@
-// Failpoint infrastructure (design §20.3/§22.3): link-section registry, env
-// activation, and the stop/crash/log modes. Activation is read once per
-// process, so every behavioural test runs in a forked child that sets its own
-// environment; the parent observes the child's fate (exited vs SIGSTOPped).
+
 
 #include "edge_runtime/detail/failpoint.hpp"
 
@@ -20,8 +17,6 @@ namespace {
 
 using edge_runtime::detail::failpoint_list;
 
-// A failpoint wired into the test binary itself; it also proves the section
-// registry picks up failpoints from any TU in the link.
 void hit_utest_fp() { EDGE_FAILPOINT(UTEST); }
 
 TEST(Failpoint, RegistryEnumeratesWiredIds) {
@@ -42,7 +37,7 @@ TEST(Failpoint, InertWhenEnvUnset) {
 		::unsetenv("EDGE_FAILPOINT");
 		::unsetenv("EDGE_FAILPOINT_MODE");
 		::unsetenv("EDGE_FAILPOINT_COUNT");
-		hit_utest_fp();  // must return without acting
+		hit_utest_fp();
 		::_exit(0);
 	}
 	int status = 0;
@@ -66,8 +61,8 @@ TEST(Failpoint, LogModePrintsAndContinues) {
 		::setenv("EDGE_FAILPOINT", "UTEST", 1);
 		::setenv("EDGE_FAILPOINT_MODE", "log", 1);
 		::unsetenv("EDGE_FAILPOINT_COUNT");
-		hit_utest_fp();  // logs the marker and continues
-		::_exit(0);      // _exit would never run if it SIGSTOPped
+		hit_utest_fp();
+		::_exit(0);
 	}
 	int status = 0;
 	ASSERT_EQ(::waitpid(pid, &status, 0), pid);
@@ -92,8 +87,8 @@ TEST(Failpoint, StopModeSigsStops) {
 		::setenv("EDGE_FAILPOINT", "UTEST", 1);
 		::setenv("EDGE_FAILPOINT_MODE", "stop", 1);
 		::unsetenv("EDGE_FAILPOINT_COUNT");
-		hit_utest_fp();  // SIGSTOPs the whole process
-		::_exit(0);      // unreachable (SIGSTOP cannot be caught/ignored)
+		hit_utest_fp();
+		::_exit(0);
 	}
 	int status = 0;
 	ASSERT_EQ(::waitpid(pid, &status, WUNTRACED), pid);
@@ -106,8 +101,7 @@ TEST(Failpoint, StopModeSigsStops) {
 }
 
 TEST(Failpoint, CountFiresOnNthHit) {
-	// COUNT=3: the first two hits are no-ops (proven by the marker written
-	// before the third), the third SIGSTOPs.
+
 	char marker[] = "/tmp/edge_fp_cnt_XXXXXX";
 	const int fd = ::mkstemp(marker);
 	ASSERT_GE(fd, 0);
@@ -145,4 +139,4 @@ TEST(Failpoint, CountFiresOnNthHit) {
 	EXPECT_GE(r, 0) << "first two hits must be no-ops (marker written) before the 3rd stops";
 }
 
-}  // namespace
+}

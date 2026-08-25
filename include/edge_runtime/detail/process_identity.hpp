@@ -8,9 +8,7 @@
 
 namespace edge_runtime::detail {
 
-// Cross-process process identity (design §7.2): pid + /proc starttime +
-// boot-id hash. Used only for recovery disambiguation, never as security
-// authentication.
+// 进程身份由 pid、/proc 启动时间和本次启动标识共同组成，防止 PID 复用误判。
 struct ProcessIdentity {
 	uint64_t pid = 0;
 	uint64_t proc_start_ticks = 0;
@@ -19,40 +17,30 @@ struct ProcessIdentity {
 };
 
 enum class Liveness : uint8_t {
-	kAlive = 0,         // pidfd live and starttime matches
-	kExited = 1,        // pidfd readable or pidfd_open ESRCH
-	kPidReused = 2,     // process alive but starttime differs
-	kUnverifiable = 3,  // fail closed
+	kAlive = 0,
+	kExited = 1,
+	kPidReused = 2,
+	kUnverifiable = 3,
 };
 
-// Parses field 22 (starttime) of /proc/<pid>/stat (U06). Returns an error on
-// ESRCH/malformed input; handles comm containing ')' and spaces.
 Result<uint64_t> proc_stat_starttime(int pid) noexcept;
 
-// FNV-1a based 128-bit hash of /proc/sys/kernel/random/boot_id.
 void current_boot_id_hash(uint64_t* hi, uint64_t* lo) noexcept;
 
 ProcessIdentity current_process_identity() noexcept;
 
-// pidfd one-shot probe cross-checked with /proc starttime (design §7.2).
-// Contradictions fail closed as kUnverifiable (C12).
 Liveness probe_liveness(uint64_t pid, uint64_t expected_start_ticks) noexcept;
 
 bool identity_matches_current(const ProcessIdentity& id) noexcept;
 
-// Long-lived pidfd for the v0.3 ProducerSupervisor (design §35.3): pidfd_open
-// once, FD_CLOEXEC, register with epoll; readable == the watched process
-// exited. This is the ONLY long-held pidfd in the library — the recovery
-// engine keeps using the one-shot probe_liveness above.
 class LivenessWatch {
        public:
+	// 长驻 pidfd 供 ProducerSupervisor 监听；普通恢复路径使用一次性探测。
 	static Result<LivenessWatch> open(uint64_t pid) noexcept;
 	int fd() const noexcept { return pidfd_.get(); }
-	// Hands the pidfd to the caller (e.g. for epoll registration under a
-	// different owner); this watch then owns nothing.
+
 	int release() noexcept { return pidfd_.release(); }
-	// Non-blocking readability probe (level-triggered: stays readable after the
-	// exit until the fd is closed — callers dedupe via their reaped flag).
+
 	bool exited() const noexcept;
 
 	LivenessWatch() = default;
@@ -65,6 +53,6 @@ class LivenessWatch {
 	UniqueFd pidfd_;
 };
 
-}  // namespace edge_runtime::detail
+}  // 命名空间 edge_runtime::detail
 
 #endif  // EDGE_RUNTIME_DETAIL_PROCESS_IDENTITY_HPP

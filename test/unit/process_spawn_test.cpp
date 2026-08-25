@@ -1,8 +1,4 @@
-// v0.3 §35.3 process_spawn unit tests: posix_spawn of a separate binary, stdout
-// capture with a non-blocking drain (a verbose child must never wedge the
-// supervisor), and exec-failure handling. The helper binary is the unit test
-// itself re-invoked with --spawn-child (a SEPARATE exec, never a shared
-// mapping — design §18.3).
+
 
 #include <gtest/gtest.h>
 
@@ -27,7 +23,6 @@ namespace {
 using edge_runtime::detail::SpawnedProcess;
 using edge_runtime::detail::spawn_process;
 
-// Child mode of THIS binary: prints `n` lines of `len` bytes each.
 int run_child_mode(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--check-sigmask") == 0) {
 		sigset_t current;
@@ -47,7 +42,6 @@ int run_child_mode(int argc, char** argv) {
 	return 0;
 }
 
-// Drain the non-blocking read end until EOF, with a poll deadline.
 std::string drain_with_deadline(const edge_runtime::detail::UniqueFd& read_end, int timeout_ms,
                                 bool* timed_out) {
 	std::string out;
@@ -67,7 +61,7 @@ std::string drain_with_deadline(const edge_runtime::detail::UniqueFd& read_end, 
 					out.append(buf, static_cast<size_t>(n));
 					continue;
 				}
-				if (n == 0) return out;  // EOF: child exited
+				if (n == 0) return out;
 				if (errno == EAGAIN || errno == EWOULDBLOCK) break;
 				if (errno == EINTR) continue;
 				return out;
@@ -99,13 +93,7 @@ TEST(ProcessSpawn, SpawnCaptureAndReap) {
 }
 
 TEST(ProcessSpawn, VerboseChildNeverBlocks) {
-	// ~200 KiB of output far exceeds the 64 KiB pipe buffer. The NONBLOCK
-	// write end makes writes beyond the buffer capacity drop instead of
-	// blocking, so the child completes promptly even when the parent drains
-	// lazily — a blocking write end would hang this exact scenario (the
-	// supervisor's false-stall-kill-loop failure mode, design §35.3). Dropped
-	// bytes are the documented tradeoff; the supervisor drains continuously
-	// so they only occur in the pathological overrun case.
+
 	const std::string self = "/proc/self/exe";
 	auto sp = spawn_process({self, "--spawn-child", "3000", "80"});
 	ASSERT_TRUE(sp) << edge_runtime::to_string(sp.error().code);
@@ -153,7 +141,7 @@ TEST(ProcessSpawn, EmptyArgvRejected) {
 	EXPECT_EQ(sp.error().code, edge_runtime::ErrorCode::kInvalidOptions);
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
 	const int child_rc = run_child_mode(argc, argv);

@@ -1,23 +1,4 @@
-// edge_shm_bench: the ER7 benchmark driver (design §21). Each run is one cell of
-// the §21.2 matrix (transport x mode x payload x rate x placement). The driver
-// FORKS+EXECs the separate helper binaries — edge_shm_bench_producer /
-// edge_shm_bench_consumer for ShmChannel, edge_shm_bench_sock for the Unix
-// domain socket baseline (§18.3: never an in-process thread) — under optional
-// taskset pinning, collects their one-line markers and wait4 rusage, then
-// writes evidence/performance/<run_id>/ per §21.4:
-//
-//   environment.txt  command.txt  samples.csv  summary.json
-//   perf_stat.txt    process_status.txt       RESULT.md
-//
-// Controlled transport pairs also produce LATENCY_COMPARISON.md. A latency
-// ratio is valid only for paced runs that fully deliver every sample without a
-// sequence gap or a receive overlapping the next publish.
-//
-// Sets: --smoke (CTest dev-loop gate), --evidence (the curated §21.1 Q1-Q6
-// answer set), --matrix (the full grid — long), --spec <csv> (one ad-hoc cell).
-// Every result is labeled VM_ONLY: this host's perf_event_paranoid=4 blocks
-// perf, so perf_stat.txt records the probe failure rather than fake numbers.
-
+// 基准驱动让独立生产者和消费者同时运行，记录吞吐、CPU 时间和每条样本的延迟。
 #include <sched.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -48,16 +29,13 @@ using edge_tool::arg_value;
 constexpr const char* kPerfEventParanoidPath = "/proc/sys/kernel/perf_event_paranoid";
 constexpr const char* kYamaPtraceScopePath = "/proc/sys/kernel/yama/ptrace_scope";
 
-// ---------------------------------------------------------------------------
-// RunSpec: one matrix cell.
-// ---------------------------------------------------------------------------
 struct RunSpec {
 	std::string id;
-	std::string transport;  // shm | socket
-	std::string mode;       // futex | poll | block
+	std::string transport;
+	std::string mode;
 	uint32_t payload = 64;
-	std::string placement;   // same | different | unpinned
-	std::string rate_label;  // max | 100 | 1k | 10k
+	std::string placement;
+	std::string rate_label;
 	uint64_t rate_hz = 0;
 	uint64_t samples = 1000000;
 	uint64_t max_time_ms = 60000;
@@ -90,9 +68,6 @@ struct ChildResult {
 	struct rusage ru {};
 };
 
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
 bool mkdirs(const std::string& path) {
 	std::string cur;
 	for (size_t i = 0; i < path.size(); ++i) {
@@ -124,10 +99,6 @@ struct ChildHandle {
 	bool valid() const { return pid > 0 && pipe_read >= 0; }
 };
 
-// fork + exec WITHOUT waiting (the benchmark pair must run concurrently: the
-// producer and consumer overlap in time, so the driver spawns both and only
-// then collects each). The helper processes write only small marker output, so
-// the pipe never fills between spawn and collect.
 ChildHandle spawn_child(const std::vector<std::string>& argv) {
 	int pipefd[2] = {-1, -1};
 	if (::pipe(pipefd) != 0) return {};
@@ -156,10 +127,6 @@ ChildHandle spawn_child(const std::vector<std::string>& argv) {
 	return {pid, pipefd[0], spawned};
 }
 
-// Read the child's stdout/stderr to EOF, then wait4 for rusage. Wall time is
-// measured from the spawn timestamp, NOT around wait4 — by the time the pipe
-// hits EOF the child has already exited, so a wait4-adjacent clock pair would
-// measure ~0 and produce a bogus throughput.
 ChildResult collect_child(ChildHandle h) {
 	ChildResult res;
 	if (!h.valid()) return res;
@@ -200,8 +167,6 @@ ChildResult collect_child(ChildHandle h) {
 	return res;
 }
 
-// Sequential convenience wrapper (git/perf probes, ctl cleanup): the child must
-// run to completion before the caller proceeds.
 ChildResult spawn_collect(const std::vector<std::string>& argv) {
 	return collect_child(spawn_child(argv));
 }
@@ -244,9 +209,6 @@ std::vector<std::string> split_words(const std::string& s) {
 	return out;
 }
 
-// ---------------------------------------------------------------------------
-// markers
-// ---------------------------------------------------------------------------
 struct ProducerMarkers {
 	uint64_t published = 0;
 	uint64_t cpu_us = 0;
@@ -300,9 +262,6 @@ ConsumerMarkers parse_consumer(const std::string& out) {
 	return m;
 }
 
-// ---------------------------------------------------------------------------
-// CSV + stats
-// ---------------------------------------------------------------------------
 struct RawSample {
 	uint64_t seq = 0;
 	uint64_t gen = 0;
@@ -437,9 +396,6 @@ std::string json_num(double v) {
 	return buf;
 }
 
-// ---------------------------------------------------------------------------
-// evidence writers
-// ---------------------------------------------------------------------------
 void write_environment(const Config& cfg, const RunSpec& spec, const std::string& dir) {
 	std::string s;
 	s += "generated_by=edge_shm_bench\n";
@@ -653,7 +609,6 @@ void write_result_md(const RunSpec& spec, const std::string& dir, const LatencyS
 	}
 }
 
-// Write the final samples.csv: header + raw rows + appended cpu columns.
 bool compose_samples_csv(const std::string& dir, const std::vector<RawSample>& rows,
                          uint64_t producer_cpu_us, uint64_t consumer_cpu_us) {
 	const std::string raw = dir + "/samples.raw.csv";
@@ -676,9 +631,6 @@ bool compose_samples_csv(const std::string& dir, const std::vector<RawSample>& r
 	return true;
 }
 
-// ---------------------------------------------------------------------------
-// runs
-// ---------------------------------------------------------------------------
 struct RunOutcome {
 	bool ok = false;
 	std::string fail_reason;
@@ -752,9 +704,6 @@ RunOutcome run_shm(const Config& cfg, const RunSpec& spec, size_t ordinal) {
 
 	write_command(spec, dir, pargv, cargv);
 
-	// Spawn both first, then collect: producer and consumer must overlap in time
-	// (the whole point of a latency measurement). Sequential spawn would let the
-	// producer finish — or block forever on accept — before the consumer exists.
 	const ChildHandle ph = spawn_child(pargv);
 	const ChildHandle ch = spawn_child(cargv);
 	ChildResult prod = collect_child(ph);
@@ -820,7 +769,6 @@ RunOutcome run_shm(const Config& cfg, const RunSpec& spec, size_t ordinal) {
 		write_result_md(spec, dir, st, prod, cons, pm.published, cm.reads, missed_total,
 		                comparison, false, reason);
 
-	// Best-effort forensic + cleanup (never fail the run on these).
 	if (!cfg.ctl_bin.empty()) {
 		const std::vector<std::string> insp = {cfg.ctl_bin, "inspect", chan};
 		const ChildResult ctlr = spawn_collect(insp);
@@ -888,9 +836,6 @@ RunOutcome run_socket(const Config& cfg, const RunSpec& spec) {
 
 	write_command(spec, dir, pargv, cargv);
 
-	// Spawn both first, then collect: producer and consumer must overlap in time
-	// (the whole point of a latency measurement). Sequential spawn would let the
-	// producer finish — or block forever on accept — before the consumer exists.
 	const ChildHandle ph = spawn_child(pargv);
 	const ChildHandle ch = spawn_child(cargv);
 	ChildResult prod = collect_child(ph);
@@ -958,9 +903,6 @@ RunOutcome run_one(const Config& cfg, const RunSpec& spec, size_t ordinal) {
 	return run_shm(cfg, spec, ordinal);
 }
 
-// ---------------------------------------------------------------------------
-// spec tables
-// ---------------------------------------------------------------------------
 RunSpec spec_of(std::string id, std::string transport, std::string mode, uint32_t payload,
                 std::string placement, std::string rate_label, uint64_t rate_hz, uint64_t samples,
                 uint64_t max_time_ms, uint64_t warmup, bool require_comparable = false) {
@@ -994,36 +936,34 @@ std::vector<RunSpec> smoke_specs() {
 
 std::vector<RunSpec> evidence_specs() {
 	return {
-	        // Q1/Q3: end-to-end latency distribution + memcpy scaling (shm, futex).
+
 	        spec_of("shm-futex-64B-same-max", "shm", "futex", 64, "same", "max", 0, 5000000,
 	                60000, 100000),
 	        spec_of("shm-futex-1KiB-same-max", "shm", "futex", 1024, "same", "max", 0, 2000000,
 	                60000, 50000),
 	        spec_of("shm-futex-64KiB-same-max", "shm", "futex", 65536, "same", "max", 0,
 	                1000000, 60000, 10000),
-	        // Q2: CPU cost of futex-wait vs bounded busy-poll (shm, max rate).
+
 	        spec_of("shm-poll-64B-same-max", "shm", "poll", 64, "same", "max", 0, 5000000,
 	                60000, 100000),
-	        // Q6: placement — same CPU vs different CPU vs unpinned.
+
 	        spec_of("shm-futex-64B-different-max", "shm", "futex", 64, "different", "max", 0,
 	                2000000, 60000, 50000),
 	        spec_of("shm-futex-64B-unpinned-max", "shm", "futex", 64, "unpinned", "max", 0,
 	                2000000, 60000, 50000),
 	        spec_of("shm-poll-64B-different-max", "shm", "poll", 64, "different", "max", 0,
 	                2000000, 60000, 50000),
-	        // Q4 throughput/backpressure baseline. Max-rate latency is not comparable
-	        // because SOCK_STREAM queues while ShmChannel overwrites old samples.
+
 	        spec_of("socket-64B-same-max", "socket", "block", 64, "same", "max", 0, 1000000,
 	                60000, 10000),
 	        spec_of("socket-1KiB-same-max", "socket", "block", 1024, "same", "max", 0, 1000000,
 	                60000, 10000),
 	        spec_of("socket-64KiB-same-max", "socket", "block", 65536, "same", "max", 0, 300000,
 	                60000, 5000),
-	        // Q5: slow consumer (bounded latency, observable gaps) at 10 kHz.
+
 	        spec_of("shm-futex-64B-same-10k", "shm", "futex", 64, "same", "10k", 10000, 1000000,
 	                60000, 0),
-	        // Controlled latency pair: producer waits for the SHM consumer; both
-	        // transports must deliver every sample before the next 100 Hz publish.
+
 	        spec_of("shm-futex-64B-same-100-controlled", "shm", "futex", 64, "same", "100", 100,
 	                1000, 15000, 100, true),
 	        spec_of("socket-64B-same-100-controlled", "socket", "block", 64, "same", "100", 100,
@@ -1116,7 +1056,7 @@ std::vector<RunSpec> matrix_specs() {
 	return out;
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
 	Config cfg;
@@ -1173,7 +1113,6 @@ int main(int argc, char** argv) {
 		return 2;
 	}
 
-	// git commit (evidence reproducibility).
 	const std::vector<std::string> git = {"git", "-C", cfg.git_dir, "rev-parse", "HEAD"};
 	const ChildResult gr = spawn_collect(git);
 	if (gr.exec_ok && gr.exit_code == 0) {
@@ -1190,7 +1129,6 @@ int main(int argc, char** argv) {
 	const ChildResult sr = spawn_collect(git_status);
 	if (sr.exec_ok && sr.exit_code == 0 && !sr.out.empty()) cfg.git_commit += " (dirty)";
 
-	// perf capability probe (VM_ONLY: paranoid=4 normally blocks it).
 	const std::vector<std::string> perf = {"perf", "stat", "-e",
 	                                       "cycles,instructions,cache-misses,context-switches,"
 	                                       "page-faults",
@@ -1207,7 +1145,7 @@ int main(int argc, char** argv) {
 	else if (want_matrix)
 		runs = matrix_specs();
 	if (only != nullptr) {
-		// --only is a comma-separated list of EXACT run ids (no substring match).
+
 		std::vector<std::string> want;
 		std::string cur;
 		for (const char* c = only;; ++c) {

@@ -30,8 +30,9 @@ void fnv_hash_bytes(const uint8_t* data, size_t size, uint64_t* h0, uint64_t* h1
 	if (h1 != nullptr) *h1 = b;
 }
 
-}  // namespace
+}
 
+// /proc/<pid>/stat 的启动 tick 用于区分同一 PID 先后承载的两个进程。
 Result<uint64_t> proc_stat_starttime(int pid) noexcept {
 	char path[64];
 	const int path_len = std::snprintf(path, sizeof(path), "/proc/%d/stat", pid);
@@ -60,8 +61,6 @@ Result<uint64_t> proc_stat_starttime(int pid) noexcept {
 	}
 	buf[static_cast<size_t>(n)] = '\0';
 
-	// comm is delimited by the LAST ')' in the line; fields after it are
-	// state(3), ppid(4), ... starttime(22).
 	char* close_paren = std::strrchr(buf, ')');
 	if (close_paren == nullptr) {
 		return make_error(ErrorCode::kRecoveryBlocked, "proc_stat_starttime",
@@ -69,7 +68,7 @@ Result<uint64_t> proc_stat_starttime(int pid) noexcept {
 	}
 	char* p = close_paren + 1;
 	if (*p == ' ') ++p;
-	// Skip fields 3..21 (19 fields) to reach field 22 (starttime).
+
 	for (int i = 0; i < 19; ++i) {
 		p = std::strchr(p, ' ');
 		if (p == nullptr) {
@@ -115,24 +114,23 @@ ProcessIdentity current_process_identity() noexcept {
 
 Liveness probe_liveness(uint64_t pid, uint64_t expected_start_ticks) noexcept {
 	if (pid == 0 || pid > static_cast<uint64_t>(INT32_MAX)) {
-		return Liveness::kExited;  // no owner registered / implausible pid
+		return Liveness::kExited;
 	}
 	const int pidfd = static_cast<int>(::syscall(SYS_pidfd_open, static_cast<pid_t>(pid), 0));
 	if (pidfd < 0) {
 		if (errno == ESRCH) return Liveness::kExited;
-		return Liveness::kUnverifiable;  // EPERM / hidepid: fail closed
+		return Liveness::kUnverifiable;
 	}
 	struct pollfd pfd {};
 	pfd.fd = pidfd;
 	pfd.events = POLLIN;
 	const int rc = ::poll(&pfd, 1, 0);
 	::close(pidfd);
-	if (rc > 0) return Liveness::kExited;  // pidfd readable => process exited
+	if (rc > 0) return Liveness::kExited;
 	if (rc < 0 && errno != EINTR) return Liveness::kUnverifiable;
 
-	// Process is alive; cross-check starttime for PID reuse (design §7.2).
 	auto start = proc_stat_starttime(static_cast<int>(pid));
-	if (!start) return Liveness::kUnverifiable;  // /proc unreadable => fail closed
+	if (!start) return Liveness::kUnverifiable;
 	if (start.value() == expected_start_ticks) return Liveness::kAlive;
 	return Liveness::kPidReused;
 }
@@ -159,8 +157,7 @@ Result<LivenessWatch> LivenessWatch::open(uint64_t pid) noexcept {
 		return make_errno_error(e, "LivenessWatch::open", std::strerror(e));
 	}
 	UniqueFd owned(pidfd);
-	// pidfd_open does not set CLOEXEC: without it, every respawned child would
-	// inherit the supervisor's pidfd (fd leak + self-watch).
+
 	const int flags = ::fcntl(pidfd, F_GETFD);
 	if (flags < 0 || ::fcntl(pidfd, F_SETFD, flags | FD_CLOEXEC) != 0) {
 		const int e = errno;
@@ -180,4 +177,4 @@ bool LivenessWatch::exited() const noexcept {
 	return rc > 0;
 }
 
-}  // namespace edge_runtime::detail
+}

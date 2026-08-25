@@ -11,14 +11,15 @@
 namespace edge_runtime::detail {
 
 namespace {
-inline constexpr size_t kBootstrapMagicLen = sizeof(kBootstrapMagic) - 1;   // 8
-inline constexpr size_t kHeaderMagicLen = sizeof(kChannelHeaderMagic) - 1;  // 8
-}  // namespace
+inline constexpr size_t kBootstrapMagicLen = sizeof(kBootstrapMagic) - 1;
+inline constexpr size_t kHeaderMagicLen = sizeof(kChannelHeaderMagic) - 1;
+}
 
+// 读取身份时必须前后两次观察相同的偶数 epoch，否则只能报告恢复阻塞。
 Result<ProcessIdentityAbi> identity_snapshot_read(ProcessIdentityAbi* abi) noexcept {
 	for (int attempt = 0; attempt < kIdentitySnapshotRetries; ++attempt) {
 		const uint64_t before = shared_load_acquire(&abi->role_epoch);
-		if ((before & 1u) != 0) continue;  // writer in progress
+		if ((before & 1u) != 0) continue;
 		ProcessIdentityAbi snap{};
 		snap.pid = shared_load_relaxed(&abi->pid);
 		snap.proc_start_ticks = shared_load_relaxed(&abi->proc_start_ticks);
@@ -45,15 +46,16 @@ Result<uint64_t> identity_snapshot_write(ProcessIdentityAbi* abi,
 		return make_error(ErrorCode::kRecoveryBlocked, "identity_snapshot_write",
 		                  "identity epoch exhausted");
 	}
-	shared_store_relaxed(&abi->role_epoch, cur + 1);  // odd: writer in progress
+	shared_store_relaxed(&abi->role_epoch, cur + 1);
 	shared_store_relaxed(&abi->pid, snap.pid);
 	shared_store_relaxed(&abi->proc_start_ticks, snap.proc_start_ticks);
 	shared_store_relaxed(&abi->boot_id_hash_hi, snap.boot_id_hash_hi);
 	shared_store_relaxed(&abi->boot_id_hash_lo, snap.boot_id_hash_lo);
-	shared_store_release(&abi->role_epoch, cur + 2);  // next even: valid snapshot
+	shared_store_release(&abi->role_epoch, cur + 2);
 	return Result<uint64_t>(cur + 2);
 }
 
+// 校验引导区和完整头部，把未完成创建、ABI 不匹配和 Schema 不匹配分开报告。
 uint64_t bootstrap_checksum_of(const BootstrapHeaderAbi& boot) noexcept {
 	BootstrapHeaderAbi tmp = boot;
 	tmp.init_state = 0;
@@ -67,8 +69,7 @@ Result<void> validate_bootstrap_parse(const BootstrapHeaderAbi& boot, uint64_t s
 		                  "bootstrap magic");
 	}
 	if (boot.abi_major != kAbiMajor || boot.abi_minor > kAbiMinorMax) {
-		// v0.2 §8.3: minor is accept-anything-<=kAbiMinorMax; minor 1 only ever
-		// means "optional heartbeat fields are meaningful" (pure addition).
+
 		return make_error(ErrorCode::kAbiMismatch, "validate_bootstrap_parse",
 		                  "bootstrap abi");
 	}
@@ -139,9 +140,7 @@ Result<void> validate_header_parse(const ChannelHeaderAbi& h, const SchemaDescri
 }
 
 Result<void> validate_header_shape(const ChannelHeaderAbi& h) noexcept {
-	// v0.3 §35.3: payload-agnostic observers validate the structural envelope
-	// only. Schema fingerprint / payload size / schema version are the
-	// consumer's job (validate_header_parse) and never the observer's.
+
 	if (std::memcmp(h.magic, kChannelHeaderMagic, kHeaderMagicLen) != 0) {
 		return make_error(ErrorCode::kCorruptHeader, "validate_header_shape",
 		                  "header magic");
@@ -218,7 +217,7 @@ Result<void> pread_full(int fd, void* buf, size_t size, uint64_t offset) noexcep
 			const int e = errno;
 			return make_errno_error(e, "pread_full", std::strerror(e));
 		}
-		if (n == 0) break;  // short read: caller treats as corruption/partial
+		if (n == 0) break;
 		got += static_cast<size_t>(n);
 	}
 	if (got != size) {
@@ -281,4 +280,4 @@ Result<ChannelStatus> read_channel_status(std::byte* base) noexcept {
 	return Result<ChannelStatus>(st);
 }
 
-}  // namespace edge_runtime::detail
+}

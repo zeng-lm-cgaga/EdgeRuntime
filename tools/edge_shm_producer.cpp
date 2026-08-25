@@ -1,16 +1,4 @@
-// edge_shm_producer: demo / integration / crash-matrix workhorse for the
-// producer side (design §9.1 + §11). Publishes a running counter as
-// TestPayloadV1 (or V2 with --schema testpayloadv2) into a channel and emits
-// stable one-line markers that test drivers parse:
-//
-//   READY                         channel created, publishing starts
-//   DONE published=<n> last_seq=<k>
-//   CREATE_FAIL code=<name>
-//   PUBLISH_FAIL code=<name> seq=<n>
-//
-// `--count 0` (default) publishes forever until SIGTERM/SIGINT, which triggers
-// the clean-shutdown destructor (§15.2).
-
+// 生产者工具创建通道并发布计数样本；输出的 READY、DONE 和失败标记供跨进程驱动解析。
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -35,20 +23,19 @@ void on_signal(int) { g_stop.store(true, std::memory_order_relaxed); }
 
 struct Args {
 	std::string name;
-	uint64_t count = 0;           // 0 = publish forever
-	uint64_t interval_us = 0;     // 0 = as fast as possible
-	uint64_t seq_start = 0;       // counter of the first sample
-	uint64_t sleep_first_us = 0;  // stay alive+idle this long before publishing (ER3 I13/I14)
-	bool no_publish = false;      // create channel, publish nothing, wait for signal (ER3 I14)
+	uint64_t count = 0;
+	uint64_t interval_us = 0;
+	uint64_t seq_start = 0;
+	uint64_t sleep_first_us = 0;
+	bool no_publish = false;
 	bool checksum = true;
 	bool use_v2 = false;
 	edge_runtime::Transport transport{edge_runtime::Transport::kPosixShm};
-	uint64_t heartbeat_interval_us = 0;  // v0.2: 0 = heartbeat disabled
-	bool heartbeat_only = false;         // v0.2: heartbeat loop, never publish (C18)
-	bool loaned = false;                 // v0.4: encode directly into a WriteLoan
+	uint64_t heartbeat_interval_us = 0;
+	bool heartbeat_only = false;
+	bool loaned = false;
 };
 
-// Publish one sample; returns the published sequence or 0 on failure.
 template <typename ProducerT>
 uint64_t publish_one(ProducerT& producer, uint64_t counter, bool loaned) {
 	using ValueT = typename ProducerT::value_type;
@@ -99,9 +86,6 @@ int run_publish(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 	uint64_t counter = a.seq_start;
 	uint64_t last_seq = 0;
 
-	// ER3 I13/I14: the producer stays alive but publishes nothing for the window,
-	// so a consumer's wait_latest times out with the producer ONLINE+alive
-	// (-> DataStale) rather than being woken by a sample.
 	if (a.sleep_first_us > 0) {
 		const uint64_t step = std::min<uint64_t>(a.sleep_first_us, 250000);
 		uint64_t slept = 0;
@@ -112,15 +96,12 @@ int run_publish(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 	}
 
 	if (a.no_publish) {
-		// Create-only mode (I14): hold the channel open and publish nothing. Only a
-		// signal ends this, so the clean-shutdown destructor (§15.2) marks
-		// producer_state OFFLINE and the consumer's wait classifies ProducerOffline.
+
 		while (!g_stop.load(std::memory_order_relaxed)) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(100));
 		}
 	} else if (a.heartbeat_only) {
-		// v0.2 C18: heartbeat loop with no publishes. The application-level loop
-		// is "healthy" while this runs; SIGSTOP at the C18 failpoint freezes it.
+
 		const uint64_t step = std::min<uint64_t>(a.heartbeat_interval_us, 50000);
 		while (!g_stop.load(std::memory_order_relaxed)) {
 			(void)producer.value().heartbeat();
@@ -146,14 +127,14 @@ int run_publish(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 			}
 			++counter;
 		}
-	}  // else: normal publish loop
+	}
 
 	std::printf("DONE published=%" PRIu64 " last_seq=%" PRIu64 "\n", published, last_seq);
 	std::fflush(stdout);
 	return 0;
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
 	Args a;

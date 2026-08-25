@@ -4,6 +4,7 @@
 
 namespace edge_runtime {
 
+// WriteLoan 的析构路径必须撤销未提交槽，避免异常或提前返回留下 WRITING 状态。
 WriteLoan::WriteLoan(std::shared_ptr<detail::ProducerHandle> handle, void* slot, std::byte* data,
                      uint32_t size, uint32_t slot_index, uint64_t sequence) noexcept
     : handle_(std::move(handle)),
@@ -96,6 +97,7 @@ ReadLoan& ReadLoan::operator=(ReadLoan&& other) noexcept {
 
 ReadLoan::~ReadLoan() { release(); }
 
+// ReadLoan 释放后消费者状态回到 PUBLISHED，Producer 才能再次复用该槽。
 void ReadLoan::release() noexcept { detail::consumer_release_loan_impl(this); }
 
-}  // namespace edge_runtime
+}

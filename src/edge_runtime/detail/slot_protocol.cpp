@@ -2,15 +2,16 @@
 
 namespace edge_runtime::detail {
 
+// 序号耗尽时拒绝发布，不能回绕到零；最新值语义允许丢样本但不能读到半写槽。
 bool checked_next_sequence(uint64_t current_ticket, uint64_t* out) noexcept {
 	const uint64_t current_seq = ticket_sequence(current_ticket);
-	if (current_seq >= kMaxSampleSequence) return false;  // no wrap to 0
+	if (current_seq >= kMaxSampleSequence) return false;
 	*out = current_seq + 1;
 	return true;
 }
 
 uint64_t saturated_gap(uint64_t last_sequence, uint64_t current_sequence) noexcept {
-	if (current_sequence <= last_sequence) return 0;  // defensive: same/older
+	if (current_sequence <= last_sequence) return 0;
 	return current_sequence - last_sequence - 1;
 }
 
@@ -24,8 +25,7 @@ void slot_publish(SlotHeaderAbi* slot) noexcept {
 }
 
 void slot_abort_write(SlotHeaderAbi* slot) noexcept {
-	// A failed write never leaves metadata/payload readable as PUBLISHED; FREE
-	// lets the producer reclaim the slot wholesale (design §11.3).
+
 	shared_store_relaxed(&slot->state, static_cast<uint32_t>(SlotState::kFree));
 }
 
@@ -44,4 +44,4 @@ void slot_release_read(SlotHeaderAbi* slot) noexcept {
 	shared_store_release(&slot->state, static_cast<uint32_t>(SlotState::kPublished));
 }
 
-}  // namespace edge_runtime::detail
+}

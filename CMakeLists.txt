@@ -1,3 +1,4 @@
+# EdgeRuntime 是面向 Linux 的单生产者单消费者最新值共享内存运行库。
 cmake_minimum_required(VERSION 3.22)
 
 project(
@@ -15,9 +16,6 @@ find_package(Threads REQUIRED)
 option(EDGERUNTIME_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(EDGERUNTIME_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
-# Compile-time failpoints (design §22 / crash matrix C01-C23). Default ON for
-# Debug builds so the fault-injection toolchain is exercisable; OFF for Release
-# so production binaries carry zero failpoint cost.
 set(_edgeruntime_failpoints_default OFF)
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   set(_edgeruntime_failpoints_default ON)
@@ -34,9 +32,6 @@ else()
   message(FATAL_ERROR "EdgeRuntime currently supports GCC or Clang on Linux only")
 endif()
 
-# First-party flags applied PRIVATE to every target in this repo (library,
-# tools, tests). Deliberately not an INTERFACE target: build-time options must
-# never leak into the installed/exported package.
 function(edgeruntime_apply_project_options target)
   target_compile_options(${target} PRIVATE ${EDGERUNTIME_PRIVATE_COMPILE_OPTIONS})
   if(EDGERUNTIME_ENABLE_SANITIZERS)
@@ -50,14 +45,6 @@ function(edgeruntime_apply_project_options target)
   endif()
 endfunction()
 
-# ---------------------------------------------------------------------------
-# edge_runtime: STATIC. Headers are classified by kind: every .hpp lives under
-# include/ (public API at include/edge_runtime/, internal "detail" headers at
-# include/edge_runtime/detail/); every .cpp lives under src/edge_runtime/detail/.
-# Internal headers are referenced with the same "edge_runtime/detail/..." prefix
-# and are excluded from the installed package. Every consumer declares its own
-# warnings flags and links rt.
-# ---------------------------------------------------------------------------
 add_library(edge_runtime STATIC
   src/edge_runtime/detail/error.cpp
   src/edge_runtime/detail/channel_abi.cpp
@@ -98,8 +85,6 @@ install(
   TARGETS edge_runtime
   EXPORT EdgeRuntimeTargets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
-# Internal "detail" headers are intentionally NOT installed: include/edge_runtime/detail/
-# exists so the build tree classifies headers by kind, but it is not part of the public ABI.
 install(
   DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
   FILES_MATCHING

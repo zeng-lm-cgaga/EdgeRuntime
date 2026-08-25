@@ -22,8 +22,9 @@ namespace {
 
 inline constexpr int kEpollMaxEvents = 8;
 inline constexpr uint64_t kStdoutTailLimit = 4096;
-inline constexpr uint64_t kAwaitReadySliceNs = 100'000'000;  // 100 ms open retry slice
+inline constexpr uint64_t kAwaitReadySliceNs = 100'000'000;
 
+// epoll 等待时间统一限制在 int 毫秒范围内，避免纳秒到毫秒转换溢出。
 bool valid_milliseconds(int64_t ms, bool allow_zero) noexcept {
 	if (ms < 0 || (!allow_zero && ms == 0)) return false;
 	return static_cast<uint64_t>(ms) <= UINT64_MAX / 1'000'000ull;
@@ -33,8 +34,6 @@ uint64_t ms_to_ns(int64_t ms) noexcept {
 	return ms > 0 ? static_cast<uint64_t>(ms) * 1'000'000ull : 0;
 }
 
-// epoll_wait timeout in int milliseconds, clamped (design §35.3 deadline
-// slicing — all waits go through epoll so request_stop stays responsive).
 int ns_to_epoll_ms(uint64_t ns) {
 	if (ns == 0) return 0;
 	uint64_t ms = ns / 1'000'000ull;
@@ -65,9 +64,6 @@ void append_stdout_tail(std::string* tail, const char* data, size_t size) {
 	tail->append(data, size);
 }
 
-// Drain the child's non-blocking stdout pipe into the bounded tail buffer
-// (design §35.3: a full pipe would freeze the child -> false stall -> kill
-// loop, so the read end is ALWAYS drained here).
 void drain_child_stdout(SupervisorHandle& h) {
 	if (h.child.stdout_read.get() < 0) return;
 	char buf[4096];
@@ -78,7 +74,7 @@ void drain_child_stdout(SupervisorHandle& h) {
 			continue;
 		}
 		if (n == 0) {
-			h.child.stdout_read.reset();  // EOF; the pidfd decides death
+			h.child.stdout_read.reset();
 			return;
 		}
 		if (errno == EAGAIN || errno == EWOULDBLOCK) return;
@@ -88,8 +84,6 @@ void drain_child_stdout(SupervisorHandle& h) {
 	}
 }
 
-// Reap the child once; idempotent. Returns true when the child is known dead
-// (either just reaped now or already reaped earlier).
 Result<bool> reap_child(SupervisorHandle& h, int* status_out) noexcept {
 	if (h.child.pid <= 0) return Result<bool>(true);
 	if (h.child_reaped) {
@@ -104,7 +98,7 @@ Result<bool> reap_child(SupervisorHandle& h, int* status_out) noexcept {
 	if (rc == h.child.pid) {
 		h.child_reaped = true;
 		h.last_exit_status_for_reap = status;
-		h.child_pidfd.reset();  // closes the pidfd; epoll auto-drops it
+		h.child_pidfd.reset();
 		*status_out = status;
 		return Result<bool>(true);
 	}
@@ -141,6 +135,7 @@ Result<void> arm_child_kill(SupervisorHandle& h) noexcept {
 	return Result<void>::ok();
 }
 
+// 只有子进程主动成功退出或收到停止信号才算干净退出，其他退出都进入重启计数。
 bool is_clean_exit_status(int status) {
 	if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return true;
 	if (WIFSIGNALED(status)) {
@@ -150,12 +145,12 @@ bool is_clean_exit_status(int status) {
 	return false;
 }
 
-// Backoff delay for the next restart (design §35.4), integer-only math.
+// 重启退避采用整数计算并封顶，防止故障子进程快速占满系统资源。
 uint64_t backoff_delay_ns(const SupervisorHandle& h) {
 	uint64_t delay = ms_to_ns(h.options.initial_delay.count());
 	uint64_t capped = ms_to_ns(h.options.max_delay.count());
 	if (capped == 0) capped = delay;
-	// attempt 1 uses initial_delay; each subsequent armed restart multiplies.
+
 	for (uint32_t i = 1; i < h.consecutive_failures && delay < capped; ++i) {
 		if (delay > capped / h.options.multiplier) {
 			delay = capped;
@@ -167,13 +162,11 @@ uint64_t backoff_delay_ns(const SupervisorHandle& h) {
 	return delay;
 }
 
-// Arm one restart after a failure. max_restarts counts actual retries after
-// the initial spawn, so exhaustion is checked before increment/event emission.
 bool count_failure(SupervisorHandle& h) {
 	const uint64_t now = monotonic_now_ns();
 	if (now != 0 && h.last_spawn_mono_ns != 0 && now >= h.last_spawn_mono_ns &&
 	    now - h.last_spawn_mono_ns >= ms_to_ns(h.options.stable_reset_window.count())) {
-		h.consecutive_failures = 0;  // long-stable child: reset the window
+		h.consecutive_failures = 0;
 	}
 	if (h.consecutive_failures >= h.options.max_restarts) return true;
 	++h.consecutive_failures;
@@ -198,11 +191,11 @@ void emit_event(const SupervisorHandle& h, SupervisorEvent event, uint64_t pid,
 	h.options.on_event(info, h.options.event_user_data);
 }
 
-}  // namespace
+}
 
 Result<std::shared_ptr<SupervisorHandle>> supervisor_create_impl(
         const SupervisorOptions& options) {
-	// §35.5 option validation: fail on any impossible configuration.
+
 	if (options.channel_name.empty() ||
 	    options.channel_name.size() > kMaxChannelNameLen ||
 	    !validate_channel_name(options.channel_name.c_str(), options.channel_name.size())) {
@@ -240,13 +233,13 @@ Result<std::shared_ptr<SupervisorHandle>> supervisor_create_impl(
 	return Result<std::shared_ptr<SupervisorHandle>>(std::move(h));
 }
 
+// 监督循环按启动、等待 READY、运行观察、终止和重启阶段推进，所有阻塞点集中在 epoll。
 Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>& h) noexcept {
 	if (h->running.exchange(true, std::memory_order_acq_rel)) {
 		return make_error(ErrorCode::kConcurrentHandleUse, "ProducerSupervisor::run",
 		                  "already running");
 	}
 
-	// ---- epoll / eventfd / signalfd setup --------------------------------------
 	const int epfd = ::epoll_create1(EPOLL_CLOEXEC);
 	if (epfd < 0) {
 		const int e = errno;
@@ -275,8 +268,6 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 		return add_stop.error();
 	}
 
-	// Block SIGTERM/SIGINT in THIS thread and receive them via signalfd
-	// (design §35.3). The previous mask is restored when run() returns.
 	sigset_t mask, old_mask;
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGTERM);
@@ -320,9 +311,6 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 	SupervisionResult result;
 	result.outcome = SupervisionOutcome::kStopped;
 
-	// Phase state machine (design §35.4). All blocking happens in epoll_wait
-	// with the phase-appropriate slice; grace/backoff deadlines are checked at
-	// the top of every iteration.
 	enum class Phase : uint8_t { kBackoff, kSpawn, kAwaitReady, kMonitor, kKill, kDone };
 	Phase phase = Phase::kSpawn;
 	bool kill_then_restart = false;
@@ -361,15 +349,14 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 				break;
 			}
 			case Phase::kSpawn: {
-				// Rebuild the observer view per instance (design §35.3): an old
-				// mapping/broker-fd can never see the replacement instance.
+
 				h->view = ChannelObserverView{};
 				h->have_view = false;
 				h->stdout_tail.clear();
 				++h->spawn_attempts;
 				auto sp = spawn_process(h->options.producer_argv);
 				if (!sp) {
-					// A posix_spawn failure is still a consumed spawn attempt.
+
 					if (count_failure(*h)) {
 						result.outcome = SupervisionOutcome::kRestartsExhausted;
 						phase = Phase::kDone;
@@ -448,8 +435,8 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 				break;
 			}
 			case Phase::kAwaitReady: {
-				// One-shot readonly open per slice (retry budget 0). Success must
-				// be OUR child's confirmed READY instance at baseline_generation+1.
+				// 子进程只有在通道 READY 且 Producer 身份匹配时才算启动成功。
+
 				auto view = open_channel_readonly(h->options.channel_name,
 				                                  h->options.transport, 0);
 				if (view) {
@@ -478,12 +465,10 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 							}
 						}
 					}
-					// Opened but not (yet) ours / not the expected generation:
-					// keep waiting within create_timeout.
+
 				}
 				if (h->child_reaped) {
-					// Died before ever confirming READY: a failure (event-time
-					// decision, design §35.4 — never re-classified by exit code).
+
 					if (count_failure(*h)) {
 						result.outcome = SupervisionOutcome::kRestartsExhausted;
 						phase = Phase::kDone;
@@ -493,16 +478,16 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 					break;
 				}
 				if (monotonic_now_ns() >= create_deadline) {
-					// Never became ready in time: kill, then count as failure.
-					// (The grace deadline is armed inside the kill phase.)
+
 					kill_then_restart = true;
 					phase = Phase::kKill;
 				}
 				break;
 			}
 			case Phase::kMonitor: {
+				// 心跳停滞只在观察窗口内升级为终止和重启，不以普通数据空闲代替停滞。
 				if (h->child_reaped) {
-					// The pidfd event armed the decision; act on it.
+
 					if (h->reap_decision == SupervisorHandle::ReapDecision::kCleanExit) {
 						result.outcome = SupervisionOutcome::kCleanExit;
 						result.last_child_exit_status = h->last_exit_status_for_reap;
@@ -517,7 +502,7 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 					enter_backoff();
 					break;
 				}
-				// Stall check (only when we own a confirmed view, §35.3).
+
 				if (h->have_view) {
 					auto* header = observer_header(h->view);
 					const StallClass sc =
@@ -525,9 +510,7 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 					                       static_cast<uint64_t>(h->child.pid),
 					                       h->child_start_ticks);
 					if (sc == StallClass::kStalled) {
-						// Event-time decision: this death is a RESTART no matter
-						// how the child exits after our SIGTERM (design §35.4).
-						// (The grace deadline is armed inside the kill phase.)
+
 						h->reap_decision = SupervisorHandle::ReapDecision::kRestart;
 						kill_then_restart = true;
 						emit_event(*h, SupervisorEvent::kStallDetected,
@@ -538,10 +521,7 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 				break;
 			}
 			case Phase::kKill: {
-				// Kill sequence (stop / signal / create-timeout / stall):
-				// SIGTERM -> grace -> SIGKILL -> reap -> decide. The grace
-				// deadline is armed HERE, together with the first signal —
-				// a stale deadline would SIGKILL instantly.
+
 				if (h->child.pid > 0 && !h->child_reaped) {
 					if (!h->child_kill_in_progress) {
 						auto armed = arm_child_kill(*h);
@@ -568,8 +548,7 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 						}
 						emit_event(*h, SupervisorEvent::kKilled,
 						           static_cast<uint64_t>(h->child.pid), 0, SIGKILL);
-						// Keep the kill sequence armed but move its deadline out of reach;
-						// otherwise the next loop would start a second SIGTERM grace window.
+
 						grace_deadline = UINT64_MAX;
 					}
 				}
@@ -603,7 +582,6 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 
 		if (phase == Phase::kDone) break;
 
-		// ---- epoll wait with the phase-appropriate slice -----------------------
 		uint64_t slice = ms_to_ns(h->options.watch_interval.count());
 		if (phase == Phase::kAwaitReady) {
 			slice = kAwaitReadySliceNs;
@@ -633,18 +611,17 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 			if (fd == h->stop_evfd.get()) {
 				uint64_t counter = 0;
 				const ssize_t drain_rc = ::read(fd, &counter, sizeof(counter));
-				(void)drain_rc;  // drain; EAGAIN means "already set"
+				(void)drain_rc;
 				kill_then_restart = false;
 				phase = Phase::kKill;
 			} else if (fd == h->signalfd_fd.get()) {
 				struct signalfd_siginfo si {};
 				const ssize_t drain_rc = ::read(fd, &si, sizeof(si));
-				(void)drain_rc;  // drain; SIGTERM/SIGINT both stop
+				(void)drain_rc;
 				kill_then_restart = false;
 				phase = Phase::kKill;
 			} else if (h->child_pidfd.get() >= 0 && fd == h->child_pidfd.get()) {
-				// Child exit observed: reap once, decide by the flag armed at
-				// event time (never re-classify by exit status here, §35.4).
+
 				int status = 0;
 				auto reaped = reap_child(*h, &status);
 				if (!reaped) {
@@ -659,8 +636,7 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 					                           ? SupervisorHandle::ReapDecision::kCleanExit
 					                           : SupervisorHandle::ReapDecision::kRestart;
 				}
-				// In a kill sequence the decision was already armed; the phases
-				// react to child_reaped on their next iteration.
+
 			} else if (h->child.stdout_read.get() >= 0 &&
 			           fd == h->child.stdout_read.get()) {
 				drain_child_stdout(*h);
@@ -668,7 +644,6 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 		}
 	}
 
-	// ---- teardown: reap whatever remains, restore the signal mask --------------
 	if (h->child.pid > 0 && !h->child_reaped) {
 		bool may_reap = true;
 		if (::kill(h->child.pid, SIGKILL) != 0 && errno != ESRCH) {
@@ -714,18 +689,19 @@ Result<SupervisionResult> supervisor_run(const std::shared_ptr<SupervisorHandle>
 	return Result<SupervisionResult>(std::move(result));
 }
 
+// request_stop 通过 eventfd 唤醒 epoll，让 run() 在线程内完成收尾。
 void supervisor_request_stop(const std::shared_ptr<SupervisorHandle>& h) noexcept {
 	h->stop_requested.store(true, std::memory_order_release);
 	std::lock_guard<std::mutex> lock(h->stop_fd_mutex);
 	if (h->stop_evfd.get() >= 0) {
 		const uint64_t one = 1;
 		const ssize_t wr = ::write(h->stop_evfd.get(), &one, sizeof(one));
-		(void)wr;  // EAGAIN means the counter is already nonzero: stop armed
+		(void)wr;
 	}
 }
 
 void supervisor_handle_shutdown(const std::shared_ptr<SupervisorHandle>& h) noexcept {
-	// Destructor path: never leave an unreaped child (design §35.4).
+
 	h->stop_requested.store(true, std::memory_order_release);
 	{
 		std::lock_guard<std::mutex> lock(h->stop_fd_mutex);
@@ -746,7 +722,7 @@ void supervisor_handle_shutdown(const std::shared_ptr<SupervisorHandle>& h) noex
 	}
 }
 
-}  // namespace edge_runtime::detail
+}
 
 namespace edge_runtime {
 
@@ -771,4 +747,4 @@ ProducerSupervisor::~ProducerSupervisor() {
 	if (handle_) detail::supervisor_handle_shutdown(handle_);
 }
 
-}  // namespace edge_runtime
+}

@@ -1,11 +1,4 @@
-// consume_demo: the minimal downstream consumer for the INSTALLED EdgeRuntime
-// package. It mirrors what an application does: include only public headers
-// (detail/ is deliberately NOT installed), supply its own PayloadCodec<T>, and
-// run one create -> write loan -> open -> read loan round trip.
-//
-// Compile-and-run is validated by the release-audit CI gate and the local
-// scripts/ci.sh (evidence: er8_install_consume.txt).
-
+// 最小下游示例只使用已安装公共头，演示创建、借用写槽、打开和借用读槽的闭环。
 #include <array>
 #include <cinttypes>
 #include <cstdint>
@@ -20,15 +13,13 @@
 
 namespace {
 
-// The library never touches T; the caller's codec defines the canonical bytes
-// (design §16.1). This demo uses a host-endian struct, exactly what a real
-// same-machine application would do.
+// 库不解释业务类型，调用方的 PayloadCodec 负责定义规范编码字节。
 struct Point {
 	int32_t x;
 	int32_t y;
 };
 
-}  // namespace
+}
 
 template <>
 struct edge_runtime::PayloadCodec<Point> {

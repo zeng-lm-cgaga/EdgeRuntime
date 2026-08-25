@@ -1,20 +1,4 @@
-// edge_shm_bench_consumer: the ShmChannel consumer side of the ER7 benchmark
-// (design §21). Opens the channel, reads latest samples in --mode futex
-// (wait_latest) or poll (bounded busy poll), samples a CLOCK_MONOTONIC_RAW
-// receive_ns immediately after each read, and writes one raw row per sample to
-// --csv (7 of the 9 design columns; the bench driver appends the aggregate CPU
-// columns and writes the header):
-//
-//   sequence,generation,payload_bytes,publish_ns,receive_ns,latency_ns,missed_samples
-//
-// The run ends at --max-samples, --max-time-ms, or after --idle-ms without a
-// new sample (producer finished). A checksum/decode failure surfaces through the
-// public API as kPayloadCorrupt/kPayloadDecodeFailed and is counted as torn —
-// the benchmark FAILS (exit 4) on any torn read, never ships one as data.
-//
-//   READY / SUMMARY reads=<n> torn=<n> missed_total=<n> last_seq=<n>
-//          elapsed_ms=<n> cpu_us=<n> ended=<samples|time|idle> / OPEN_FAIL / READ_ERROR
-
+// 基准消费者可使用 futex 或有限轮询读取，并将原始延迟数据写入 CSV。
 #include <sched.h>
 
 #include <cinttypes>
@@ -42,11 +26,11 @@ using edge_tool::monotonic_raw_now_ns;
 struct Args {
 	std::string name;
 	uint32_t payload = 64;
-	bool use_wait = true;  // true = futex wait, false = bounded busy poll
+	bool use_wait = true;
 	std::string csv_path;
 	uint64_t max_samples = 1000000;
 	uint64_t max_time_ms = 60000;
-	uint64_t idle_ms = 1500;  // no new sample for this long -> producer done
+	uint64_t idle_ms = 1500;
 	uint64_t poll_bound = 1024;
 	uint64_t open_retry_ms = 10000;
 	bool checksum = true;
@@ -71,7 +55,7 @@ int run_consume_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 		while (!consumer && edge_tool::monotonic_ms_now() < deadline_ms) {
 			struct timespec ts {};
 			ts.tv_sec = 0;
-			ts.tv_nsec = 10 * 1000000L;  // 10 ms
+			ts.tv_nsec = 10 * 1000000L;
 			::nanosleep(&ts, nullptr);
 			consumer = open_one();
 		}
@@ -100,8 +84,8 @@ int run_consume_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 	uint64_t torn = 0;
 	uint64_t missed_total = 0;
 	uint64_t last_seq = 0;
-	uint64_t last_sample_raw = 0;  // raw ns of the last successful read
-	uint64_t empty_polls = 0;      // poll mode: consecutive empty reads (reset on success)
+	uint64_t last_sample_raw = 0;
+	uint64_t empty_polls = 0;
 	const char* ended = "time";
 
 	auto write_row = [&](const edge_runtime::Sample<bench::BenchPayloadV1<N>>& s,
@@ -134,12 +118,12 @@ int run_consume_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 			const edge_runtime::ErrorCode ec = snap.error().code;
 			if (ec == edge_runtime::ErrorCode::kNoNewSample ||
 			    ec == edge_runtime::ErrorCode::kReadContention) {
-				// consumed inside the wait loop; keep looping
+
 			} else if (ec == edge_runtime::ErrorCode::kDataStale ||
 			           ec == edge_runtime::ErrorCode::kProducerOffline ||
 			           ec == edge_runtime::ErrorCode::kRecoveryBlocked) {
-				ended = "idle";  // producer finished (or is gone): nothing more to
-				                 // read
+				ended = "idle";
+
 				break;
 			} else if (ec == edge_runtime::ErrorCode::kPayloadCorrupt ||
 			           ec == edge_runtime::ErrorCode::kPayloadDecodeFailed) {
@@ -171,9 +155,7 @@ int run_consume_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 			const edge_runtime::ErrorCode ec = snap.error().code;
 			if (ec == edge_runtime::ErrorCode::kNoNewSample ||
 			    ec == edge_runtime::ErrorCode::kReadContention) {
-				// Consecutive empty polls accumulate across iterations; the yield
-				// only fires after poll_bound empties so a same-CPU producer gets
-				// a scheduling slice instead of being starved by a tight spin.
+
 				if (++empty_polls >= a.poll_bound) {
 					::sched_yield();
 					empty_polls = 0;
@@ -214,7 +196,7 @@ int run_consume_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 	return torn > 0 ? 4 : 0;
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
 	const char* name = edge_tool::arg_value(argc, argv, "--name");

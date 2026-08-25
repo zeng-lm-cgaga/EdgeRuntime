@@ -1,7 +1,4 @@
-// v0.3 §35.3 channel observer unit tests: open_channel_readonly over both
-// transports, retry/refusal behavior, classify_stall branches, and the
-// zero-write (PROT_READ) guarantee. The READY channel fixtures come from an
-// in-process Producer handle (the observer itself never creates anything).
+
 
 #include <gtest/gtest.h>
 
@@ -70,9 +67,7 @@ TEST(ChannelObserver, AbsentChannelTimesOut) {
 }
 
 TEST(ChannelObserver, ClassifyStallBranches) {
-	// The observer view is PROT_READ — all header mutations in this test go
-	// through the PRODUCER's own writable mapping (heartbeat()/publish()),
-	// which the observer's MAP_SHARED view of the same object observes.
+
 	const std::string name = unique_channel_name("obs4");
 	ChannelOptions opts;
 	opts.name = name;
@@ -88,24 +83,21 @@ TEST(ChannelObserver, ClassifyStallBranches) {
 	const uint64_t pid = pid_abi.value().pid;
 	const uint64_t start = pid_abi.value().proc_start_ticks;
 
-	// Identity mismatch: never kill someone else's channel.
 	EXPECT_EQ(classify_stall(header, edge_runtime::detail::boottime_now_ns(), pid + 1, start),
 	          StallClass::kIdentityMismatch);
-	// Fresh beat: heartbeat() just stored BOOTTIME, no stall at ~now.
+
 	ASSERT_TRUE(p.value().heartbeat());
 	const uint64_t now = edge_runtime::detail::boottime_now_ns();
 	EXPECT_EQ(classify_stall(header, now, pid, start), StallClass::kFresh);
-	// Stale beat beyond 3x the interval (simulated clock advance): stalled.
+
 	const uint64_t stale_now = now + 4 * ns_from_ms(100);
 	EXPECT_EQ(classify_stall(header, stale_now, pid, start), StallClass::kStalled);
-	// Stale beat + fresh publish -> rule 2 wins (data advancing beats a stale
-	// heartbeat). Real time must actually pass 3x the interval so the beat is
-	// stale while the new publish is fresh.
+
 	std::this_thread::sleep_for(std::chrono::milliseconds(350));
 	ASSERT_TRUE(p.value().publish(TestPayloadV1{0x5A000001u, 1, 0}));
 	const uint64_t now2 = edge_runtime::detail::boottime_now_ns();
 	EXPECT_EQ(classify_stall(header, now2, pid, start), StallClass::kFresh);
-	// A future observation in shared memory must not underflow into a false stall.
+
 	EXPECT_EQ(classify_stall(header, 1, pid, start), StallClass::kFresh);
 }
 
@@ -118,7 +110,7 @@ TEST(ChannelObserver, RetryTimeoutOverflowRejected) {
 TEST(ChannelObserver, HeartbeatDisabledNotApplicable) {
 	const std::string name = unique_channel_name("obs5");
 	ChannelOptions opts;
-	opts.name = name;  // heartbeat_interval defaults to 0 (disabled)
+	opts.name = name;
 	auto p = Producer<TestPayloadV1>::create(opts, TestPayloadV1Schema());
 	ASSERT_TRUE(p);
 	auto view = open_channel_readonly(name, Transport::kPosixShm, 100);
@@ -131,4 +123,4 @@ TEST(ChannelObserver, HeartbeatDisabledNotApplicable) {
 	          StallClass::kNotApplicable);
 }
 
-}  // namespace
+}

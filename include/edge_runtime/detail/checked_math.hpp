@@ -5,6 +5,7 @@
 
 namespace edge_runtime::detail {
 
+// 地址和映射大小计算统一使用溢出检查，失败时由调用方拒绝创建或访问。
 constexpr bool checked_add_u64(uint64_t a, uint64_t b, uint64_t* out) noexcept {
 	if (b > UINT64_MAX - a) return false;
 	*out = a + b;
@@ -22,14 +23,10 @@ constexpr uint64_t saturating_mul_u64(uint64_t a, uint64_t b) noexcept {
 	return checked_mul_u64(a, b, &out) ? out : UINT64_MAX;
 }
 
-// A future timestamp is not classified as stale. This fails closed when a
-// clock source or shared field moves backwards instead of wrapping subtraction.
 constexpr bool elapsed_exceeds(uint64_t now, uint64_t then, uint64_t limit) noexcept {
 	return now >= then && now - then > limit;
 }
 
-// Rounds v up to the next multiple of align (align must be nonzero). Used to
-// keep every slot on a 64-byte boundary (design §8.1).
 constexpr bool round_up_to_multiple_u64(uint64_t v, uint64_t align, uint64_t* out) noexcept {
 	if (align == 0) return false;
 	const uint64_t rem = v % align;
@@ -43,6 +40,6 @@ constexpr bool round_up_to_multiple_u64(uint64_t v, uint64_t align, uint64_t* ou
 	return true;
 }
 
-}  // namespace edge_runtime::detail
+}  // 命名空间 edge_runtime::detail
 
 #endif  // EDGE_RUNTIME_DETAIL_CHECKED_MATH_HPP

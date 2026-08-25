@@ -212,4 +212,4 @@ TEST(Loan, HandleMoveAssignmentRetiresPreviousEndpoint) {
 	EXPECT_TRUE(fourth.value().remove_if_owner());
 }
 
-}  // namespace
+}

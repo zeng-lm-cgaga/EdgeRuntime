@@ -1,8 +1,4 @@
-// ER2 integration driver: pattern/publish-read tests (I02–I08, I17). Every
-// cross-process case fork+execs the SEPARATE edge_shm_producer / edge_shm_consumer
-// tool binaries (design §18.3); the tools publish a running counter and verify
-// the pattern contract counter == sequence-1 on every read, so torn reads are
-// observable as a nonzero torn count in the consumer's SUMMARY line.
+
 
 #include <gtest/gtest.h>
 
@@ -42,7 +38,6 @@ bool out_contains(const std::string& out, const char* needle) {
 	return out.find(needle) != std::string::npos;
 }
 
-// Parse `SUMMARY reads=<n> torn=<n> missed_total=<n> ...` fields.
 uint64_t summary_field(const std::string& out, const char* field) {
 	const std::string needle = std::string(field) + "=";
 	const size_t pos = out.find(needle);
@@ -54,7 +49,7 @@ uint64_t summary_field(const std::string& out, const char* field) {
 	return std::strtoull(val.c_str(), nullptr, 10);
 }
 
-TEST(Pattern, MillionNoTorn) {  // I02
+TEST(Pattern, MillionNoTorn) {
 	const std::string name = edge_test::unique_channel_name("i02");
 	auto pa = producer_args(name);
 	pa.push_back("--count");
@@ -75,17 +70,15 @@ TEST(Pattern, MillionNoTorn) {  // I02
 	ASSERT_TRUE(prod.wait(250000, &prod_out)) << "producer hung: " << prod_out;
 	ASSERT_EQ(prod.exit_code(), 0) << prod_out;
 	ASSERT_EQ(cons.exit_code(), 0) << cons_out;
-	// every read checksum-verified and pattern-checked -> zero torn
+
 	EXPECT_EQ(summary_field(cons_out, "torn"), 0u) << cons_out;
 	EXPECT_GT(summary_field(cons_out, "reads"), 0u) << cons_out;
 	EXPECT_TRUE(out_contains(prod_out, "DONE published=1000000")) << prod_out;
 }
 
-TEST(Pattern, GapObservable) {  // I03
+TEST(Pattern, GapObservable) {
 	const std::string name = edge_test::unique_channel_name("i03");
-	// consumer first (it must open via NotFound retry), then a producer that
-	// publishes 200 samples at 1ms while the consumer reads every 15ms -> the
-	// per-read missed_samples gap must be observable.
+
 	auto ca = consumer_args(name);
 	ca.push_back("--reads");
 	ca.push_back("12");
@@ -116,9 +109,9 @@ TEST(Pattern, GapObservable) {  // I03
 	EXPECT_GT(summary_field(cons_out, "missed_total"), 0u) << cons_out;
 }
 
-TEST(Pattern, ConsumerFirst) {  // I04
+TEST(Pattern, ConsumerFirst) {
 	const std::string name = edge_test::unique_channel_name("i04");
-	// consumer starts before the producer exists and must wait for it (open retry)
+
 	auto ca = consumer_args(name);
 	ca.push_back("--expect-last-seq");
 	ca.push_back("100");
@@ -146,10 +139,9 @@ TEST(Pattern, ConsumerFirst) {  // I04
 	EXPECT_GE(summary_field(cons_out, "last_seq"), 100u) << cons_out;
 }
 
-TEST(Pattern, DuplicateProducerRejected) {  // I05
+TEST(Pattern, DuplicateProducerRejected) {
 	const std::string name = edge_test::unique_channel_name("i05");
-	// producer A stays alive (count 0 = infinite); a second producer must be
-	// rejected as AlreadyOwned, not allowed to replace the live owner.
+
 	auto aa = producer_args(name);
 	aa.push_back("--count");
 	aa.push_back("0");
@@ -174,7 +166,7 @@ TEST(Pattern, DuplicateProducerRejected) {  // I05
 	prod_a.wait(10000, &a_out);
 }
 
-TEST(Pattern, DuplicateConsumerRejected) {  // I06
+TEST(Pattern, DuplicateConsumerRejected) {
 	const std::string name = edge_test::unique_channel_name("i06");
 	auto pa = producer_args(name);
 	pa.push_back("--count");
@@ -185,7 +177,6 @@ TEST(Pattern, DuplicateConsumerRejected) {  // I06
 	ASSERT_TRUE(prod.spawn(pa));
 	std::this_thread::sleep_for(std::chrono::milliseconds(400));
 
-	// consumer A stays alive; a second consumer must be rejected.
 	auto aa = consumer_args(name);
 	aa.push_back("--reads");
 	aa.push_back("0");
@@ -214,14 +205,13 @@ TEST(Pattern, DuplicateConsumerRejected) {  // I06
 	prod.wait(10000, &tmp);
 }
 
-TEST(Pattern, SchemaMismatchRejected) {  // I07
+TEST(Pattern, SchemaMismatchRejected) {
 	const std::string name = edge_test::unique_channel_name("i07");
 	ChannelOptions opts;
 	opts.name = name;
 	auto prod = Producer<TestPayloadV1>::create(opts, TestPayloadV1Schema());
 	ASSERT_TRUE(prod);
 
-	// same payload size (16), but a different fingerprint -> kSchemaMismatch
 	auto c = Consumer<TestPayloadV1>::open(opts, TestPayloadV2Schema());
 	ASSERT_FALSE(c);
 	EXPECT_EQ(c.error().code, ErrorCode::kSchemaMismatch);
@@ -229,15 +219,13 @@ TEST(Pattern, SchemaMismatchRejected) {  // I07
 	ASSERT_TRUE(prod.value().remove_if_owner());
 }
 
-TEST(Pattern, PayloadSizeMismatchRejected) {  // I08
+TEST(Pattern, PayloadSizeMismatchRejected) {
 	const std::string name = edge_test::unique_channel_name("i08");
 	ChannelOptions opts;
 	opts.name = name;
 	auto prod = Producer<TestPayloadV1>::create(opts, TestPayloadV1Schema());
 	ASSERT_TRUE(prod);
 
-	// matching fingerprint, but consumer<TestPayloadV2> expects 8-byte payloads
-	// against a 16-byte channel -> kSchemaMismatch
 	auto c = Consumer<TestPayloadV2>::open(opts, TestPayloadV2Schema());
 	ASSERT_FALSE(c);
 	EXPECT_EQ(c.error().code, ErrorCode::kSchemaMismatch);
@@ -245,10 +233,8 @@ TEST(Pattern, PayloadSizeMismatchRejected) {  // I08
 	ASSERT_TRUE(prod.value().remove_if_owner());
 }
 
-TEST(Pattern, CodecCrossExec) {  // I17
-	// producer and consumer run in separate binaries; the consumer's pattern
-	// check (counter == sequence-1) proves the codec bytes are identical across
-	// exec.
+TEST(Pattern, CodecCrossExec) {
+
 	const std::string name = edge_test::unique_channel_name("i17");
 	auto pa = producer_args(name);
 	pa.push_back("--count");
@@ -275,7 +261,7 @@ TEST(Pattern, CodecCrossExec) {  // I17
 	EXPECT_GE(summary_field(cons_out, "reads"), 1u) << cons_out;
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
 	::testing::InitGoogleTest(&argc, argv);

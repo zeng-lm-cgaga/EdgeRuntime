@@ -5,9 +5,7 @@
 
 namespace edge_runtime::detail {
 
-// All access to shared-memory atomic fields goes through these wrappers
-// (design §6.2, §13). T must be a lock-free explicit-width integer type; the
-// frozen ABI never contains std::atomic or plain concurrent access.
+// 共享内存字段只能通过这些原子包装访问，避免把 std::atomic 写入固定 ABI。
 template <typename T>
 inline T shared_load_acquire(const T* addr) noexcept {
 	static_assert(sizeof(T) <= 8, "shared atomics are limited to 64-bit fields");
@@ -40,7 +38,6 @@ inline void shared_store_relaxed(T* addr, T value) noexcept {
 	__atomic_store_n(addr, value, __ATOMIC_RELAXED);
 }
 
-// Strong compare_exchange: acquire on success, relaxed on failure.
 template <typename T>
 inline bool shared_cas_acquire(T* addr, T expected, T desired) noexcept {
 	static_assert(sizeof(T) <= 8, "shared atomics are limited to 64-bit fields");
@@ -66,6 +63,6 @@ inline T shared_fetch_add_relaxed(T* addr, T value) noexcept {
 	return __atomic_fetch_add(addr, value, __ATOMIC_RELAXED);
 }
 
-}  // namespace edge_runtime::detail
+}  // 命名空间 edge_runtime::detail
 
 #endif  // EDGE_RUNTIME_DETAIL_SHARED_ATOMIC_HPP

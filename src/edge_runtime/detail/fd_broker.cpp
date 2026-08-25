@@ -28,8 +28,8 @@ namespace edge_runtime::detail {
 namespace {
 
 inline constexpr uint32_t kListenBacklog = 4;
-inline constexpr uint64_t kConnectRetryIntervalNs = 10'000'000;  // 10 ms
-inline constexpr uint64_t kServePollIntervalNs = 100'000'000;    // 100 ms
+inline constexpr uint64_t kConnectRetryIntervalNs = 10'000'000;
+inline constexpr uint64_t kServePollIntervalNs = 100'000'000;
 
 uint64_t reply_checksum_of(const FdBrokerReplyAbi& r) noexcept {
 	FdBrokerReplyAbi tmp = r;
@@ -52,8 +52,6 @@ bool request_fingerprint_set(const FdBrokerRequestAbi& r) noexcept {
 
 inline constexpr int kServePollIntervalMs = 100;
 
-// Full recv of exactly `size` bytes. Polling keeps a half-open client from
-// pinning producer shutdown while still allowing arbitrarily fragmented input.
 bool recv_full(int fd, void* buf, size_t size, const std::atomic<bool>* stop) noexcept {
 	auto* dst = static_cast<char*>(buf);
 	size_t got = 0;
@@ -74,12 +72,13 @@ bool recv_full(int fd, void* buf, size_t size, const std::atomic<bool>* stop) no
 			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
 			return false;
 		}
-		if (n == 0) return false;  // peer closed mid-record
+		if (n == 0) return false;
 		got += static_cast<size_t>(n);
 	}
 	return true;
 }
 
+// 文件描述符传递是一次性交互；请求、回复或辅助数据任一失败都关闭本次连接。
 bool send_full(int fd, const void* buf, size_t size) noexcept {
 	const auto* src = static_cast<const char*>(buf);
 	size_t sent = 0;
@@ -94,7 +93,6 @@ bool send_full(int fd, const void* buf, size_t size) noexcept {
 	return true;
 }
 
-// Best-effort SO_PEERCRED check: same-UID trust model only (design §33.4).
 bool peer_is_same_uid(int fd) noexcept {
 	struct ucred cred {};
 	socklen_t len = sizeof(cred);
@@ -102,8 +100,6 @@ bool peer_is_same_uid(int fd) noexcept {
 	return cred.uid == geteuid();
 }
 
-// Best-effort peer liveness probe for a stale socket (design §33.5): connect()
-// succeeds only if something is accepting.
 bool socket_has_live_peer(const std::string& path) noexcept {
 	const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (fd < 0) return false;
@@ -121,9 +117,6 @@ bool unlink_socket(const std::string& path) noexcept {
 	return ::unlink(path.c_str()) == 0 || errno == ENOENT;
 }
 
-// Send the reply record plus one fd via SCM_RIGHTS. The whole exchange is
-// one-shot: any failure abandons the connection (SCM_RIGHTS is never retried
-// on the same connection, design §33.4).
 bool send_reply_with_fd(int conn_fd, const FdBrokerReplyAbi& reply, int payload_fd) noexcept {
 	char cmsg_buf[CMSG_SPACE(sizeof(int))]{};
 	struct iovec iov {};
@@ -144,20 +137,17 @@ bool send_reply_with_fd(int conn_fd, const FdBrokerReplyAbi& reply, int payload_
 	return n == static_cast<ssize_t>(sizeof(reply));
 }
 
-// Dup for a read-write hand-out, or reopen read-only through /proc/self/fd for
-// a readonly request (dup keeps O_RDWR, design §33.4).
 int hand_out_fd(int shm_fd, bool readonly) noexcept {
 	if (!readonly) return ::fcntl(shm_fd, F_DUPFD_CLOEXEC, 0);
 	char path[64]{};
 	std::snprintf(path, sizeof(path), "/proc/self/fd/%d", shm_fd);
-	return ::open(path, O_RDONLY | O_CLOEXEC);  // fail closed; never hand out O_RDWR
+	return ::open(path, O_RDONLY | O_CLOEXEC);
 }
 
-}  // namespace
+}
 
 uint64_t fd_broker_checksum(const void* record, size_t size) noexcept {
-	// Records are fixed 64 bytes; copy to a local buffer so the trailing
-	// checksum field can be zeroed without touching the caller's record.
+
 	if (record == nullptr || size < sizeof(uint64_t) || size > kFdBrokerReplySize) return 0;
 	std::byte tmp[kFdBrokerReplySize]{};
 	std::memcpy(tmp, record, size);
@@ -176,9 +166,7 @@ Result<UniqueFd> memfd_create_object(const std::string& channel_name) {
 		return make_errno_error(e, "memfd_create_object", std::strerror(e));
 	}
 	UniqueFd owned(fd);
-	// memfd arrives with umask-derived mode (typically 0755); pin it to 0600 so
-	// memfd_fstat_and_capture's group/other check and the §33.3 permission
-	// discipline match the named-shm rules.
+
 	if (::fchmod(fd, static_cast<mode_t>(S_IRUSR | S_IWUSR)) != 0) {
 		const int e = errno;
 		return make_errno_error(e, "memfd_create_object", std::strerror(e));
@@ -208,8 +196,7 @@ Result<UniqueFd> fd_broker_bind(const std::string& socket_path) {
 	int rc = ::bind(fd, reinterpret_cast<struct sockaddr*>(&addr),
 	                static_cast<socklen_t>(sizeof(addr)));
 	if (rc != 0 && errno == EADDRINUSE) {
-		// EADDRINUSE: probe before unlink (design §33.5, mirror of §9.4). A live
-		// peer owns the channel; a dead one left a stale socket we may remove.
+
 		if (socket_has_live_peer(socket_path)) {
 			return make_error(ErrorCode::kAlreadyOwned, "fd_broker_bind",
 			                  "live broker socket under path");
@@ -225,7 +212,7 @@ Result<UniqueFd> fd_broker_bind(const std::string& socket_path) {
 		const int e = errno;
 		return make_errno_error(e, "fd_broker_bind", std::strerror(e));
 	}
-	// chmod the filesystem node, not the sockfs inode referred to by `fd`.
+
 	if (::chmod(socket_path.c_str(), static_cast<mode_t>(S_IRUSR | S_IWUSR)) != 0) {
 		const int e = errno;
 		(void)::unlink(socket_path.c_str());
@@ -250,13 +237,13 @@ void fd_broker_serve_loop(int listen_fd, int shm_fd, std::byte* base,
 		const int prc = ::poll(&pfd, 1, 250);
 		if (prc < 0) {
 			if (errno == EINTR) continue;
-			break;  // EBADF (shutdown+close raced): leave
+			break;
 		}
-		if (prc == 0) continue;  // idle tick; re-check stop
+		if (prc == 0) continue;
 		const int conn = ::accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
 		if (conn < 0) {
 			if (errno == EINTR || errno == EAGAIN) continue;
-			break;  // EBADF after shutdown: leave
+			break;
 		}
 		UniqueFd conn_fd(conn);
 
@@ -273,7 +260,7 @@ void fd_broker_serve_loop(int listen_fd, int shm_fd, std::byte* base,
 		if (!recv_full(conn, &req, sizeof(req), stop)) continue;
 		if (std::memcmp(req.magic, kFdBrokerRequestMagic, sizeof(kFdBrokerRequestMagic) - 1) !=
 		    0) {
-			continue;  // garbage: drop, never answer an unparseable record
+			continue;
 		}
 		if (req.version != kFdBrokerVersion || request_checksum_of(req) != req.checksum) {
 			continue;
@@ -311,7 +298,7 @@ void fd_broker_serve_loop(int listen_fd, int shm_fd, std::byte* base,
 				UniqueFd out_guard(out_fd);
 				reply.checksum = reply_checksum_of(reply);
 				if (send_reply_with_fd(conn, reply, out_fd)) {
-					EDGE_FAILPOINT(C14);  // crash matrix: served one request
+					EDGE_FAILPOINT(C14);
 					continue;
 				}
 				reply.status = static_cast<uint32_t>(FdBrokerStatus::kSystem);
@@ -375,9 +362,8 @@ Result<UniqueFd> fd_broker_request_fd(const std::string& socket_path, uint32_t c
 		req.channel_hash = channel_hash;
 		std::memcpy(req.schema_fingerprint, schema.fingerprint.data(), 32);
 		req.checksum = request_checksum_of(req);
-		if (!send_full(fd, &req, sizeof(req))) continue;  // fresh connection next round
+		if (!send_full(fd, &req, sizeof(req))) continue;
 
-		// One-shot receive: reply record + optional fd (design §33.4).
 		char cmsg_buf[CMSG_SPACE(sizeof(int))]{};
 		FdBrokerReplyAbi reply{};
 		struct iovec iov {};
@@ -398,23 +384,22 @@ Result<UniqueFd> fd_broker_request_fd(const std::string& socket_path, uint32_t c
 				if (received_fd.get() < 0) {
 					received_fd.reset(passed_fd);
 				} else {
-					::close(passed_fd);  // protocol allows exactly one descriptor
+					::close(passed_fd);
 				}
 			}
 		}
 		if (n != static_cast<ssize_t>(sizeof(reply)) ||
 		    (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0) {
-			continue;  // received_fd closes even for a malformed ancillary record
+			continue;
 		}
 		if (std::memcmp(reply.magic, kFdBrokerReplyMagic, sizeof(kFdBrokerReplyMagic) - 1) != 0 ||
 		    reply_checksum_of(reply) != reply.checksum) {
-			continue;  // unparseable wire record: never trust it
+			continue;
 		}
 		const auto status = static_cast<FdBrokerStatus>(reply.status);
 		if (status == FdBrokerStatus::kOk) {
-			if (received_fd.get() < 0) continue;  // ok status without fd: protocol violation
-			// MSG_CMSG_CLOEXEC handles Linux atomically; keep an explicit check so a
-			// platform/libc regression cannot silently leak the fd across exec.
+			if (received_fd.get() < 0) continue;
+
 			const int flags = ::fcntl(received_fd.get(), F_GETFD);
 			if (flags < 0 || ::fcntl(received_fd.get(), F_SETFD, flags | FD_CLOEXEC) != 0) {
 				const int e = errno;
@@ -432,7 +417,7 @@ Result<UniqueFd> fd_broker_request_fd(const std::string& socket_path, uint32_t c
 			return make_error(ErrorCode::kPermissionDenied, "fd_broker_request_fd",
 			                  "broker refused peer");
 		}
-		// kNotReady / kSystem: retry within the remaining budget.
+
 		if (remaining_time_ns(deadline) == 0) {
 			return make_error(ErrorCode::kProducerOffline, "fd_broker_request_fd",
 			                  "broker not ready (retry budget exhausted)");
@@ -442,4 +427,4 @@ Result<UniqueFd> fd_broker_request_fd(const std::string& socket_path, uint32_t c
 	}
 }
 
-}  // namespace edge_runtime::detail
+}

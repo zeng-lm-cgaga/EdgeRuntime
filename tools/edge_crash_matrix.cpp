@@ -1,39 +1,4 @@
-// edge_crash_matrix: C01-C23 table-driven crash matrix (design §20.3/§24/§36).
-//
-// For each case it pauses a victim at a named kill point (SIGSTOP via a
-// failpoint), records forensic evidence, runs the recovery actor, and verifies
-// the expected outcome. Evidence lands in
-//   <out-dir>/<run_id>/<case_id>/{command.txt,pids.txt,killpoint.txt,
-//                                 header_dump.txt,recovery_result.txt,result.txt}
-// The matrix is the project's verification centerpiece: every case is
-// deterministic and re-runnable, and each PASS depends on the same invariants
-// the library's correctness does (narrow recovery, fail-closed ambiguity, slot
-// reclaim, generation+1 replacement, torn-free reads).
-//
-// Cases:
-//   C01  creator dies right after shm_open  -> size-0 pre-object, auto-clean
-//   C02  creator dies after bootstrap write -> partial object, inode-bound,
-//                                             recovered
-//   C03  producer dies after claim (WRITING)         -> invisible, old current
-//   C04  producer dies mid payload copy (WRITING)    -> stays readable
-//   C05  producer dies after publish, before ticket  -> unpublished invisible
-//   C06  producer dies after ticket, before wake     -> ticketed sample visible
-//   C07  consumer dies at READING_CLAIMING (epoch 0) -> slot reclaimed
-//   C08  consumer dies at READING (epoch set)        -> slot reclaimed
-//   C09  consumer dies after release                 -> nothing leaked
-//   C10  old producer dead + two new producers       -> lock serializes, gen+1
-//   C11  PID-reuse fixture (live pid, wrong starttime) -> kPidReused, gen+1
-//   C12  identity-epoch corruption (odd role_epoch)  -> RecoveryBlocked, closed
-//   C13  name/inode ABA (object replaced)            -> kNameRaceDetected
-//
-// --smoke runs a fast representative subset (C01, C03, C08) for the dev loop;
-// the full matrix is a separate, longer CTest (LABELS crash).
-//
-// Usage:
-//   edge_crash_matrix --producer <bin> --consumer <bin> --ctl <bin>
-//                     [--smoke] [--only C01,C03] [--seed N]
-//                     [--out-dir evidence/crash]
-
+// 崩溃矩阵通过独立进程和故障点覆盖创建、发布、恢复、传输及监督器失败路径。
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -102,7 +67,6 @@ uint64_t parse_after(const std::string& text, const char* key) {
 	return std::strtoull(text.c_str() + p + std::strlen(key), nullptr, 10);
 }
 
-// ---- failpoint env: applied in the child only, never in the driver ----------
 std::vector<std::pair<const char*, const char*>> fp_env(const char* id, const char* count) {
 	std::vector<std::pair<const char*, const char*>> env;
 	env.emplace_back("EDGE_FAILPOINT", id);
@@ -111,8 +75,6 @@ std::vector<std::pair<const char*, const char*>> fp_env(const char* id, const ch
 	return env;
 }
 
-// A failpoint-hostile child: fork+exec with stdout captured on a pipe, then
-// waitpid(WUNTRACED|WNOHANG) until it SIGSTOPs at the kill point.
 class CrashChild {
        public:
 	bool spawn(const std::vector<std::string>& argv,
@@ -128,7 +90,7 @@ class CrashChild {
 		if (pid == 0) {
 			::close(pipefd[0]);
 			if (::dup2(pipefd[1], STDOUT_FILENO) < 0) _exit(127);
-			(void)::fcntl(pipefd[1], F_SETFL, O_NONBLOCK);  // never block on write
+			(void)::fcntl(pipefd[1], F_SETFL, O_NONBLOCK);
 			for (const auto& kv : env) ::setenv(kv.first, kv.second, 1);
 			std::vector<char*> args;
 			args.reserve(argv.size() + 1);
@@ -152,8 +114,6 @@ class CrashChild {
 	bool stopped() const { return stopped_; }
 	const std::string& stdout_text() const { return out_; }
 
-	// Blocks until the child SIGSTOPs (WUNTRACED); true on stop, false if it
-	// exited instead or timed out (SIGKILLed).
 	bool wait_stop(int timeout_ms) {
 		const int64_t deadline = monotonic_ms_now() + timeout_ms;
 		while (true) {
@@ -179,13 +139,11 @@ class CrashChild {
 				return false;
 			}
 			struct timespec ts {};
-			ts.tv_nsec = 5 * 1000 * 1000;  // 5 ms
+			ts.tv_nsec = 5 * 1000 * 1000;
 			::nanosleep(&ts, nullptr);
 		}
 	}
 
-	// Blocks until the child exits; returns its exit code, or -1 on signal /
-	// timeout (SIGKILLed and reaped).
 	int wait_exit(int timeout_ms) {
 		const int64_t deadline = monotonic_ms_now() + timeout_ms;
 		while (true) {
@@ -211,7 +169,6 @@ class CrashChild {
 		}
 	}
 
-	// SIGKILL (if not already reaped) and drain remaining stdout.
 	void kill_and_reap() {
 		if (!reaped_) ::kill(pid_, SIGKILL);
 		if (!reaped_) ::waitpid(pid_, nullptr, 0);
@@ -219,7 +176,6 @@ class CrashChild {
 		drain();
 	}
 
-	// Send an arbitrary signal (v0.3 C19: SIGTERM for a clean supervisor stop).
 	void send_signal(int sig) {
 		if (!reaped_) ::kill(pid_, sig);
 	}
@@ -234,12 +190,12 @@ class CrashChild {
 				out_.append(buf, static_cast<size_t>(n));
 				continue;
 			}
-			if (n == 0) {  // EOF: write end closed by child death
+			if (n == 0) {
 				::close(pipe_);
 				pipe_ = -1;
 				return;
 			}
-			if (errno == EAGAIN || errno == EWOULDBLOCK) return;  // no data yet
+			if (errno == EAGAIN || errno == EWOULDBLOCK) return;
 			if (errno == EINTR) continue;
 			::close(pipe_);
 			pipe_ = -1;
@@ -254,13 +210,12 @@ class CrashChild {
 	std::string out_;
 };
 
-// ---- evidence + per-case state ----------------------------------------------
 class CaseDriver {
        public:
 	std::string prod_bin;
 	std::string cons_bin;
 	std::string ctl_bin;
-	std::string supervisor_bin;  // v0.3 C19-C21
+	std::string supervisor_bin;
 	std::string run_dir;
 	uint64_t name_seq = 0;
 	int failures = 0;
@@ -299,7 +254,6 @@ class CaseDriver {
 
 	void record_command(const std::string& line) { commands_.push_back(line); }
 
-	// Run a synchronous helper command (producer/consumer/ctl) capturing stdout.
 	CommandResult run_command(const std::vector<std::string>& argv) {
 		record_command(join(argv));
 		CommandResult res;
@@ -338,7 +292,6 @@ class CaseDriver {
 		return res;
 	}
 
-	// edge_shm_ctl inspect, captured for evidence.
 	CommandResult ctl_inspect(const std::string& channel) {
 		const CommandResult r = run_command({ctl_bin, "inspect", channel});
 		write_evidence("header_dump.txt",
@@ -388,9 +341,6 @@ std::string gen_pids_line(const char* case_id, const CrashChild& c) {
 	return buf;
 }
 
-// ---- in-process fixture helpers (C11/C12/C13) --------------------------------
-// Reset a stale journal to Idle (audit evidence erased; the object itself is
-// already gone).
 void reset_journal_idle(const std::string& channel_name) {
 	auto lock = detail::ControlLock::acquire(detail::channel_lock_path(channel_name));
 	if (!lock) return;
@@ -399,8 +349,6 @@ void reset_journal_idle(const std::string& channel_name) {
 	(void)lock.value().write_journal(idle);
 }
 
-// Map an existing channel read-write; returns the header and keeps the mapping
-// alive in `view`.
 struct HeaderView {
 	detail::MappedRegion mm;
 	detail::ChannelHeaderAbi* header = nullptr;
@@ -431,14 +379,12 @@ bool map_existing_header(const std::string& channel_name, HeaderView* view, std:
 	return true;
 }
 
-}  // namespace
-
-// ---- cases -------------------------------------------------------------------
+}
 
 static bool run_c01(CaseDriver& d) {
 	d.begin_case("C01",
 	             "creator dies right after shm_open: size-0 pre-object, "
-	             "narrow condition auto-cleans (design §9.1)");
+	             "narrow condition auto-cleans");
 	const std::string name = d.channel_name("c01");
 
 	CrashChild victim;
@@ -448,7 +394,7 @@ static bool run_c01(CaseDriver& d) {
 		d.finish_case(gen_pids_line("C01", victim));
 		return d.ok();
 	}
-	victim.kill_and_reap();  // release the control lock before inspect
+	victim.kill_and_reap();
 
 	const CommandResult dump = d.ctl_inspect(name);
 	d.expect_contains(dump.out, "JOURNAL state=creating_pre_object", "C01 header_dump");
@@ -500,10 +446,6 @@ static bool run_c02(CaseDriver& d) {
 	return d.ok();
 }
 
-// C03/C04/C05/C06: producer dies mid-publish. Publishes 3 clean samples, then
-// stops on the 4th at the kill point. Recovery: a fresh consumer must read only
-// what the ticket exposes — old current stays readable, a WRITING or
-// published-but-unticketed sample is invisible, a ticketed one is visible.
 static bool run_c_publish(CaseDriver& d, const char* id, const char* fp, const char* description,
                           bool expect_ticketed, bool loaned = false) {
 	d.begin_case(id, description);
@@ -520,7 +462,6 @@ static bool run_c_publish(CaseDriver& d, const char* id, const char* fp, const c
 		return d.ok();
 	}
 
-	// Publish does not hold the control lock, so inspect works while stopped.
 	const CommandResult dump = d.ctl_inspect(name);
 	const char* expect_ticket = expect_ticketed ? "TICKET seq=4" : "TICKET seq=3";
 	d.expect_contains(dump.out, expect_ticket, "publish-crash header_dump");
@@ -547,11 +488,6 @@ static bool run_c_publish(CaseDriver& d, const char* id, const char* fp, const c
 	return d.ok();
 }
 
-// C07/C08/C09: consumer dies mid-read. Recovery: a new consumer reclaims leaked
-// slots by role epoch and reads torn=0 while the producer keeps publishing
-// without wedging. `expect_slot` is the slot-state token the header_dump must
-// contain ("reading_claiming " / "reading "); nullptr means assert its absence
-// (C09: the release completed, nothing leaked).
 static bool run_c_consumer(CaseDriver& d, const char* id, const char* fp, const char* description,
                            const char* expect_slot, bool loaned = false) {
 	d.begin_case(id, description);
@@ -565,7 +501,7 @@ static bool run_c_consumer(CaseDriver& d, const char* id, const char* fp, const 
 		return d.ok();
 	}
 	struct timespec ts {};
-	ts.tv_nsec = 450 * 1000 * 1000;  // let the first samples be published
+	ts.tv_nsec = 450 * 1000 * 1000;
 	::nanosleep(&ts, nullptr);
 
 	CrashChild victim;
@@ -578,7 +514,7 @@ static bool run_c_consumer(CaseDriver& d, const char* id, const char* fp, const 
 		d.finish_case(gen_pids_line(id, victim));
 		return d.ok();
 	}
-	victim.kill_and_reap();  // must be dead before the recovery consumer opens
+	victim.kill_and_reap();
 
 	const CommandResult dump = d.ctl_inspect(name);
 	if (expect_slot == nullptr) {
@@ -597,8 +533,6 @@ static bool run_c_consumer(CaseDriver& d, const char* id, const char* fp, const 
 	                 rec.out + "EXIT " + std::to_string(rec.exit_code) + "\n");
 	d.expect_contains(rec.out, "SUMMARY reads=5 torn=0", "consumer-crash recovery");
 
-	// The producer must not have wedged on a leaked READING slot: with count=0 a
-	// wedged producer exits with PUBLISH_FAIL instead of running forever.
 	if (prod.reaped()) {
 		d.fail("consumer-crash: producer exited early:\n" + prod.stdout_text());
 	} else {
@@ -616,7 +550,6 @@ static bool run_c10(CaseDriver& d) {
 	             "serializes recovery, generation advances exactly once");
 	const std::string name = d.channel_name("c10");
 
-	// Old producer: create gen-1, publish, then SIGKILL.
 	CrashChild old_prod;
 	if (!old_prod.spawn({d.prod_bin, "--name", name, "--count", "0", "--interval-us", "100000"},
 	                    {})) {
@@ -629,8 +562,6 @@ static bool run_c10(CaseDriver& d) {
 	::nanosleep(&ts, nullptr);
 	old_prod.kill_and_reap();
 
-	// Recovery A: gets the lock, stops at C10 holding it (SIGSTOP does not
-	// release flock).
 	CrashChild a;
 	if (!a.spawn({d.prod_bin, "--name", name, "--count", "0"}, fp_env("C10", nullptr)) ||
 	    !a.wait_stop(8000)) {
@@ -640,7 +571,6 @@ static bool run_c10(CaseDriver& d) {
 		return d.ok();
 	}
 
-	// Recovery B: no failpoint; blocks on flock until A dies and releases it.
 	CrashChild b;
 	if (!b.spawn({d.prod_bin, "--name", name, "--count", "3"}, {})) {
 		d.fail("recovery B spawn failed");
@@ -648,10 +578,10 @@ static bool run_c10(CaseDriver& d) {
 		d.finish_case(gen_pids_line("C10", a));
 		return d.ok();
 	}
-	ts.tv_nsec = 200 * 1000 * 1000;  // let B reach the flock while A holds it
+	ts.tv_nsec = 200 * 1000 * 1000;
 	::nanosleep(&ts, nullptr);
 
-	a.kill_and_reap();  // release the lock; B's flock wait unblocks
+	a.kill_and_reap();
 	const int bcode = b.wait_exit(20000);
 	d.write_evidence("recovery_result.txt",
 	                 b.stdout_text() + "EXIT " + std::to_string(bcode) + "\n");
@@ -691,11 +621,8 @@ static bool run_c11(CaseDriver& d) {
 			gen1 = st.value().generation;
 			ev += "gen1=" + std::to_string(gen1) + "\n";
 		}
-	}  // clean shutdown -> producer_state OFFLINE
+	}
 
-	// Forge the producer identity to OUR live pid with starttime 1 (impossible
-	// for a real process), and set the producer ONLINE so the liveness decision
-	// is the interesting one.
 	{
 		HeaderView view;
 		std::string err;
@@ -704,7 +631,7 @@ static bool run_c11(CaseDriver& d) {
 		} else {
 			detail::ProcessIdentityAbi forged{};
 			forged.pid = static_cast<uint64_t>(::getpid());
-			forged.proc_start_ticks = 1;  // wrong starttime: pid is live but differs
+			forged.proc_start_ticks = 1;
 			forged.boot_id_hash_hi = 0x1111111111111111ull;
 			forged.boot_id_hash_lo = 0x2222222222222222ull;
 			auto wr = detail::identity_snapshot_write(&view.header->producer, forged);
@@ -721,9 +648,6 @@ static bool run_c11(CaseDriver& d) {
 		}
 	}
 
-	// The new producer must not mistake our live pid for the old owner: the
-	// starttime mismatch proves it is not the same process, so verified
-	// replacement advances the generation.
 	{
 		auto p2 = Producer<TestPayloadV1>::create(opts, schema);
 		if (!p2) {
@@ -755,7 +679,7 @@ static bool run_c12(CaseDriver& d) {
 	d.begin_case("C12",
 	             "identity-epoch corruption fixture: an odd role_epoch "
 	             "makes identity_snapshot_read fail, so recovery fails "
-	             "closed with RecoveryBlocked (design §15.8/C12)");
+	             "closed with RecoveryBlocked (C12)");
 	const std::string name = d.channel_name("c12");
 	ChannelOptions opts;
 	opts.name = name;
@@ -780,8 +704,6 @@ static bool run_c12(CaseDriver& d) {
 		}
 	}
 
-	// Corrupt the producer identity epoch to an odd value: the seqlock is
-	// permanently mid-write, so identity_snapshot_read can never converge.
 	{
 		HeaderView view;
 		std::string err;
@@ -808,7 +730,6 @@ static bool run_c12(CaseDriver& d) {
 		}
 	}
 
-	// Cleanup: drop the corrupted object and reset the journal.
 	{
 		const std::string shm = detail::channel_shm_name(name);
 		auto fd = detail::shm_open_existing(shm);
@@ -834,7 +755,6 @@ static bool run_c13(CaseDriver& d) {
 	const std::string name = d.channel_name("c13");
 	std::string ev;
 
-	// Creator dies at C02: CREATING_OBJECT journal bound to inode X + partial obj.
 	CrashChild victim;
 	if (!victim.spawn({d.prod_bin, "--name", name, "--count", "0"}, fp_env("C02", nullptr)) ||
 	    !victim.wait_stop(8000)) {
@@ -862,8 +782,6 @@ static bool run_c13(CaseDriver& d) {
 		return d.ok();
 	}
 
-	// ABA: unlink the creator's object, then put a DIFFERENT object under the
-	// name. The journal still claims inode X; the live object is Y.
 	if (!detail::shm_unlink_checked(shm, dev0, ino0)) {
 		d.fail("C13 unlink of creator object failed");
 		d.finish_case(gen_pids_line("C13", victim));
@@ -903,7 +821,6 @@ static bool run_c13(CaseDriver& d) {
 		}
 	}
 
-	// The stranger's object must be byte-identical (untouched).
 	{
 		auto fd2 = detail::shm_open_existing(shm);
 		if (!fd2) {
@@ -921,7 +838,6 @@ static bool run_c13(CaseDriver& d) {
 		}
 	}
 
-	// Cleanup.
 	{
 		auto fd3 = detail::shm_open_existing(shm);
 		if (fd3) {
@@ -938,13 +854,6 @@ static bool run_c13(CaseDriver& d) {
 	return d.ok();
 }
 
-// ---- v0.2 fd-pass + heartbeat cases (C14-C18) --------------------------------
-
-// C14: fd producer crashes inside the serving loop right after handing out one
-// fd. The socket survives (crash leaves a stale socket); consumers get bounded
-// ProducerOffline, ctl falls back to a journal-only report, and a successor
-// producer probes the stale socket, unlinks it, and rebinds at generation+1
-// (design §33.5).
 static bool run_c14(CaseDriver& d) {
 	d.begin_case("C14",
 	             "fd producer dies in serve_loop after one hand-out: consumer "
@@ -960,9 +869,7 @@ static bool run_c14(CaseDriver& d) {
 		d.finish_case(gen_pids_line("C14", victim));
 		return d.ok();
 	}
-	// Trigger the failpoint: a consumer request makes the server serve one fd,
-	// then SIGSTOP. The consumer itself gets its fd BEFORE the failpoint fires
-	// (the reply precedes it), so it succeeds.
+
 	const CommandResult first = d.run_command(
 	        {d.cons_bin, "--name", name, "--transport", "fd", "--reads", "1",
 	         "--read-interval-ms", "20", "--open-retry-ms", "8000"});
@@ -976,18 +883,15 @@ static bool run_c14(CaseDriver& d) {
 	}
 	victim.kill_and_reap();
 
-	// The broker is gone but its socket remains: ctl reports journal-only.
 	const CommandResult dump = d.ctl_inspect(name);
 	d.expect_contains(dump.out, "transport=fd_pass", "C14 header_dump");
 	d.expect_contains(dump.out, "broker_failed", "C14 header_dump");
 
-	// A second consumer (bounded retry) must end in ProducerOffline, never hang.
 	const CommandResult second = d.run_command(
 	        {d.cons_bin, "--name", name, "--transport", "fd", "--reads", "1",
 	         "--open-retry-ms", "3000"});
 	d.expect_contains(second.out, "code=ProducerOffline", "C14 second consumer");
 
-	// Successor: EADDRINUSE -> probe (dead) -> unlink -> rebind -> generation+1.
 	const CommandResult rec = d.run_command(
 	        {d.prod_bin, "--name", name, "--transport", "fd", "--count", "2"});
 	d.write_evidence("recovery_result.txt",
@@ -1001,9 +905,6 @@ static bool run_c14(CaseDriver& d) {
 	return d.ok();
 }
 
-// C15: fd consumer dies after registering its identity, before the handle is
-// built. The next open must probe it dead and reclaim its role (C07-style)
-// without blocking the producer (design §33.6 + §15.4).
 static bool run_c15(CaseDriver& d) {
 	d.begin_case("C15",
 	             "fd consumer dies after identity registration: dead identity "
@@ -1019,7 +920,7 @@ static bool run_c15(CaseDriver& d) {
 		return d.ok();
 	}
 	struct timespec wait_ts {};
-	wait_ts.tv_nsec = 400 * 1000 * 1000;  // let the producer bind + serve
+	wait_ts.tv_nsec = 400 * 1000 * 1000;
 	::nanosleep(&wait_ts, nullptr);
 
 	CrashChild victim;
@@ -1035,7 +936,6 @@ static bool run_c15(CaseDriver& d) {
 	const CommandResult dump = d.ctl_inspect(name);
 	d.expect_contains(dump.out, "consumer=online", "C15 header_dump");
 
-	// A fresh consumer takes the role from the dead one and reads cleanly.
 	const CommandResult rec = d.run_command(
 	        {d.cons_bin, "--name", name, "--transport", "fd", "--reads", "2",
 	         "--read-interval-ms", "20", "--open-retry-ms", "5000"});
@@ -1050,10 +950,6 @@ static bool run_c15(CaseDriver& d) {
 	return d.ok();
 }
 
-// C16: fd producer dies right after memfd_create (journal still PREOBJECT).
-// The object died with the creator — no residual, no unlink needed; the
-// journal reconciles to Idle and the successor numbers from it (design §33.3,
-// the fd-mode counterpart of C01).
 static bool run_c16(CaseDriver& d) {
 	d.begin_case("C16",
 	             "fd creator dies after memfd_create: object gone with creator, "
@@ -1083,8 +979,6 @@ static bool run_c16(CaseDriver& d) {
 	if (rec.exit_code != 0)
 		d.fail("C16 recovery producer exit " + std::to_string(rec.exit_code));
 
-	// The successor exited cleanly (object dies with it); ctl remove reports the
-	// fd-pass journal-only semantics.
 	const CommandResult rm = d.run_command({d.ctl_bin, "remove", name});
 	d.expect_contains(rm.out, "REMOVED fd_pass", "C16 remove");
 
@@ -1092,8 +986,6 @@ static bool run_c16(CaseDriver& d) {
 	return d.ok();
 }
 
-// C17: a stale broker socket occupies the path (staged, no failpoint): bind
-// succeeds only after probe-dead -> unlink -> rebind (design §33.5).
 static bool run_c17(CaseDriver& d) {
 	d.begin_case("C17",
 	             "stale broker socket at the path: create probes it dead, unlinks "
@@ -1101,7 +993,6 @@ static bool run_c17(CaseDriver& d) {
 	const std::string name = d.channel_name("c17");
 	const std::string sock = detail::channel_socket_path(name);
 
-	// Stage the stale socket: bind it and close WITHOUT ever listening.
 	{
 		const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 		if (fd < 0) {
@@ -1125,7 +1016,7 @@ static bool run_c17(CaseDriver& d) {
 			d.finish_case(gen_pids_line("C17", CrashChild{}));
 			return d.ok();
 		}
-		::close(fd);  // no listener, no accept: a dead socket stays on the path
+		::close(fd);
 	}
 
 	const CommandResult rec = d.run_command(
@@ -1140,9 +1031,6 @@ static bool run_c17(CaseDriver& d) {
 	return d.ok();
 }
 
-// C18: heartbeat producer freezes right after writing one beat (SIGSTOP victim).
-// The consumer classifies ProducerStalled — an observation; the owner is never
-// reclaimed (design §34.3).
 static bool run_c18(CaseDriver& d) {
 	d.begin_case("C18",
 	             "producer frozen after one heartbeat: consumer wait classifies "
@@ -1171,8 +1059,6 @@ static bool run_c18(CaseDriver& d) {
 	d.expect_contains(rec.out, "last_error=ProducerStalled", "C18 consumer");
 	d.expect_contains(rec.out, "timed_out=1", "C18 consumer");
 
-	// The frozen producer is still the owner: a takeover attempt must be
-	// refused while it is alive (observation-only semantics).
 	const CommandResult takeover = d.run_command(
 	        {d.prod_bin, "--name", name, "--count", "1"});
 	d.expect_contains(takeover.out, "code=AlreadyOwned", "C18 no takeover");
@@ -1182,12 +1068,6 @@ static bool run_c18(CaseDriver& d) {
 	return d.ok();
 }
 
-// ---- v0.3 supervisor cases (C19-C21) ----------------------------------------
-
-// C19: stall takeover. The supervisor runs a heartbeat-only producer; the
-// driver freezes the grandchild with SIGSTOP. The supervisor must classify the
-// stall, escalate SIGTERM->SIGKILL, restart at generation+1, and a consumer
-// must read the replacement (design §35.4).
 static bool run_c19(CaseDriver& d) {
 	d.begin_case("C19",
 	             "supervisor stall takeover: frozen heartbeat producer -> "
@@ -1212,21 +1092,17 @@ static bool run_c19(CaseDriver& d) {
 	}
 	struct timespec wait_ts {};
 	wait_ts.tv_sec = 1;
-	wait_ts.tv_nsec = 500 * 1000 * 1000;  // 1.5s (tv_nsec must stay < 1e9)
+	wait_ts.tv_nsec = 500 * 1000 * 1000;
 	::nanosleep(&wait_ts, nullptr);
 
-	// Freeze the grandchild (anchored pattern: only the producer's own cmdline).
 	const std::string stop_cmd =
 	        "/usr/bin/pkill -STOP -f \"^" + d.prod_bin + " --name " + name + " \"";
 	(void)d.run_command({"/bin/sh", "-c", stop_cmd});
 
-	wait_ts.tv_sec = 3;  // 3s: detection + grace + backoff + replacement create
+	wait_ts.tv_sec = 3;
 	wait_ts.tv_nsec = 0;
 	::nanosleep(&wait_ts, nullptr);
 
-	// The replacement instance must be generation 2 and openable. (It is a
-	// heartbeat-only producer, so it publishes nothing — a successful open is
-	// the recovery assertion.)
 	const CommandResult dump = d.ctl_inspect(name);
 	d.expect_contains(dump.out, "gen=2", "C19 header_dump");
 	const CommandResult rec = d.run_command(
@@ -1238,7 +1114,6 @@ static bool run_c19(CaseDriver& d) {
 	if (rec.exit_code != 0)
 		d.fail("C19 recovery consumer exit " + std::to_string(rec.exit_code));
 
-	// Clean stop of the supervisor, then assert the marker sequence.
 	sup.send_signal(SIGTERM);
 	const int sup_rc = sup.wait_exit(15000);
 	d.write_evidence("supervisor_result.txt",
@@ -1253,8 +1128,6 @@ static bool run_c19(CaseDriver& d) {
 	return d.ok();
 }
 
-// C20: crash-loop cap. A child that dies instantly (/bin/false) restarts
-// exactly max_restarts times, then GAVE_UP with a non-zero exit (design §35.4).
 static bool run_c20(CaseDriver& d) {
 	d.begin_case("C20",
 	             "supervisor crash loop: /bin/false child -> RESTART x3 -> "
@@ -1294,8 +1167,6 @@ static bool run_c20(CaseDriver& d) {
 	return d.ok();
 }
 
-// C21: clean exit. A child that finishes by itself (exit 0) must NOT be
-// restarted (design §35.4).
 static bool run_c21(CaseDriver& d) {
 	d.begin_case("C21",
 	             "supervisor clean exit: --count 2 child finishes -> "
@@ -1330,8 +1201,6 @@ static bool run_c21(CaseDriver& d) {
 	return d.ok();
 }
 
-// ---- dispatcher --------------------------------------------------------------
-
 struct CaseDef {
 	const char* id;
 	const char* desc;
@@ -1346,28 +1215,28 @@ static const CaseDef kCases[] = {
 	         return run_c_publish(d, "C03", "C03",
 	                              "producer killed after slot->WRITING; the WRITING "
 	                              "sample is invisible, the old current stays readable",
-	                              /*expect_ticketed=*/false);
+	                              false);
          }},
         {"C04", "producer dies mid payload copy (WRITING, invisible)",
          [](CaseDriver& d) {
 	         return run_c_publish(d, "C04", "C04",
 	                              "producer killed mid payload copy; torn-free read of "
 	                              "the old current",
-	                              /*expect_ticketed=*/false);
+	                              false);
          }},
         {"C05", "producer dies after publish, before ticket (unpublished invisible)",
          [](CaseDriver& d) {
 	         return run_c_publish(d, "C05", "C05",
 	                              "slot PUBLISHED but ticket uncommitted: the sample is "
 	                              "invisible to readers",
-	                              /*expect_ticketed=*/false);
+	                              false);
          }},
         {"C06", "producer dies after ticket, before wake (ticketed visible)",
          [](CaseDriver& d) {
 	         return run_c_publish(d, "C06", "C06",
 	                              "ticket committed: the ticketed sample is visible "
 	                              "even though the producer never woke waiters",
-	                              /*expect_ticketed=*/true);
+	                              true);
          }},
         {"C07", "consumer dies at READING_CLAIMING (epoch unset, reclaimed)",
          [](CaseDriver& d) {
@@ -1407,14 +1276,14 @@ static const CaseDef kCases[] = {
 	         return run_c_publish(d, "C22", "C22",
 	                              "write-loan owner killed while WRITING; the borrowed "
 	                              "bytes stay invisible and the old ticket is readable",
-	                              /*expect_ticketed=*/false, /*loaned=*/true);
+	                              false, true);
          }},
         {"C23", "loaned consumer dies while holding READING (reclaimed)",
          [](CaseDriver& d) {
 	         return run_c_consumer(d, "C23", "C23",
 	                               "read-loan owner killed while READING; a new consumer "
 	                               "reclaims the slot by role epoch",
-	                               "state=reading ", /*loaned=*/true);
+	                               "state=reading ", true);
          }},
 };
 
@@ -1436,7 +1305,7 @@ bool arg_has(int argc, char** argv, const char* flag) {
 
 int main(int argc, char** argv) {
 	if (arg_has(argc, argv, "--list")) {
-		std::printf("edge_crash_matrix case table (design §20.3):\n");
+		std::printf("edge_crash_matrix case table:\n");
 		for (const CaseDef& c : kCases) {
 			std::printf("  %-4s  %s\n", c.id, c.desc);
 		}
@@ -1463,7 +1332,6 @@ int main(int argc, char** argv) {
 		return 2;
 	}
 
-	// ---- select cases ---------------------------------------------------------
 	std::vector<const CaseDef*> selected;
 	if (only != nullptr) {
 		const char* p = only;
@@ -1492,7 +1360,6 @@ int main(int argc, char** argv) {
 		return 2;
 	}
 
-	// ---- run ------------------------------------------------------------------
 	char run_id[128];
 	std::snprintf(run_id, sizeof(run_id), "run_%llu_%ld_s%s",
 	              static_cast<unsigned long long>(unix_secs_now()),

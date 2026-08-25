@@ -28,8 +28,9 @@ uint32_t channel_name_hash(const char* name, size_t len) noexcept {
 	return hash;
 }
 
+// 控制锁目录使用当前用户私有权限，锁文件只保护创建、替换和删除事务。
 Result<ControlLock> ControlLock::acquire(const std::string& lock_path) {
-	// Ensure /run/user/<uid>/edgeruntime exists with 0700 (design §7.1).
+
 	const size_t slash = lock_path.rfind('/');
 	if (slash == std::string::npos || slash == 0) {
 		return make_error(ErrorCode::kInvalidOptions, "control_lock_acquire",
@@ -85,20 +86,17 @@ Result<ControlJournalV1> ControlLock::read_journal() noexcept {
 			const int e = errno;
 			return make_errno_error(e, "control_lock_read_journal", std::strerror(e));
 		}
-		if (n == 0) break;  // short/absent file
+		if (n == 0) break;
 		got += static_cast<size_t>(n);
 	}
 	if (got == 0) {
-		return Result<ControlJournalV1>(journal);  // empty lock file -> idle record
+		return Result<ControlJournalV1>(journal);
 	}
 	if (got != want) {
 		return make_error(ErrorCode::kRecoveryBlocked, "control_lock_read_journal",
 		                  "partial journal record");
 	}
-	// A full-size all-zero record is the "fresh lock file" state (a failed
-	// create restores the pre-transaction record, which is all zeros for a
-	// never-used channel): treat it as Idle, exactly like the empty file.
-	// Garbage records still fail closed on the magic check below.
+
 	bool all_zero = true;
 	const auto* bytes = reinterpret_cast<const unsigned char*>(&journal);
 	for (size_t i = 0; i < sizeof(journal); ++i) {
@@ -108,7 +106,7 @@ Result<ControlJournalV1> ControlLock::read_journal() noexcept {
 		}
 	}
 	if (all_zero) {
-		return Result<ControlJournalV1>(journal);  // fresh file: idle zero record
+		return Result<ControlJournalV1>(journal);
 	}
 	if (std::memcmp(journal.magic, kJournalMagic, 7) != 0) {
 		return make_error(ErrorCode::kRecoveryBlocked, "control_lock_read_journal",
@@ -153,4 +151,4 @@ void ControlLock::release() noexcept {
 	fd_.reset();
 }
 
-}  // namespace edge_runtime::detail
+}

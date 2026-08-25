@@ -26,19 +26,17 @@ void producer_shutdown_impl(const std::shared_ptr<ProducerHandle>& handle) noexc
 Result<void> producer_remove_if_owner_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
 Result<void> producer_heartbeat_impl(const std::shared_ptr<ProducerHandle>& handle) noexcept;
 
-}  // namespace edge_runtime::detail
+}  // 命名空间 edge_runtime::detail
 
 namespace edge_runtime {
 
-// SPSC producer handle (design §9.1, §16.2). Move-only; the underlying fd and
-// MAP_SHARED mapping are released on destruction. publish() is ER2.
+// 单生产者单消费者句柄。句柄独占映射，析构时释放资源；同一句柄不能并发调用。
 template <typename T>
 class Producer {
        public:
 	using value_type = T;
 
-	// Full §9.1 create sequence: validated control-lock transaction, inode-checked
-	// replacement of a dead predecessor, commit at bootstrap READY.
+	// 创建事务会校验控制锁、实例身份，并在确认旧实例失效后提交 READY 状态。
 	static Result<Producer> create(const ChannelOptions& options,
 	                               const SchemaDescriptor& schema) {
 		detail::validate_payload_codec<T>();
@@ -48,8 +46,7 @@ class Producer {
 		return Producer(std::move(h.value()));
 	}
 
-	// Publish a new latest sample (design §11). The codec encode runs here (the
-	// impl never touches T); failures leave shared memory untouched.
+	// 编码失败时不触碰共享内存；成功后只发布完整的最新样本。
 	Result<PublishInfo> publish(const T& value) noexcept {
 		typename PayloadCodec<T>::EncodedBuffer encoded{};
 		const uint32_t size = PayloadCodec<T>::kEncodedSize;
@@ -60,30 +57,23 @@ class Producer {
 		return detail::producer_publish_impl(handle_, encoded.data(), size);
 	}
 
-	// Borrow one shared-memory slot for direct canonical encoding. The returned
-	// WRITING slot is invisible until commit(); dropping it aborts the write.
+	// 借用一个槽直接写入规范编码；只有 commit() 才会让 WRITING 对消费者可见。
 	Result<WriteLoan> loan() noexcept { return detail::producer_loan_impl(handle_); }
 
-	// Slow-check diagnostic: revalidates the name still resolves to this
-	// instance's inode, then snapshots the channel state.
+	// 慢路径诊断：确认名称仍指向当前实例后读取通道状态。
 	Result<ChannelStatus> status() const noexcept {
 		return detail::producer_status_impl(handle_);
 	}
 
-	// Frozen generation of the owned instance (design §15.6). Advances by one on
-	// each verified replacement; used by tests/CLI to prove generation+1.
+	// 当前实例代数；实例被验证替换后递增。
 	uint64_t generation() const noexcept { return detail::producer_generation_impl(handle_); }
 
-	// Explicit verified removal of the owned instance (design §9.4). Never called
-	// implicitly from the destructor.
+	// 仅删除仍由当前句柄拥有的实例，析构函数不会隐式执行删除。
 	Result<void> remove_if_owner() noexcept {
 		return detail::producer_remove_if_owner_impl(handle_);
 	}
 
-	// v0.2 optional heartbeat (design §34): declare "the application is still
-	// making progress" between publishes. No-op data-wise when the channel was
-	// created with heartbeat disabled; otherwise stores BOOTTIME into
-	// heartbeat_boot_ns under the same stale guards as publish().
+	// 向共享状态写入应用进度；关闭心跳时该调用不改变数据。
 	Result<void> heartbeat() noexcept {
 		return detail::producer_heartbeat_impl(handle_);
 	}
@@ -98,8 +88,7 @@ class Producer {
 		return *this;
 	}
 
-	// Best-effort clean shutdown (design §15.2): marks the shared producer_state
-	// OFFLINE so a same-process recreate is not mistaken for a live owner.
+	// 尽力执行干净关闭，将 Producer 状态标记为 OFFLINE。
 	~Producer() {
 		if (handle_) detail::producer_shutdown_impl(handle_);
 	}
@@ -110,6 +99,6 @@ class Producer {
 	std::shared_ptr<detail::ProducerHandle> handle_;
 };
 
-}  // namespace edge_runtime
+}  // 命名空间 edge_runtime
 
 #endif  // EDGE_RUNTIME_PRODUCER_HPP

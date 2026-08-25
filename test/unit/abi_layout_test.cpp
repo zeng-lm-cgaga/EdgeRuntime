@@ -1,7 +1,4 @@
-// U01–U04: frozen ABI layout, naming, ticket packing, mapping formula.
-// The offsets/sizes here are living evidence of the v0.1 contract (§8); the
-// structs themselves are also static_assert'd in channel_layout.hpp, this test
-// asserts the values the design document freezes.
+
 
 #include <gtest/gtest.h>
 #include <unistd.h>
@@ -35,7 +32,7 @@ using edge_runtime::detail::ticket_sequence;
 using edge_runtime::detail::ticket_slot;
 using edge_runtime::detail::validate_channel_name;
 
-TEST(AbiLayout, FrozenRecordSizes) {  // U04
+TEST(AbiLayout, FrozenRecordSizes) {
 	EXPECT_EQ(sizeof(BootstrapHeaderAbi), 128u);
 	EXPECT_EQ(sizeof(ChannelHeaderAbi), 320u);
 	EXPECT_EQ(sizeof(SlotHeaderAbi), 64u);
@@ -46,7 +43,7 @@ TEST(AbiLayout, FrozenRecordSizes) {  // U04
 	EXPECT_EQ(alignof(ProcessIdentityAbi), 64u);
 }
 
-TEST(AbiLayout, BootstrapOffsets) {  // U04
+TEST(AbiLayout, BootstrapOffsets) {
 	EXPECT_EQ(offsetof(BootstrapHeaderAbi, magic), 0u);
 	EXPECT_EQ(offsetof(BootstrapHeaderAbi, abi_major), 8u);
 	EXPECT_EQ(offsetof(BootstrapHeaderAbi, header_size), 12u);
@@ -56,7 +53,7 @@ TEST(AbiLayout, BootstrapOffsets) {  // U04
 	EXPECT_EQ(offsetof(BootstrapHeaderAbi, bootstrap_checksum), 80u);
 }
 
-TEST(AbiLayout, HeaderOffsets) {  // U04
+TEST(AbiLayout, HeaderOffsets) {
 	EXPECT_EQ(offsetof(ChannelHeaderAbi, magic), 0u);
 	EXPECT_EQ(offsetof(ChannelHeaderAbi, endian_marker), 16u);
 	EXPECT_EQ(offsetof(ChannelHeaderAbi, payload_size), 24u);
@@ -68,16 +65,15 @@ TEST(AbiLayout, HeaderOffsets) {  // U04
 	EXPECT_EQ(offsetof(ChannelHeaderAbi, producer_state), 272u);
 	EXPECT_EQ(offsetof(ChannelHeaderAbi, publish_count), 280u);
 	EXPECT_EQ(offsetof(ChannelHeaderAbi, last_publish_boot_ns), 296u);
-	// v0.2 §34: heartbeat fields occupy the former trailing padding; the struct
-	// size stays 320 so every v0.1 offset above is unchanged.
+
 	EXPECT_EQ(offsetof(ChannelHeaderAbi, heartbeat_boot_ns), 304u);
 	EXPECT_EQ(offsetof(ChannelHeaderAbi, producer_heartbeat_interval_ns), 312u);
 	EXPECT_EQ(sizeof(ChannelHeaderAbi), 320u);
-	EXPECT_EQ(kAbiMinor, 0u);     // written when heartbeat is disabled
-	EXPECT_EQ(kAbiMinorMax, 1u);  // minor 1 == optional heartbeat
+	EXPECT_EQ(kAbiMinor, 0u);
+	EXPECT_EQ(kAbiMinorMax, 1u);
 }
 
-TEST(AbiLayout, SlotOffsets) {  // U04
+TEST(AbiLayout, SlotOffsets) {
 	EXPECT_EQ(offsetof(SlotHeaderAbi, state), 0u);
 	EXPECT_EQ(offsetof(SlotHeaderAbi, payload_checksum), 24u);
 	EXPECT_EQ(offsetof(SlotHeaderAbi, reader_role_epoch), 32u);
@@ -86,59 +82,59 @@ TEST(AbiLayout, SlotOffsets) {  // U04
 	EXPECT_EQ(kFirstSlotOffset, 448u);
 }
 
-TEST(ChannelLayout, NameValidation) {  // U01
-	// allowed charset: [a-zA-Z0-9_.-]
+TEST(ChannelLayout, NameValidation) {
+
 	EXPECT_TRUE(validate_channel_name("sensor.1", 8));
 	EXPECT_TRUE(validate_channel_name("a-b_c.d", 7));
 	EXPECT_TRUE(validate_channel_name("x", 1));
 	EXPECT_TRUE(validate_channel_name("-a", 2));
 	EXPECT_TRUE(validate_channel_name("a-", 2));
 	EXPECT_TRUE(validate_channel_name("a_b_c_", 6));
-	// empty / null
+
 	EXPECT_FALSE(validate_channel_name("", 0));
 	EXPECT_FALSE(validate_channel_name(nullptr, 0));
-	// path traversal guard: "/" and consecutive ".."
+
 	EXPECT_FALSE(validate_channel_name("a/b", 3));
 	EXPECT_FALSE(validate_channel_name("..", 2));
 	EXPECT_FALSE(validate_channel_name("a..b", 4));
 	EXPECT_FALSE(validate_channel_name("a.b..c", 6));
-	// whitespace and control chars rejected
+
 	EXPECT_FALSE(validate_channel_name("a b", 3));
 	EXPECT_FALSE(validate_channel_name("a\tb", 3));
-	// length bound
+
 	std::string max_name(64, 'a');
 	EXPECT_TRUE(validate_channel_name(max_name.c_str(), max_name.size()));
 	std::string too_long(65, 'a');
 	EXPECT_FALSE(validate_channel_name(too_long.c_str(), too_long.size()));
 }
 
-TEST(ChannelLayout, TicketPacking) {       // U03
-	EXPECT_EQ(make_ticket(0, 0), 0u);  // ticket 0 == unpublished
+TEST(ChannelLayout, TicketPacking) {
+	EXPECT_EQ(make_ticket(0, 0), 0u);
 	EXPECT_EQ(ticket_sequence(make_ticket(7, 2)), 7u);
 	EXPECT_EQ(ticket_slot(make_ticket(7, 2)), 2u);
-	// maximum sequence still fits, slot bits preserved
+
 	const uint64_t max_ticket = make_ticket(kMaxSampleSequence, 3);
 	EXPECT_EQ(ticket_sequence(max_ticket), kMaxSampleSequence);
 	EXPECT_EQ(ticket_slot(max_ticket), 3u);
 }
 
-TEST(ChannelLayout, MappingFormula) {  // U02
+TEST(ChannelLayout, MappingFormula) {
 	uint64_t m = 0;
-	// payload 0 -> stride 64 -> 448 + 3*64 = 640
+
 	ASSERT_TRUE(mapping_size_for_payload(0, &m));
 	EXPECT_EQ(m, kFirstSlotOffset + 3 * 64u);
-	// payload 64 -> stride 128
+
 	ASSERT_TRUE(mapping_size_for_payload(64, &m));
 	EXPECT_EQ(m, kFirstSlotOffset + 3 * 128u);
-	// max payload 65536 -> stride 65600 (no slack: 65600 % 64 == 0)
+
 	ASSERT_TRUE(mapping_size_for_payload(kMaxPayloadSize, &m));
 	EXPECT_EQ(m, kFirstSlotOffset + 3 * 65600u);
-	// payload that forces rounding
+
 	ASSERT_TRUE(mapping_size_for_payload(65, &m));
 	EXPECT_EQ(m, kFirstSlotOffset + 3 * (64 + 128u));
 }
 
-TEST(ChannelLayout, SlotByteOffset) {  // U02
+TEST(ChannelLayout, SlotByteOffset) {
 	uint64_t o = 0;
 	const uint64_t stride = 128;
 	ASSERT_TRUE(slot_byte_offset(0, stride, &o));
@@ -147,13 +143,13 @@ TEST(ChannelLayout, SlotByteOffset) {  // U02
 	EXPECT_EQ(o, kFirstSlotOffset + stride);
 	ASSERT_TRUE(slot_byte_offset(2, stride, &o));
 	EXPECT_EQ(o, kFirstSlotOffset + 2 * stride);
-	EXPECT_FALSE(slot_byte_offset(3, stride, &o));  // out of range
+	EXPECT_FALSE(slot_byte_offset(3, stride, &o));
 }
 
-TEST(ChannelLayout, Naming) {  // U01
+TEST(ChannelLayout, Naming) {
 	const std::string uid = std::to_string(getuid());
 	EXPECT_EQ(channel_shm_name("abc"), "/edgeruntime." + uid + ".abc");
 	EXPECT_EQ(channel_lock_path("abc"), "/run/user/" + uid + "/edgeruntime/abc.lock");
 }
 
-}  // namespace
+}

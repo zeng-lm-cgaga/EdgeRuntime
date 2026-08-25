@@ -1,19 +1,4 @@
-// edge_shm_bench_sock: the Unix domain socket baseline for the ER7 benchmark
-// (design §21.2 "transport" dimension). One binary, two roles:
-//
-//   --role producer: bind+listen+accept a SOCK_STREAM socket, then send
-//       BenchPayloadV1<N> bytes (publish_ns stamped right before send) paced by
-//       --rate — the natural backpressure baseline (every sample delivered,
-//       no latest-value semantics, no futex).
-//   --role consumer: connect, recv exactly N bytes per sample, decode+validate,
-//       stamp a RAW receive_ns at the same public-read boundary as ShmChannel,
-//       and write the same 7-column
-//       rows as the ShmChannel consumer (generation/missed are 0 here) so the
-//       bench driver produces a comparable samples.csv.
-//
-// The consumer closing the connection (its run caps) makes the producer's next
-// send hit EPIPE, which ends the producer — so both sides stop together.
-
+// Unix 套接字基准端点提供对照传输，帮助区分共享内存协议和调度开销。
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -85,7 +70,7 @@ int run_sock_producer_n(const Args& a) {
 		return 2;
 	}
 	::close(fd);
-	::unlink(a.sock_path.c_str());  // socket node is consumed by the connection
+	::unlink(a.sock_path.c_str());
 
 	const int64_t deadline_ms = a.max_time_ms > 0 ? edge_tool::monotonic_ms_now() +
 	                                                        static_cast<int64_t>(a.max_time_ms)
@@ -96,7 +81,7 @@ int run_sock_producer_n(const Args& a) {
 
 	uint64_t published = 0;
 	for (;;) {
-		if (published > 0) pacer.wait_until_next();  // first sample is immediate
+		if (published > 0) pacer.wait_until_next();
 		const uint64_t publish_ns = monotonic_raw_now_ns();
 		bench::BenchPayloadV1<N> v{};
 		v.counter = published;
@@ -131,7 +116,7 @@ int run_sock_producer_n(const Args& a) {
 			::close(cfd);
 			return 3;
 		}
-		if (consumer_closed) break;  // consumer reached its run cap
+		if (consumer_closed) break;
 		++published;
 		if (a.samples > 0 && published >= a.samples) break;
 		if (deadline_ms != 0 && edge_tool::monotonic_ms_now() >= deadline_ms) break;
@@ -171,7 +156,7 @@ int run_sock_consumer_n(const Args& a) {
 			return 2;
 		}
 		struct timespec ts {};
-		ts.tv_nsec = 10 * 1000000L;  // 10 ms
+		ts.tv_nsec = 10 * 1000000L;
 		::nanosleep(&ts, nullptr);
 	}
 	std::printf("READY\n");
@@ -199,7 +184,7 @@ int run_sock_consumer_n(const Args& a) {
 		bool producer_closed = false;
 		while (got < N) {
 			const ssize_t r = ::recv(fd, buf.data() + got, N - got, 0);
-			if (r == 0) {  // producer closed (its own caps hit)
+			if (r == 0) {
 				producer_closed = true;
 				break;
 			}
@@ -223,8 +208,7 @@ int run_sock_consumer_n(const Args& a) {
 			++torn;
 			break;
 		}
-		// Match ShmChannel's public read boundary: wait_latest() returns only after
-		// local copy, checksum, and codec decode have completed.
+
 		const uint64_t receive_ns = monotonic_raw_now_ns();
 		const uint64_t latency = receive_ns >= v.publish_ns ? receive_ns - v.publish_ns : 0;
 		std::fprintf(csv, "%" PRIu64 ",0,%u,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0\n",
@@ -259,8 +243,6 @@ int run_sock_consumer_n(const Args& a) {
 	return torn > 0 ? 4 : 0;
 }
 
-// C++17 has no templated lambdas, so the payload dispatch goes through two
-// namespace-scope tag structs with static template member functions.
 struct SockProducerRole {
 	template <size_t N>
 	static int run(const Args& args) {
@@ -298,7 +280,7 @@ int dispatch_sock_payload(const Args& a) {
 	}
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
 	const char* role = edge_tool::arg_value(argc, argv, "--role");

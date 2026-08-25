@@ -1,21 +1,4 @@
-// edge_shm_supervisor: v0.3 ProducerSupervisor CLI host (design §35). Spawns
-// the given producer argv as its supervised child, watches the channel, and
-// restarts on crash / heartbeat stall with bounded backoff. Emits stable
-// one-line markers that test drivers and the crash matrix parse:
-//
-//   SUPERVISED pid=N gen=N         child spawned and confirmed READY
-//   STALL_DETECTED pid=N           heartbeat stale -> takeover sequence
-//   KILLED sig=9 pid=N             escalated to SIGKILL during a kill sequence
-//   RESTART attempt=N delay=Ns     failure counted, backoff armed
-//   GAVE_UP attempts=N restarts=N crash-loop cap hit
-//   CLEAN_EXIT pid=N              child exited cleanly on its own
-//   STOPPED                        request_stop / SIGTERM/SIGINT
-//
-// Exit codes: 0 = clean exit / stopped, 3 = restarts exhausted, 2 = bad
-// arguments, 1 = library error. `--child-env K=V` (repeatable) injects env
-// into the child (failpoint control for S2/C20); `--forward-stdout` prefixes
-// the child's stdout lines to the supervisor's own stdout.
-
+// 监督器工具把 ProducerSupervisor 的状态事件转换为稳定的一行标记，便于驱动核对。
 #include <atomic>
 #include <csignal>
 #include <cinttypes>
@@ -32,7 +15,6 @@
 
 namespace {
 
-// Split "a b c" on whitespace (no quoting support — argv for tests/tools).
 std::vector<std::string> split_ws(const std::string& s) {
 	std::vector<std::string> out;
 	std::string cur;
@@ -55,7 +37,6 @@ int64_t arg_ms(int argc, char** argv, const char* flag, int64_t dflt) {
 	return v != nullptr ? std::strtoll(v, nullptr, 10) : dflt;
 }
 
-// run()-thread event callback -> stable one-line markers (design §35.2).
 void on_event(const edge_runtime::SupervisorEventInfo& info, void*) {
 	switch (info.event) {
 		case edge_runtime::SupervisorEvent::kSupervised:
@@ -76,7 +57,7 @@ void on_event(const edge_runtime::SupervisorEventInfo& info, void*) {
 	std::fflush(stdout);
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
 	const char* name = edge_tool::arg_value(argc, argv, "--name");
@@ -115,9 +96,6 @@ int main(int argc, char** argv) {
 	        edge_tool::arg_u64(argc, argv, "--forward-stdout", 0) != 0;
 	opts.on_event = on_event;
 
-	// --child-env K=V (repeatable): inject into this process's environment
-	// BEFORE the supervisor spawns (the child inherits it — failpoint control
-	// for S2/C20). Single-threaded at this point, so setenv is safe.
 	for (int i = 1; i + 1 < argc; ++i) {
 		if (std::strcmp(argv[i], "--child-env") == 0) {
 			const std::string kv = argv[i + 1];
@@ -139,9 +117,6 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 
-	// No local signal handler: run() blocks SIGTERM/SIGINT in its thread and
-	// receives them via signalfd (design §35.3). The tool is single-threaded,
-	// so the stop path is deterministic.
 	auto result = sup.value().run();
 	if (!result) {
 		std::printf("SUPERVISOR_FAIL code=%s ctx=%s\n",

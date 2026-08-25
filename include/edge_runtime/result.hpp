@@ -8,15 +8,13 @@
 
 namespace edge_runtime {
 
-// Non-throwing result wrapper (design §16.3). The value path never throws,
-// never allocates beyond T's own construction, and supports move-only T
-// (Producer/Consumer handles are move-only).
+// 非异常结果包装器；成功值和固定大小 Error 二选一，支持不可复制的句柄类型。
 template <typename T>
 class Result {
        public:
-	Result(T value) : value_(std::move(value)) {}        // NOLINT
-	Result(const Error& error) : error_(error) {}        // NOLINT
-	Result(Error&& error) : error_(std::move(error)) {}  // NOLINT
+	Result(T value) : value_(std::move(value)) {}
+	Result(const Error& error) : error_(error) {}
+	Result(Error&& error) : error_(std::move(error)) {}
 	Result(ErrorCode code, const char* operation, const char* context = nullptr)
 	    : error_(make_error(code, operation, context)) {}
 
@@ -44,8 +42,8 @@ template <>
 class Result<void> {
        public:
 	Result() = default;
-	Result(const Error& error) : error_(error), failed_(true) {}        // NOLINT
-	Result(Error&& error) : error_(std::move(error)), failed_(true) {}  // NOLINT
+	Result(const Error& error) : error_(error), failed_(true) {}
+	Result(Error&& error) : error_(std::move(error)), failed_(true) {}
 	Result(ErrorCode code, const char* operation, const char* context = nullptr)
 	    : error_(make_error(code, operation, context)), failed_(true) {}
 
@@ -67,6 +65,6 @@ class Result<void> {
 	bool failed_ = false;
 };
 
-}  // namespace edge_runtime
+}  // 命名空间 edge_runtime
 
 #endif  // EDGE_RUNTIME_RESULT_HPP

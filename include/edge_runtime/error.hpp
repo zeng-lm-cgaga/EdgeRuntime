@@ -5,9 +5,6 @@
 
 namespace edge_runtime {
 
-// Frozen ErrorCode values (design §17). The order and underlying values are
-// part of the stable contract; tests U08 and I05–I09 assert them. Do not
-// reorder or renumber.
 enum class ErrorCode : uint32_t {
 	kInvalidName = 0,
 	kInvalidOptions,
@@ -37,15 +34,16 @@ enum class ErrorCode : uint32_t {
 	kSequenceExhausted,
 	kConcurrentHandleUse,
 	kSystemError,
-	// v0.2 (design §17/§34)
+
+	// 新增错误码只能追加，数值顺序是跨进程稳定契约。
 	kProducerStalled,
 	kTransportFailed,
-	// v0.3 (design §35)
+
+	// 监督器达到重启上限，后续不再自动拉起子进程。
 	kSupervisionExhausted,
 };
 
-// Fixed-size error payload. The hot path must not allocate or throw (design
-// §11, §16.3), so context is a fixed buffer, never std::string.
+// 固定大小错误载荷，热路径不分配内存也不抛异常。
 struct Error {
 	ErrorCode code{ErrorCode::kSystemError};
 	int errno_value{0};
@@ -59,19 +57,15 @@ struct Error {
 
 const char* to_string(ErrorCode code) noexcept;
 
-// errno -> stable ErrorCode (U08). The mapping must not drift.
 ErrorCode classify_errno(int errno_value) noexcept;
 
 Error make_error(ErrorCode code, const char* operation, const char* context = nullptr) noexcept;
 
-// Syscall failure helpers. Capture errno at the call site before any other
-// libc call can overwrite it; the first overload derives the stable code,
-// while the second preserves a domain-specific code such as TransportFailed.
 Error make_errno_error(int saved_errno, const char* operation,
                        const char* context = nullptr) noexcept;
 Error make_errno_error(ErrorCode code, int saved_errno, const char* operation,
                        const char* context = nullptr) noexcept;
 
-}  // namespace edge_runtime
+}  // 命名空间 edge_runtime
 
 #endif  // EDGE_RUNTIME_ERROR_HPP

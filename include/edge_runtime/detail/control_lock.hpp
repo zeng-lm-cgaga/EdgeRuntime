@@ -9,6 +9,7 @@
 
 namespace edge_runtime::detail {
 
+// 控制日志记录创建、替换和删除事务，崩溃后用于确认实例归属与恢复边界。
 enum class JournalState : uint32_t {
 	kIdle = 0,
 	kCreatingPreObject = 1,
@@ -17,33 +18,29 @@ enum class JournalState : uint32_t {
 	kRemoving = 4,
 };
 
-inline constexpr char kJournalMagic[] = "EDGJRN1";  // 7 chars, NUL not copied
+inline constexpr char kJournalMagic[] = "EDGJRN1";
 inline constexpr uint32_t kJournalVersion = 1;
 inline constexpr size_t kJournalRecordSize = 256;
 
-// Fixed-width ControlJournalV1 record (design §7.3), serialized into the lock
-// file with pwrite and guarded by flock. Never on the publish/read hot path.
-// Value-initialize before filling so padding bytes are deterministic.
 struct alignas(64) ControlJournalV1 {
-	char magic[8];               // 0
-	uint32_t version;            // 8
-	uint32_t channel_hash;       // 12
-	uint32_t state;              // 16  (JournalState)
-	uint32_t reserved0;          // 20
-	uint64_t target_dev;         // 24
-	uint64_t target_ino;         // 32
-	uint64_t old_generation;     // 40
-	uint64_t new_generation;     // 48
-	uint64_t old_nonce_hi;       // 56
-	uint64_t old_nonce_lo;       // 64
-	uint64_t new_nonce_hi;       // 72
-	uint64_t new_nonce_lo;       // 80
-	ProcessIdentityAbi creator;  // 128 (aligned to 64)
-	uint64_t record_checksum;    // 192
-	// v0.2 (design §7.3): transport occupies the first 4 bytes of the former
-	// reserved tail. Journal version stays 1; old records read 0 == kPosixShm.
-	uint32_t transport;   // 200
-	uint8_t reserved[52];  // 204
+	char magic[8];
+	uint32_t version;
+	uint32_t channel_hash;
+	uint32_t state;
+	uint32_t reserved0;
+	uint64_t target_dev;
+	uint64_t target_ino;
+	uint64_t old_generation;
+	uint64_t new_generation;
+	uint64_t old_nonce_hi;
+	uint64_t old_nonce_lo;
+	uint64_t new_nonce_hi;
+	uint64_t new_nonce_lo;
+	ProcessIdentityAbi creator;
+	uint64_t record_checksum;
+
+	uint32_t transport;
+	uint8_t reserved[52];
 };
 static_assert(sizeof(ControlJournalV1) == kJournalRecordSize, "journal record size");
 static_assert(offsetof(ControlJournalV1, channel_hash) == 12, "journal channel_hash");
@@ -53,15 +50,13 @@ static_assert(offsetof(ControlJournalV1, creator) == 128, "journal creator");
 static_assert(offsetof(ControlJournalV1, record_checksum) == 192, "journal checksum");
 static_assert(offsetof(ControlJournalV1, transport) == 200, "journal transport");
 
-// Checksum over the whole record with the checksum field zeroed.
 uint64_t journal_checksum(const ControlJournalV1& journal) noexcept;
 
-// FNV-1a 32-bit hash of the channel name, used to bind a journal to a name.
 uint32_t channel_name_hash(const char* name, size_t len) noexcept;
 
-// An flock(LOCK_EX) guard over the control-lock file, plus the journal record.
 class ControlLock {
        public:
+	// 锁的生命周期覆盖一次完整控制面事务，不能跨线程转移使用。
 	static Result<ControlLock> acquire(const std::string& lock_path);
 
 	~ControlLock() { release(); }
@@ -76,11 +71,8 @@ class ControlLock {
 		return *this;
 	}
 
-	// Reads and validates the journal record; an empty/short lock file returns
-	// a zeroed record with state kIdle.
 	Result<ControlJournalV1> read_journal() noexcept;
 
-	// Writes the record with a fresh checksum and fdatasyncs.
 	Result<void> write_journal(const ControlJournalV1& journal) noexcept;
 
 	void release() noexcept;
@@ -90,6 +82,6 @@ class ControlLock {
 	UniqueFd fd_;
 };
 
-}  // namespace edge_runtime::detail
+}  // 命名空间 edge_runtime::detail
 
 #endif  // EDGE_RUNTIME_DETAIL_CONTROL_LOCK_HPP

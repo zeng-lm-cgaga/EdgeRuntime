@@ -85,4 +85,4 @@ TEST(SupervisorPolicy, RejectsZeroStableResetWindow) {
 	EXPECT_EQ(supervisor.error().code, edge_runtime::ErrorCode::kInvalidOptions);
 }
 
-}  // namespace
+}

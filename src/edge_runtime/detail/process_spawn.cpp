@@ -23,8 +23,9 @@ std::vector<char*> build_c_argv(const std::vector<std::string>& argv) {
 	c_argv.push_back(nullptr);
 	return c_argv;
 }
-}  // namespace
+}
 
+// 子进程只继承必要的标准输出管道，spawn 失败时由调用方决定是否重启。
 Result<SpawnedProcess> spawn_process(const std::vector<std::string>& argv) noexcept {
 	if (argv.empty() || argv[0].empty()) {
 		return make_error(ErrorCode::kInvalidOptions, "spawn_process", "empty argv");
@@ -95,4 +96,4 @@ Result<SpawnedProcess> spawn_process(const std::vector<std::string>& argv) noexc
 	return Result<SpawnedProcess>(std::move(sp));
 }
 
-}  // namespace edge_runtime::detail
+}

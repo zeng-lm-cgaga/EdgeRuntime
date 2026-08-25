@@ -22,7 +22,7 @@ struct ThrowingMovePayload {
 	ThrowingMovePayload(ThrowingMovePayload&&) noexcept(false) {}
 };
 
-}  // namespace
+}
 
 namespace edge_runtime {
 
@@ -88,7 +88,7 @@ struct PayloadCodec<ThrowingMovePayload> {
 	static bool decode(const std::byte*, size_t, ThrowingMovePayload*) noexcept { return true; }
 };
 
-}  // namespace edge_runtime
+}
 
 namespace {
 
@@ -120,4 +120,4 @@ TEST(SchemaContract, DetectsValidAndInvalidCodecs) {
 	EXPECT_FALSE(edge_runtime::kSupportedPayload<ThrowingMovePayload>);
 }
 
-}  // namespace
+}

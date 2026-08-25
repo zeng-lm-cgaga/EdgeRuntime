@@ -41,6 +41,7 @@ class UniqueFd {
 	int fd_ = -1;
 };
 
+// MappedRegion 独占一次 mmap 映射，移动后源对象不再负责 munmap。
 class MappedRegion {
        public:
 	MappedRegion() noexcept = default;
@@ -78,8 +79,7 @@ class MappedRegion {
 	size_t size_ = 0;
 };
 
-// Owns one POSIX shared-memory object: name, fd, mapping and its
-// dev/inode/size identity (design §7.3/§9.4).
+// ShmObject 绑定名称、文件描述符、映射以及 dev/inode/size 身份。
 struct ShmObject {
 	std::string name;
 	UniqueFd fd;
@@ -89,42 +89,25 @@ struct ShmObject {
 	uint64_t size = 0;
 };
 
-// Create a new named shm object (O_CREAT|O_EXCL, 0600). The object is created
-// EMPTY (size 0): the caller truncates/extends it as its transaction proceeds.
-// This preserves the design §9.1 narrow recovery window — a creator killed
-// right after shm_open leaves a provably-nothing object (size 0) that a
-// takeover can unlink, whereas any truncated object could be someone else's.
 Result<UniqueFd> shm_open_create(const std::string& posix_name);
 
-// Open an existing named shm object (O_RDWR|O_CLOEXEC).
 Result<UniqueFd> shm_open_existing(const std::string& posix_name);
 
 Result<void> shm_truncate(const UniqueFd& fd, uint64_t size);
 
 Result<MappedRegion> mmap_region(const UniqueFd& fd, uint64_t size);
 
-// Read-only mapping for a fd granted with read-only access (v0.2 §33.4: ctl
-// inspect via the broker). PROT_READ only; writing through it would SIGSEGV.
 Result<MappedRegion> mmap_region_readonly(const UniqueFd& fd, uint64_t size);
 
-// fstat validation: owner uid == euid, mode 0600, regular file; captures
-// st_dev/st_ino/st_size. Fails closed on any mismatch.
 Result<void> shm_fstat_and_capture(const UniqueFd& fd, uint64_t* dev, uint64_t* ino,
                                    uint64_t* size);
 
-// Inode-checked unlink (design §9.4): reopen the name, revalidate dev/ino,
-// shm_unlink, then confirm the name is ENOENT. A new object under the same
-// name is a race -> NameRaceDetected, never touched.
 Result<void> shm_unlink_checked(const std::string& posix_name, uint64_t expected_dev,
                                 uint64_t expected_ino);
 
-// fstat validation for a memfd-backed object (v0.2, design §33.3). memfd fstat
-// mode is typically 0700, so the exact-0600 rule of shm_fstat_and_capture does
-// not apply; instead: regular file, owner uid == euid, and no group/other
-// write/execute bits. Captures st_dev/st_ino/st_size.
 Result<void> memfd_fstat_and_capture(const UniqueFd& fd, uint64_t* dev, uint64_t* ino,
                                      uint64_t* size);
 
-}  // namespace edge_runtime::detail
+}  // 命名空间 edge_runtime::detail
 
 #endif  // EDGE_RUNTIME_DETAIL_SHM_OBJECT_HPP

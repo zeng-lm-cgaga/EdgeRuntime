@@ -1,5 +1,4 @@
-// U11/U13: ControlJournalV1 checksum determinism, name-hash binding, and a
-// real lock-file round-trip under flock (control plane only, never hot path).
+
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
@@ -22,38 +21,34 @@ using edge_runtime::detail::journal_checksum;
 using edge_runtime::detail::JournalState;
 using edge_runtime::detail::make_control_journal;
 
-TEST(ControlJournal, ChecksumDeterministic) {           // U11
-	edge_runtime::detail::ProcessIdentity creator;  // pid 0, zeroed
+TEST(ControlJournal, ChecksumDeterministic) {
+	edge_runtime::detail::ProcessIdentity creator;
 	auto j1 = make_control_journal("abc", JournalState::kCreatingObject, 1, 2, 3, 4, 5, 6,
 	                               creator);
 	const uint64_t c1 = journal_checksum(j1);
-	// the record ships with a zeroed checksum field (write_journal fills it);
-	// the hashed value must be deterministic and non-zero over real content
+
 	EXPECT_NE(c1, 0u);
 
-	// identical record -> identical checksum (padding is value-initialized)
 	auto j2 = make_control_journal("abc", JournalState::kCreatingObject, 1, 2, 3, 4, 5, 6,
 	                               creator);
 	EXPECT_EQ(journal_checksum(j2), c1);
 
-	// any content bit flip changes the checksum
 	j2.channel_hash ^= 1u;
 	EXPECT_NE(journal_checksum(j2), c1);
 
-	// the checksum field itself is excluded from the hashed region
 	j2 = j1;
 	j2.record_checksum = 0xDEADBEEFu;
 	EXPECT_EQ(journal_checksum(j2), c1);
 }
 
-TEST(ControlJournal, NameHashBinding) {  // U11
+TEST(ControlJournal, NameHashBinding) {
 	EXPECT_NE(edge_runtime::detail::channel_name_hash("alpha", 5),
 	          edge_runtime::detail::channel_name_hash("beta", 4));
 	EXPECT_EQ(edge_runtime::detail::channel_name_hash("alpha", 5),
 	          edge_runtime::detail::channel_name_hash("alpha", 5));
 }
 
-TEST(ControlJournal, LockRoundTrip) {  // U13
+TEST(ControlJournal, LockRoundTrip) {
 	const std::string name = "ctrl_" + std::to_string(getpid());
 	const std::string path = channel_lock_path(name);
 
@@ -62,7 +57,6 @@ TEST(ControlJournal, LockRoundTrip) {  // U13
 		ASSERT_TRUE(lock_res) << edge_runtime::to_string(lock_res.error().code);
 		ControlLock lock = std::move(lock_res.value());
 
-		// a fresh lock file reads back as a zeroed idle record
 		auto idle = lock.read_journal();
 		ASSERT_TRUE(idle);
 		EXPECT_EQ(idle.value().state, static_cast<uint32_t>(JournalState::kIdle));
@@ -89,14 +83,12 @@ TEST(ControlJournal, LockRoundTrip) {  // U13
 		EXPECT_EQ(rec.target_dev, 99u);
 		EXPECT_EQ(rec.new_generation, 2u);
 		EXPECT_EQ(rec.creator.pid, static_cast<uint64_t>(getpid()));
-		// checksum validates against the record as read back
+
 		EXPECT_EQ(journal_checksum(rec), rec.record_checksum);
-		// v0.2 §7.3: transport defaults to posix in fresh records (old binary
-		// compatibility — a v0.1 record reads as transport 0).
+
 		EXPECT_EQ(rec.transport, static_cast<uint32_t>(edge_runtime::Transport::kPosixShm));
 		EXPECT_EQ(offsetof(ControlJournalV1, transport), 200u);
 
-		// cleanup: return the journal to idle so later tests see a clean channel
 		edge_runtime::detail::ProcessIdentity creator_id;
 		creator_id.pid = rec.creator.pid;
 		creator_id.proc_start_ticks = rec.creator.proc_start_ticks;
@@ -108,7 +100,7 @@ TEST(ControlJournal, LockRoundTrip) {  // U13
 	}
 }
 
-TEST(ControlJournal, TransportFieldRoundTrip) {  // v0.2 §7.3
+TEST(ControlJournal, TransportFieldRoundTrip) {
 	const std::string name = "ctrl_tr_" + std::to_string(getpid());
 	const std::string path = channel_lock_path(name);
 
@@ -131,15 +123,14 @@ TEST(ControlJournal, TransportFieldRoundTrip) {  // v0.2 §7.3
 		EXPECT_EQ(rd.value().transport,
 		          static_cast<uint32_t>(edge_runtime::Transport::kMemfdFdPass));
 		EXPECT_EQ(rd.value().new_generation, 1u);
-		// the transport field is inside the checksummed record: tampering must
-		// be detected (journal_checksum covers the whole record).
+
 		auto tampered = rd.value();
 		tampered.transport = 0;
 		EXPECT_NE(journal_checksum(tampered), tampered.record_checksum);
 	}
 }
 
-TEST(ControlJournal, CorruptRecordRejected) {  // U13
+TEST(ControlJournal, CorruptRecordRejected) {
 	const std::string name = "ctrl_corrupt_" + std::to_string(getpid());
 	const std::string path = channel_lock_path(name);
 
@@ -150,13 +141,10 @@ TEST(ControlJournal, CorruptRecordRejected) {  // U13
 		const auto creator = current_process_identity();
 		auto rec = make_control_journal(name, JournalState::kCreatingObject, 1, 2, 3, 4, 5,
 		                                6, creator);
-		auto wr = lock.write_journal(rec);  // checksummed correctly
+		auto wr = lock.write_journal(rec);
 		ASSERT_TRUE(wr);
 	}
 
-	// write_journal always stamps a fresh valid checksum, so corruption must be
-	// introduced at the raw file level: flip a payload byte (new_nonce_lo @ 80)
-	// and leave the stored checksum unchanged.
 	{
 		const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
 		ASSERT_GE(fd, 0);
@@ -178,4 +166,4 @@ TEST(ControlJournal, CorruptRecordRejected) {  // U13
 	}
 }
 
-}  // namespace
+}

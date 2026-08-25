@@ -1,11 +1,4 @@
-// Cross-exec reopen helper (ER1 I01): a SEPARATE binary that re-opens the
-// channel by name and verifies the frozen identity (generation, instance
-// nonce, ABI, schema, endpoint states) that the driver producer created. It
-// proves a true reopen: this image's mmap is fresh, not inherited.
-//
-// usage: reopen_child <name> <schema_version> <fingerprint_hex64> <gen>
-//                      <nonce_hi> <nonce_lo>
-// prints "OPEN_RESULT ok=1|0 ..." to stdout, exit 0 on success.
+
 
 #include <array>
 #include <cstdint>
@@ -39,7 +32,7 @@ std::array<std::byte, 32> parse_fingerprint(const char* hex) {
 	return fp;
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
 	if (argc != 7) {
