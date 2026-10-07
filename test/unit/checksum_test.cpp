@@ -1,6 +1,6 @@
 
 
-#include "edge_runtime/detail/checksum.hpp"
+#include "edge_runtime/utility/checksum.hpp"
 
 #include <gtest/gtest.h>
 

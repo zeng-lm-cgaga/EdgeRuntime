@@ -1,6 +1,6 @@
 
 
-#include "edge_runtime/error.hpp"
+#include "edge_runtime/common/error.hpp"
 
 #include <gtest/gtest.h>
 

@@ -4,8 +4,8 @@
 #include <cstdlib>
 #include <string>
 
-#include "edge_runtime/consumer.hpp"
-#include "edge_runtime/error.hpp"
+#include "edge_runtime/channel/consumer.hpp"
+#include "edge_runtime/common/error.hpp"
 #include "test_payload.hpp"
 
 int main(int argc, char** argv) {

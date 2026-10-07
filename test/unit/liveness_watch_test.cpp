@@ -11,9 +11,9 @@
 #include <cstring>
 #include <thread>
 
-#include "edge_runtime/detail/process_identity.hpp"
-#include "edge_runtime/detail/process_spawn.hpp"
-#include "edge_runtime/detail/shm_object.hpp"
+#include "edge_runtime/process/process_identity.hpp"
+#include "edge_runtime/process/process_spawn.hpp"
+#include "edge_runtime/transport/shm_object.hpp"
 
 namespace {
 

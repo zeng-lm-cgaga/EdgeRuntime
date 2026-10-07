@@ -1,15 +1,17 @@
 # 工具用于运行诊断、故障恢复和跨进程性能采集，不属于公共 API。
-add_executable(edge_runtime_platform_probe platform_probe.cpp)
+add_executable(edge_runtime_platform_probe src/platform_probe.cpp)
 edgeruntime_apply_project_options(edge_runtime_platform_probe)
 target_link_libraries(edge_runtime_platform_probe PRIVATE EdgeRuntime::edge_runtime rt)
 
 function(edgeruntime_tool name)
-  add_executable(${name} ${name}.cpp)
+  add_executable(${name} src/${name}.cpp)
   edgeruntime_apply_project_options(${name})
   target_link_libraries(${name} PRIVATE EdgeRuntime::edge_runtime Threads::Threads rt)
   target_include_directories(
     ${name} PRIVATE
       ${CMAKE_SOURCE_DIR}/test/fixtures
+      ${CMAKE_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
       ${CMAKE_CURRENT_SOURCE_DIR})
 endfunction()
 
@@ -25,6 +27,8 @@ edgeruntime_tool(edge_shm_bench)
 edgeruntime_tool(edge_shm_bench_producer)
 edgeruntime_tool(edge_shm_bench_consumer)
 edgeruntime_tool(edge_shm_bench_sock)
+edgeruntime_tool(edge_mpmc_bench)
+edgeruntime_tool(edge_buffer_pool_bench)
 
 if(BUILD_TESTING)
   add_test(NAME platform_contract COMMAND edge_runtime_platform_probe)
@@ -59,4 +63,22 @@ if(BUILD_TESTING)
             --out-dir ${CMAKE_BINARY_DIR}/evidence/performance)
   set_tests_properties(
     bench_smoke PROPERTIES TIMEOUT 300 LABELS benchmark)
+
+  add_test(NAME mpmc_bench_smoke COMMAND edge_mpmc_bench --smoke)
+  set_tests_properties(mpmc_bench_smoke PROPERTIES TIMEOUT 120 LABELS benchmark)
+
+  add_test(
+    NAME mpmc_bench_spin_smoke
+    COMMAND edge_mpmc_bench --retry-policy spin --payload-size 64 --producers 2
+            --consumers 2 --messages 8 --capacity 4 --timeout-ms 10000)
+  set_tests_properties(mpmc_bench_spin_smoke PROPERTIES TIMEOUT 30 LABELS benchmark)
+
+  add_test(
+    NAME mpmc_wait_bench_smoke
+    COMMAND edge_mpmc_bench --retry-policy yield --wait-policy blocking --payload-size 64
+            --producers 2 --consumers 2 --messages 8 --capacity 4 --timeout-ms 10000)
+  set_tests_properties(mpmc_wait_bench_smoke PROPERTIES TIMEOUT 30 LABELS benchmark)
+
+  add_test(NAME buffer_pool_bench_smoke COMMAND edge_buffer_pool_bench --smoke)
+  set_tests_properties(buffer_pool_bench_smoke PROPERTIES TIMEOUT 120 LABELS benchmark)
 endif()

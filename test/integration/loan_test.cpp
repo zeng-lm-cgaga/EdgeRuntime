@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-#include "edge_runtime/producer.hpp"
+#include "edge_runtime/channel/producer.hpp"
 #include "test_payload.hpp"
 #include "test_util.hpp"
 

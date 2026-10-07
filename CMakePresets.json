@@ -8,7 +8,8 @@
   "configurePresets": [
     {
       "name": "dev-debug",
-      "displayName": "GCC Debug",
+      "displayName": "GCC Debug (out-of-source: build/dev-debug)",
+      "description": "Build outside the source tree under ${sourceDir}/build/dev-debug; src/CMakeLists.txt owns the library sources.",
       "generator": "Unix Makefiles",
       "binaryDir": "${sourceDir}/build/dev-debug",
       "cacheVariables": {
@@ -21,7 +22,8 @@
     },
     {
       "name": "asan-ubsan",
-      "displayName": "GCC ASan + UBSan",
+      "displayName": "GCC ASan + UBSan (out-of-source: build/asan-ubsan)",
+      "description": "Sanitized out-of-source build under ${sourceDir}/build/asan-ubsan; src/CMakeLists.txt owns the library sources.",
       "inherits": "dev-debug",
       "binaryDir": "${sourceDir}/build/asan-ubsan",
       "cacheVariables": {
@@ -30,12 +32,15 @@
     },
     {
       "name": "release",
-      "displayName": "GCC Release",
+      "displayName": "GCC Release (out-of-source: build/release)",
+      "description": "Release out-of-source build under ${sourceDir}/build/release; src/CMakeLists.txt owns the library sources.",
       "inherits": "dev-debug",
       "binaryDir": "${sourceDir}/build/release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "BUILD_TESTING": "OFF"
+        "BUILD_TESTING": "OFF",
+        "EDGERUNTIME_ENABLE_FAILPOINTS": "OFF",
+        "EDGERUNTIME_ENABLE_SANITIZERS": "OFF"
       }
     }
   ],

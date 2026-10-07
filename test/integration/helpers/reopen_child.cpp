@@ -7,8 +7,8 @@
 #include <cstring>
 #include <string>
 
-#include "edge_runtime/consumer.hpp"
-#include "edge_runtime/schema.hpp"
+#include "edge_runtime/channel/consumer.hpp"
+#include "edge_runtime/common/schema.hpp"
 #include "test_payload.hpp"
 #include "test_util.hpp"
 

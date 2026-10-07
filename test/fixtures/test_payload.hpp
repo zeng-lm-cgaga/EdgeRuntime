@@ -6,7 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "edge_runtime/schema.hpp"
+#include "edge_runtime/common/schema.hpp"
 
 struct TestPayloadV1 {
 	uint32_t magic = 0x5A000001u;

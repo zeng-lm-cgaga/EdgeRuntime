@@ -9,14 +9,14 @@
 #include <string>
 #include <vector>
 
-#include "edge_runtime/consumer.hpp"
-#include "edge_runtime/detail/channel_abi.hpp"
-#include "edge_runtime/detail/channel_layout.hpp"
-#include "edge_runtime/detail/control_lock.hpp"
-#include "edge_runtime/detail/process_identity.hpp"
-#include "edge_runtime/detail/shm_object.hpp"
-#include "edge_runtime/error.hpp"
-#include "edge_runtime/producer.hpp"
+#include "edge_runtime/channel/consumer.hpp"
+#include "edge_runtime/channel/channel_abi.hpp"
+#include "edge_runtime/channel/channel_layout.hpp"
+#include "edge_runtime/channel/control_lock.hpp"
+#include "edge_runtime/process/process_identity.hpp"
+#include "edge_runtime/transport/shm_object.hpp"
+#include "edge_runtime/common/error.hpp"
+#include "edge_runtime/channel/producer.hpp"
 #include "test_payload.hpp"
 #include "test_util.hpp"
 

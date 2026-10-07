@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <string>
 
-#include "edge_runtime/detail/channel_layout.hpp"
+#include "edge_runtime/channel/channel_layout.hpp"
 
 namespace {
 

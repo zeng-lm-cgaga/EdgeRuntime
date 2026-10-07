@@ -7,10 +7,10 @@
 #include <thread>
 #include <vector>
 
-#include "edge_runtime/channel_options.hpp"
-#include "edge_runtime/detail/channel_layout.hpp"
-#include "edge_runtime/detail/producer_impl.hpp"
-#include "edge_runtime/error.hpp"
+#include "edge_runtime/channel/channel_options.hpp"
+#include "edge_runtime/channel/channel_layout.hpp"
+#include "edge_runtime/channel/producer_impl.hpp"
+#include "edge_runtime/common/error.hpp"
 #include "test_payload.hpp"
 #include "test_util.hpp"
 

@@ -45,37 +45,7 @@ function(edgeruntime_apply_project_options target)
   endif()
 endfunction()
 
-add_library(edge_runtime STATIC
-  src/edge_runtime/detail/error.cpp
-  src/edge_runtime/detail/channel_abi.cpp
-  src/edge_runtime/detail/channel_layout.cpp
-  src/edge_runtime/detail/channel_observer.cpp
-  src/edge_runtime/detail/checksum.cpp
-  src/edge_runtime/detail/clock.cpp
-  src/edge_runtime/detail/consumer_impl.cpp
-  src/edge_runtime/detail/control_lock.cpp
-  src/edge_runtime/detail/failpoint.cpp
-  src/edge_runtime/detail/fd_broker.cpp
-  src/edge_runtime/detail/futex.cpp
-  src/edge_runtime/detail/loan.cpp
-  src/edge_runtime/detail/process_identity.cpp
-  src/edge_runtime/detail/process_spawn.cpp
-  src/edge_runtime/detail/producer_impl.cpp
-  src/edge_runtime/detail/shm_object.cpp
-  src/edge_runtime/detail/slot_protocol.cpp
-  src/edge_runtime/detail/supervisor_impl.cpp)
-add_library(EdgeRuntime::edge_runtime ALIAS edge_runtime)
-
-target_compile_features(edge_runtime PUBLIC cxx_std_17)
-target_include_directories(
-  edge_runtime
-  PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-
-edgeruntime_apply_project_options(edge_runtime)
-target_link_libraries(edge_runtime PRIVATE rt)
-
+add_subdirectory(src)
 add_subdirectory(tools)
 if(BUILD_TESTING)
   add_subdirectory(test)
@@ -88,6 +58,7 @@ install(
 install(
   DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
   FILES_MATCHING
+    PATTERN "*.h"
     PATTERN "*.hpp"
     PATTERN "detail" EXCLUDE)
 install(

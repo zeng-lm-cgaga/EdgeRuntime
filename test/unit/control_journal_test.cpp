@@ -6,10 +6,10 @@
 
 #include <string>
 
-#include "edge_runtime/channel_options.hpp"
-#include "edge_runtime/detail/channel_abi.hpp"
-#include "edge_runtime/detail/control_lock.hpp"
-#include "edge_runtime/detail/process_identity.hpp"
+#include "edge_runtime/channel/channel_options.hpp"
+#include "edge_runtime/channel/channel_abi.hpp"
+#include "edge_runtime/channel/control_lock.hpp"
+#include "edge_runtime/process/process_identity.hpp"
 
 namespace {
 

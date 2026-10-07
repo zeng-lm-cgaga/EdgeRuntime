@@ -1,6 +1,6 @@
 
 
-#include "edge_runtime/detail/clock.hpp"
+#include "edge_runtime/sync/clock.hpp"
 
 #include <gtest/gtest.h>
 

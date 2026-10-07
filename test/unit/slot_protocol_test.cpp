@@ -1,12 +1,12 @@
 
 
-#include "edge_runtime/detail/slot_protocol.hpp"
+#include "edge_runtime/channel/slot_protocol.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
 
-#include "edge_runtime/detail/channel_layout.hpp"
+#include "edge_runtime/channel/channel_layout.hpp"
 
 namespace {
 

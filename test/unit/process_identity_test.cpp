@@ -1,6 +1,6 @@
 
 
-#include "edge_runtime/detail/process_identity.hpp"
+#include "edge_runtime/process/process_identity.hpp"
 
 #include <gtest/gtest.h>
 #include <sys/types.h>

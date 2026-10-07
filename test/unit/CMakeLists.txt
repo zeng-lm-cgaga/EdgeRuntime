@@ -5,7 +5,9 @@ function(edgeruntime_unit_test name)
   target_link_libraries(
     ${name} PRIVATE edge_runtime GTest::gtest_main Threads::Threads rt)
   target_include_directories(
-    ${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
+    ${name} PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+      ${CMAKE_SOURCE_DIR}/src)
   gtest_discover_tests(${name})
 endfunction()
 
@@ -27,3 +29,6 @@ edgeruntime_unit_test(process_spawn_test)     # posix_spawn 与非阻塞输出�
 edgeruntime_unit_test(producer_concurrency_test)  # 同一句柄并发调用约束
 edgeruntime_unit_test(loan_test)                  # 借用槽所有权与延迟关闭
 edgeruntime_unit_test(supervisor_policy_test)     # 重启上限、退避和参数边界
+edgeruntime_unit_test(mpmc_layout_test)           # MPMC 共享内存 ABI 和映射边界
+edgeruntime_unit_test(shared_buffer_pool_test)    # 固定块池 ABI、状态和 handle 校验
+edgeruntime_unit_test(owner_snapshot_test)        # MPMC/Pool 共享 owner tuple 与 epoch 边界

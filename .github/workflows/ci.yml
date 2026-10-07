@@ -6,10 +6,8 @@
 # ASan/UBSan, release compiles failpoints out, and the installed package is
 # consumable by an independent downstream project.
 #
-#   Stage 1  dev-debug configure + build + ctest   (54 tests)
-#   Stage 2  asan-ubsan configure + build + ctest
-#   Stage 3  release configure + build
-#   Stage 4  install to a temp prefix + build & run examples/consume_demo
+#   scripts/ci.sh owns the ordered debug, sanitizer, Release install, and
+#   external downstream-consumer stages.
 #
 # Full crash matrix (C01-C23) and the ER7 12-run benchmark evidence set are
 # opt-in on the development host, not part of per-commit CI (see design §20.3
@@ -33,41 +31,5 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y g++ cmake
 
-      - name: Configure dev-debug
-        run: cmake --preset dev-debug
-
-      - name: Build dev-debug
-        run: cmake --build --preset dev-debug
-
-      - name: Test dev-debug
-        run: ctest --preset dev-debug --output-on-failure
-
-      - name: Configure asan-ubsan
-        run: cmake --preset asan-ubsan
-
-      - name: Build asan-ubsan
-        run: cmake --build --preset asan-ubsan
-
-      - name: Test asan-ubsan
-        env:
-          ASAN_OPTIONS: "detect_leaks=0:halt_on_error=1"
-          UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
-        run: ctest --preset asan-ubsan --output-on-failure
-
-      - name: Configure release
-        run: cmake --preset release
-
-      - name: Build release
-        run: cmake --build --preset release
-
-      - name: Install
-        run: cmake --install build/dev-debug --prefix "$RUNNER_TEMP/er-install"
-
-      - name: Configure consume_demo
-        run: cmake -S examples/consume_demo -B "$RUNNER_TEMP/er-demo" -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/er-install" -DCMAKE_BUILD_TYPE=Debug
-
-      - name: Build consume_demo
-        run: cmake --build "$RUNNER_TEMP/er-demo"
-
-      - name: Run consume_demo
-        run: "$RUNNER_TEMP/er-demo/consume_demo"
+      - name: Release audit and independent downstream consumer
+        run: scripts/ci.sh --out-dir "$RUNNER_TEMP/edgeruntime-ci"

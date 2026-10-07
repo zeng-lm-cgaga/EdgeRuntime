@@ -1,4 +1,4 @@
-#include "edge_runtime/schema.hpp"
+#include "edge_runtime/common/schema.hpp"
 
 #include <gtest/gtest.h>
 

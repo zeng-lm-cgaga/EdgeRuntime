@@ -1,6 +1,6 @@
 
 
-#include "edge_runtime/detail/failpoint.hpp"
+#include "edge_runtime/utility/failpoint.hpp"
 
 #include <fcntl.h>
 #include <gtest/gtest.h>

@@ -5,7 +5,7 @@
 #include <limits>
 #include <vector>
 
-#include "edge_runtime/supervisor.hpp"
+#include "edge_runtime/process/supervisor.hpp"
 #include "test_util.hpp"
 
 namespace {

@@ -1,6 +1,6 @@
 
 
-#include "edge_runtime/detail/futex.hpp"
+#include "edge_runtime/sync/futex.hpp"
 
 #include <gtest/gtest.h>
 #include <pthread.h>

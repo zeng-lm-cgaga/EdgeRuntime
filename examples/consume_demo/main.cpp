@@ -1,89 +1,51 @@
-// 最小下游示例只使用已安装公共头，演示创建、借用写槽、打开和借用读槽的闭环。
-#include <array>
-#include <cinttypes>
-#include <cstdint>
 #include <cstdio>
-#include <cstring>
+#include <csignal>
+#include <cstdlib>
+#include <string>
 
-#include "edge_runtime/consumer.hpp"
-#include "edge_runtime/loan.hpp"
-#include "edge_runtime/producer.hpp"
-#include "edge_runtime/sample.hpp"
-#include "edge_runtime/schema.hpp"
+#include "consume_demo/channel_flow.hpp"
+#include "consume_demo/common.hpp"
+#include "consume_demo/pool_flow.hpp"
+#include "consume_demo/queue_flow.hpp"
 
 namespace {
 
-// 库不解释业务类型，调用方的 PayloadCodec 负责定义规范编码字节。
-struct Point {
-	int32_t x;
-	int32_t y;
-};
-
+int parse_fd(const char* text) {
+	if (text == nullptr) return -1;
+	char* end = nullptr;
+	const long value = std::strtol(text, &end, 10);
+	if (end == text || *end != '\0' || value < 0 || value > 1'000'000) return -1;
+	return static_cast<int>(value);
 }
 
-template <>
-struct edge_runtime::PayloadCodec<Point> {
-	static constexpr bool kDefined = true;
-	static constexpr uint32_t kEncodedSize = 8;
-	using EncodedBuffer = std::array<std::byte, kEncodedSize>;
-	static bool encode(const Point& v, std::byte* out, size_t cap) noexcept {
-		if (cap < kEncodedSize) return false;
-		const int32_t x = v.x;
-		const int32_t y = v.y;
-		std::memcpy(out, &x, 4);
-		std::memcpy(out + 4, &y, 4);
-		return true;
-	}
-	static bool decode(const std::byte* in, size_t size, Point* v) noexcept {
-		if (size < kEncodedSize) return false;
-		std::memcpy(&v->x, in, 4);
-		std::memcpy(&v->y, in + 4, 4);
-		return true;
-	}
-};
+}  // namespace
 
-int main() {
-	constexpr char kName[] = "er_consume_demo_ch";
-	edge_runtime::ChannelOptions opts;
-	opts.name = kName;
-	edge_runtime::SchemaDescriptor schema;
-	schema.fingerprint.fill(std::byte{0xAB});
-	schema.version = 1;
-	schema.debug_name = "er_consume_demo";
-
-	auto p = edge_runtime::Producer<Point>::create(opts, schema);
-	if (!p) {
-		std::fprintf(stderr, "create failed\n");
-		return 1;
+int main(int argc, char** argv) {
+	(void)std::signal(SIGPIPE, SIG_IGN);
+	if (argc >= 2 && std::string(argv[1]) == "channel-child" && argc == 4) {
+		return consume_demo::run_channel_child(argv[2], parse_fd(argv[3]));
 	}
-	auto c = edge_runtime::Consumer<Point>::open(opts, schema);
-	if (!c) {
-		std::fprintf(stderr, "open failed\n");
-		return 1;
+	if (argc >= 2 && std::string(argv[1]) == "queue-child" && argc == 5) {
+		return consume_demo::run_queue_child(argv[2], parse_fd(argv[3]), parse_fd(argv[4]));
+	}
+	if (argc >= 2 && std::string(argv[1]) == "pool-child" && argc == 5) {
+		return consume_demo::run_pool_child(argv[2], argv[3], parse_fd(argv[4]));
+	}
+	if (argc >= 2 && std::string(argv[1]) == "pool-child-fail-after-pop" && argc == 5) {
+		return consume_demo::run_pool_child(argv[2], argv[3], parse_fd(argv[4]), true);
+	}
+	if (argc >= 2 && std::string(argv[1]) == "pool-child-fail-after-read" && argc == 5) {
+		return consume_demo::run_pool_child(argv[2], argv[3], parse_fd(argv[4]), false, true);
+	}
+	if (argc != 1) {
+		std::fprintf(stderr, "usage: %s\n", argv[0]);
+		return 2;
 	}
 
-	auto write = p.value().loan();
-	if (!write || !edge_runtime::PayloadCodec<Point>::encode(
-	                      Point{3, 4}, write.value().data(), write.value().size())) {
-		std::fprintf(stderr, "write loan failed\n");
+	if (consume_demo::executable_path().empty() || !consume_demo::run_channel_flow() ||
+	    !consume_demo::run_queue_flow() || !consume_demo::run_pool_flow()) {
 		return 1;
 	}
-	auto pub = write.value().commit();
-	if (!pub) {
-		std::fprintf(stderr, "commit failed\n");
-		return 1;
-	}
-	auto r = c.value().try_loan_latest();
-	if (!r) {
-		std::fprintf(stderr, "read loan failed\n");
-		return 1;
-	}
-	Point got{};
-	if (!edge_runtime::PayloadCodec<Point>::decode(r.value().data(), r.value().size(), &got)) {
-		std::fprintf(stderr, "decode failed\n");
-		return 1;
-	}
-	const uint64_t seq = r.value().sequence();
-	std::printf("OK x=%d y=%d seq=%" PRIu64 "\n", got.x, got.y, seq);
-	return (got.x == 3 && got.y == 4) ? 0 : 2;
+	std::printf("OK installed EdgeRuntime public API fork/exec audit\n");
+	return 0;
 }

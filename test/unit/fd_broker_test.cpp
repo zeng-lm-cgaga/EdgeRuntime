@@ -16,11 +16,11 @@
 #include <optional>
 #include <thread>
 
-#include "edge_runtime/channel_options.hpp"
-#include "edge_runtime/detail/channel_layout.hpp"
-#include "edge_runtime/detail/control_lock.hpp"
-#include "edge_runtime/detail/fd_broker.hpp"
-#include "edge_runtime/producer.hpp"
+#include "edge_runtime/channel/channel_options.hpp"
+#include "edge_runtime/channel/channel_layout.hpp"
+#include "edge_runtime/channel/control_lock.hpp"
+#include "edge_runtime/transport/fd_broker.hpp"
+#include "edge_runtime/channel/producer.hpp"
 #include "test_payload.hpp"
 #include "test_util.hpp"
 
