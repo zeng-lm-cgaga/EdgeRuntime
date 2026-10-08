@@ -1,22 +1,51 @@
 # EdgeRuntime
 
-EdgeRuntime 是一个 Linux C++17 跨进程通信库，提供固定 schema 的 SPSC **latest-value** 共享内存通道，以及独立的固定容量 MPMC bounded task queue。
+EdgeRuntime 是一个面向同机 Linux 进程的 **C++17 共享内存 IPC 运行库**，包含三类独立的数据面能力：**SPSC latest-value 状态通道、MPMC 有界任务队列、SharedBufferPool 固定块共享缓冲池**，并提供进程监督、等待通知和诊断工具。它不再只是一个 SPSC 通道库；不同模块的交付、背压和故障语义不能混用。
 
-## 特性
+## 核心模块与选型
 
-- **固定跨进程 ABI**：共享内存只含显式宽度整数，无指针、无 STL 容器、无虚函数；32/64 位原子访问均为 lock-free。
-- **latest-value 语义**：三槽位所有权协议，publish/read 无背压；慢消费者丢弃中间样本、从不阻塞生产者。
-- **futex 通知**：进程共享等待/唤醒，只影响唤醒延迟，不参与数据正确性。
-- **崩溃恢复**：对通道生命周期各崩溃点有界恢复（重建、槽位回收、重连），身份无法验证时安全关闭（fail closed）。
-- **双 transport（v0.2）**：POSIX shm（默认，行为与 v0.1 一致）与 **memfd + SCM_RIGHTS**——通道对象无全局名，consumer 通过 producer 进程内的 per-channel broker socket（`SO_PEERCRED` 同 UID 门控）收到一次性 fd。memfd 对象由仍存活的 fd 或映射保持；creator/broker 退出会阻止新的 fd admission，但不会立即使已传递的 fd 或已有映射失效。
-- **optional heartbeat（v0.2）**：`Producer<T>::heartbeat()` 显式声明"正在推进"，consumer 可区分正常空闲（`kDataStale`）与逻辑卡死（`kProducerStalled`，纯观测报告，不回收 owner）。
-- **ProducerSupervisor（v0.3）**：长驻 pidfd 监督 + 有界 backoff 重启——监督自 spawn 的 producer 子进程，崩溃自动重启（generation+1），心跳卡死经 SIGTERM→grace→SIGKILL 接管；clean exit 不重启，crash loop 封顶后 GAVE_UP。**不绕过恢复引擎**：接管只是信号，替换由子进程自己的 `Producer::create` 走死 owner 路径。
-- **loaned encoded buffers（v0.4）**：`WriteLoan` 直接编码到共享槽位，`ReadLoan` 原地解析校验后的共享字节；move-only RAII 负责 abort/release，借用者崩溃复用既有槽位回收。该保证仅指库内不复制 payload 字节，不等同于任意 C++ 对象或端到端零拷贝。
-- **MPMC bounded task queue（首个里程碑）**：`MpmcQueue<T>` 支持固定大小 trivially-copyable payload、多生产者/多消费者和 `try_push`/`try_pop`；每条消息按 FIFO 位置至多成功交付一次。首版仅使用 POSIX 共享内存，生产/消费两侧各自跨进程门控，owner/槽位崩溃按 `RecoveryBlocked` fail-closed，不静默回收。
-- **MPMC deadline-aware blocking wait（当前里程碑）**：MPMC ABI major 2 使用 `EDGMPMC2`、320B header 和 64B slot；`EDGMPMC1`/旧 major 在读取新增字段前拒绝。`wait_push_until`/`wait_pop_until` 使用绝对 `steady_clock` deadline 和进程共享 futex；超时、损坏、耗尽和 `RecoveryBlocked` 保持独立错误。
-- **MPMC 基线压测（第二个里程碑）**：`edge_mpmc_bench` 使用真实 `fork/exec` 子进程，支持 1P1C/2P2C、64B/1KiB/4KiB 固定 payload、可配置容量与消息数；统计 published/delivered、队列状态、`wait4` CPU 时间和逐 run 延迟分位数。输出必须标注 `VM_ONLY`，不把 MPMC delivered messages 与 SPSC latest-value 的 `missed_samples` 混用。
-- **SharedBufferPool 固定块零拷贝基线（第三个里程碑）**：`SharedBufferPool` 支持 4KiB/16KiB 固定块，调用方直接写入/读取 mmap 视图，仅通过 `MpmcQueue<BufferHandle>` 传递固定宽度 descriptor。Pool ABI major 2 使用 192B header、64B block header，block `owner_epoch` 位于 offset 48；`BufferHandle` 固定为 88B。pool generation、schema、owner identity 和 block generation 全部校验，崩溃边界 fail-closed，不静默回收；旧 pool magic/major 不会自动升级。`edge_buffer_pool_bench` 提供 1P1C/2P2C 矩阵、逐 run 延迟摘要与原始 CSV，结果标注 `VM_ONLY`。
-- **诊断与取证**：`edge_shm_ctl` 检查通道状态（含 fd-pass 通道经只读 fd）、执行受验证的删除，不导出 payload 内容。
+| 模块 | 数据语义与主要接口 | 适用场景 |
+|---|---|---|
+| SPSC 状态通道 | `Producer<T>` / `Consumer<T>`；单生产者、单消费者，只读取最新值，允许跳过中间样本 | 连续控制目标、设备状态、周期快照 |
+| MPMC 有界任务队列 | `MpmcQueue<T>`；多生产者、多消费者，固定容量 FIFO，支持 `try_push/try_pop` 和绝对 deadline 等待 | 离散任务、事件、需要逐条出队的固定大小消息 |
+| SharedBufferPool 共享缓冲池 | `SharedBufferPool`、`WriteBuffer` / `ReadBuffer`；直接访问共享块，以 `BufferHandle` 定位并校验数据 | 大块 payload 的跨进程写入、读取与复用 |
+
+缓冲池可与 `MpmcQueue<BufferHandle>` 组合：payload 留在共享内存中，队列只传递
+88B descriptor，接收进程独立打开 pool、校验句柄、读取并释放共享块。
+队列成功出队不等于业务执行成功；库不提供业务 ACK、持久化或端到端 exactly-once 保证。
+
+## 共享机制
+
+- **固定跨进程 ABI**：共享布局只含显式宽度整数，无进程内指针、STL 容器或虚函数；32/64 位原子访问为 lock-free，但不据此宣称整个队列算法无锁。
+- **进程共享 futex**：用于 SPSC 通道和 MPMC 队列的等待/唤醒；数据正确性由各自的所有权与发布协议保证，不依赖通知必达。
+- **所有权与故障边界**：校验实例代次、nonce、schema 和进程身份；SPSC 通道支持受验证的恢复，MPMC/Pool 在 owner 崩溃等不安全边界返回 `RecoveryBlocked`，不静默回收。
+
+## SPSC latest-value 状态通道
+
+- **三槽位所有权协议**：publish/read 无消费者背压；慢消费者可以跳过中间样本，不提供逐条交付保证。
+- **双 transport**：POSIX shm（默认）与 **memfd + SCM_RIGHTS**。后者没有全局 shm 名称，consumer 通过 producer 进程内的 per-channel broker socket（`SO_PEERCRED` 同 UID 门控）收到 fd。creator/broker 退出会阻止新的 fd admission，但已传递的 fd 或已有映射不会立即失效。
+- **可选 heartbeat**：`Producer<T>::heartbeat()` 提供活性观测；`kDataStale` 与 `kProducerStalled` 不等同，心跳不刷新业务命令的新鲜度，也不授权回收 owner。
+- **loaned encoded buffers**：`WriteLoan` 直接编码到共享槽位，`ReadLoan` 原地解析校验后的共享字节；move-only RAII 负责 abort/release，借用者崩溃复用既有槽位回收。零拷贝保证仅指库内不复制 payload 字节，不等同于任意 C++ 对象或端到端零拷贝。
+- **受验证的崩溃恢复**：通道重建、槽位回收与重连均受身份和代次校验约束；无法确认安全性时 fail-closed。
+
+## MPMC 有界任务队列
+
+- **多生产者/多消费者**：固定大小 trivially-copyable payload，按 FIFO 位置至多成功交付一次；支持 `try_push`/`try_pop`，不会以 latest-value 覆盖替代排队。
+- **绝对 deadline 等待**：`wait_push_until`/`wait_pop_until` 使用绝对 `steady_clock` deadline 和进程共享 futex；空/满、超时、损坏、计数耗尽和 `RecoveryBlocked` 有独立错误分类，EINTR/伪唤醒不会重置原始等待预算。
+- **ABI 与故障边界**：ABI major 2 使用 `EDGMPMC2`、320B header 和 64B slot；旧 magic/major 在读取新增字段前拒绝。当前仅使用 POSIX 共享内存，生产/消费两侧各自跨进程门控，owner/槽位崩溃 fail-closed，不静默回收。
+- **真实跨进程压测**：`edge_mpmc_bench` 使用 `fork/exec`，支持 1P1C/2P2C、64B/1KiB/4KiB payload、可配置容量和消息数，统计 published/delivered、队列状态、`wait4` CPU 时间与逐 run 延迟分位数。结果标注 `VM_ONLY`，不与 SPSC `missed_samples` 混用。
+
+## SharedBufferPool 固定块共享缓冲池
+
+- **共享块借用**：支持 4KiB/16KiB 固定块；`WriteBuffer` / `ReadBuffer` 直接访问 mmap 视图，RAII 管理 abort/release；`BufferHandle` 可经 MPMC 队列跨进程传递。
+- **句柄与 ABI 校验**：Pool ABI major 2 使用 192B header、64B block header，block `owner_epoch` 位于 offset 48；`BufferHandle` 固定为 88B。校验 pool generation、instance nonce、schema、owner identity 和 block generation，旧 pool magic/major 不会自动升级。
+- **安全复用与限制**：崩溃边界 fail-closed，不远程回收仍可能被访问的块；零拷贝指共享块 payload 不经队列复制，不包括 descriptor 本身。
+- **跨进程压测**：`edge_buffer_pool_bench` 提供 1P1C/2P2C、4/16KiB 矩阵、逐 run 延迟摘要和原始 CSV，结果标注 `VM_ONLY`。
+
+## 进程监督与诊断
+
+- **ProducerSupervisor**：使用长驻 pidfd 监督自己 spawn 的 producer 子进程，提供有界 backoff 重启；崩溃重启后 generation+1，心跳卡死经 SIGTERM→grace→SIGKILL 处理；clean exit 不重启，crash loop 封顶后 GAVE_UP。它不是任意进程、MPMC 或 Pool owner 的通用回收器；替换仍由子进程自己的 `Producer::create` 走受验证的恢复路径。
+- **诊断与取证**：`edge_shm_ctl` 检查 SPSC 通道状态（含 fd-pass 通道经只读 fd）、执行受验证的删除，不导出 payload 内容。
 
 ## 构建与测试
 
@@ -64,7 +93,7 @@ target_link_libraries(app PRIVATE EdgeRuntime::edge_runtime)
 
 ## 目录结构
 
-- `include/edge_runtime/<module>/` — canonical 公共 API：`common`、`channel`、`queue`、`buffer`、`process`；安装时只暴露这棵树
+- `include/edge_runtime/<module>/` — canonical 公共 API：`common`、`channel`、`queue`、`buffer`、`process`；安装公共头文件，不暴露 `src/` 中的私有实现
 - `include/edge_runtime/*.hpp` — 兼容旧版本 include 的 forwarding headers；项目内部代码和文档统一使用 module include
 - `src/edge_runtime/<module>/` — 与公共功能域对应的私有头和实现：`channel`、`queue`、`buffer`、`process`，以及仅源码可见的 `transport`、`sync`、`utility`
 - `src/CMakeLists.txt` — 唯一的库源码归属入口，声明 `edge_runtime` target 及其按功能域组织的源码；模块目录不再各自拥有 CMake 文件
