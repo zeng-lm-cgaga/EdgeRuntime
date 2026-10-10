@@ -29,8 +29,13 @@ edgeruntime_tool(edge_shm_bench_consumer)
 edgeruntime_tool(edge_shm_bench_sock)
 edgeruntime_tool(edge_mpmc_bench)
 edgeruntime_tool(edge_buffer_pool_bench)
+edgeruntime_tool(edge_mpmc_handshake_helper)
+edgeruntime_tool(edge_buffer_pool_handshake_helper)
+edgeruntime_tool(edge_benchmark_watchdog_helper)
 
 if(BUILD_TESTING)
+  find_package(Python3 QUIET COMPONENTS Interpreter)
+
   add_test(NAME platform_contract COMMAND edge_runtime_platform_probe)
   set_tests_properties(platform_contract PROPERTIES TIMEOUT 10)
 
@@ -81,4 +86,31 @@ if(BUILD_TESTING)
 
   add_test(NAME buffer_pool_bench_smoke COMMAND edge_buffer_pool_bench --smoke)
   set_tests_properties(buffer_pool_bench_smoke PROPERTIES TIMEOUT 120 LABELS benchmark)
+
+  if(Python3_Interpreter_FOUND)
+    add_test(
+      NAME benchmark_pressure_watchdog_regression
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test_pressure_watchdog.py
+              --mpmc-binary $<TARGET_FILE:edge_mpmc_bench>
+              --pool-binary $<TARGET_FILE:edge_buffer_pool_bench>
+              --owner-binary $<TARGET_FILE:edge_benchmark_watchdog_helper>
+              --output-root /tmp)
+    set_tests_properties(
+      benchmark_pressure_watchdog_regression PROPERTIES TIMEOUT 45 LABELS benchmark)
+
+    add_test(
+      NAME mpmc_payload_retry_regression
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test_mpmc_payload_retry.py
+              --binary $<TARGET_FILE:edge_mpmc_bench> --output-root /tmp)
+    set_tests_properties(mpmc_payload_retry_regression PROPERTIES TIMEOUT 45 LABELS benchmark)
+
+    add_test(
+      NAME benchmark_handshake_timing_regression
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test_handshake_timing.py
+              --mpmc-binary $<TARGET_FILE:edge_mpmc_handshake_helper>
+              --pool-binary $<TARGET_FILE:edge_buffer_pool_handshake_helper>
+              --output-root /tmp)
+    set_tests_properties(
+      benchmark_handshake_timing_regression PROPERTIES TIMEOUT 45 LABELS benchmark)
+  endif()
 endif()

@@ -2,6 +2,8 @@
 // executable for every producer and consumer; no thread-only measurement path is used.
 #include <fcntl.h>
 #include <linux/perf_event.h>
+#include <poll.h>
+#include <signal.h>
 #include <sched.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -146,9 +148,13 @@ struct Config {
 	uint32_t capacity = 64;
 	uint32_t runs = 1;
 	uint64_t timeout_ms = 30000;
+	uint64_t test_consumer_hold_ms = 0;
+	uint64_t test_consumer_delay_us = 0;
+	bool test_ignore_term_consumer = false;
 	RetryPolicy retry_policy = RetryPolicy::kYield;
 	WaitPolicy wait_policy = WaitPolicy::kBusy;
 	std::string out_dir;
+	std::string ready_file;
 };
 
 struct ChildProcess {
@@ -184,9 +190,24 @@ struct RunAggregate {
 	uint64_t perf_context_switches = 0;
 	bool perf_available = true;
 	bool timed_out = false;
+	bool ready_failed = false;
+	bool child_kill_sent = false;
 	bool correctness = false;
 	std::vector<uint64_t> latency_ns;
 };
+
+volatile sig_atomic_t g_stop_requested = 0;
+
+void stop_signal_handler(int) noexcept { g_stop_requested = 1; }
+
+bool install_stop_signal_handler() noexcept {
+	struct sigaction action {};
+	action.sa_handler = stop_signal_handler;
+	if (::sigemptyset(&action.sa_mask) != 0) return false;
+	action.sa_flags = 0;
+	return ::sigaction(SIGTERM, &action, nullptr) == 0 &&
+	       ::sigaction(SIGINT, &action, nullptr) == 0;
+}
 
 uint64_t monotonic_ns() noexcept {
 	return edge_tool::monotonic_raw_now_ns();
@@ -215,6 +236,12 @@ bool write_full(int fd, const void* data, size_t size) noexcept {
 		return false;
 	}
 	return true;
+}
+
+void report_ready(int fd, char value) noexcept {
+	if (fd < 0) return;
+	(void)write_full(fd, &value, sizeof(value));
+	(void)::close(fd);
 }
 
 bool read_full(int fd, void* data, size_t size) noexcept {
@@ -404,9 +431,11 @@ bool prepare_report_path(const std::string& path) noexcept {
 
 template <size_t kSize>
 int run_child_producer(int argc, char** argv) {
+	if (!install_stop_signal_handler()) return 2;
 	const char* name = edge_tool::arg_value(argc, argv, "--name");
 	const char* report_path = edge_tool::arg_value(argc, argv, "--report-file");
 	if (name == nullptr || report_path == nullptr) return 2;
+	const int ready_fd = static_cast<int>(edge_tool::arg_u64(argc, argv, "--ready-fd", 0));
 	const uint32_t capacity =
 	        static_cast<uint32_t>(edge_tool::arg_u64(argc, argv, "--capacity", 0));
 	const uint32_t producer_id =
@@ -427,51 +456,66 @@ int run_child_producer(int argc, char** argv) {
 	auto queue = edge_runtime::MpmcQueue<edge_mpmc_bench::Payload<kSize>>::open(
 	        options, edge_mpmc_bench::schema<kSize>());
 	bool success = queue.has_value();
-	if (!queue) note_worker_error(&header, queue.error(), ChildRole::kProducer, "open");
+	if (!queue) {
+		report_ready(ready_fd, 'E');
+		note_worker_error(&header, queue.error(), ChildRole::kProducer, "open");
+	}
 	if (queue) {
-		for (uint64_t sequence = 0; sequence < messages;) {
+		report_ready(ready_fd, 'R');
+		for (uint64_t sequence = 0; sequence < messages && !g_stop_requested;) {
 			const auto payload =
 			        edge_mpmc_bench::make_payload<kSize>(producer_id, sequence, monotonic_ns());
-			auto pushed = queue.value().try_push(payload);
-			if (!pushed && wait_policy == WaitPolicy::kBlocking &&
-			    (pushed.error().code == ErrorCode::kQueueFull ||
-			     pushed.error().code == ErrorCode::kQueueContention)) {
-				if (pushed.error().code == ErrorCode::kQueueFull) ++header.queue_full;
-				if (pushed.error().code == ErrorCode::kQueueContention) ++header.queue_contention;
-				++header.wait_calls;
-				const auto deadline = std::chrono::steady_clock::now() +
-				                      std::chrono::milliseconds(wait_timeout_ms);
-				pushed = queue.value().wait_push_until(payload, deadline);
-				if (!pushed && pushed.error().code == ErrorCode::kTimeout) {
-					++header.wait_timeouts;
+			for (;;) {
+				if (g_stop_requested) {
+					success = false;
+					break;
 				}
-			}
-			if (pushed) {
-				++sequence;
-				++header.published;
-				continue;
-			}
-			if (wait_policy == WaitPolicy::kBlocking &&
-			    pushed.error().code == ErrorCode::kTimeout) {
-				note_worker_error(&header, pushed.error(), ChildRole::kProducer, "push");
-				success = false;
-				sequence = messages;
-				continue;
-			}
-			switch (pushed.error().code) {
-			case ErrorCode::kQueueFull:
-				++header.queue_full;
-				retry_after(retry_policy);
-				break;
-			case ErrorCode::kQueueContention:
-				++header.queue_contention;
-				retry_after(retry_policy);
-				break;
-			default:
-				note_worker_error(&header, pushed.error(), ChildRole::kProducer, "push");
-				success = false;
-				sequence = messages;
-				break;
+				auto pushed = queue.value().try_push(payload);
+				if (g_stop_requested) {
+					success = false;
+					break;
+				}
+				if (!pushed && wait_policy == WaitPolicy::kBlocking &&
+				    (pushed.error().code == ErrorCode::kQueueFull ||
+				     pushed.error().code == ErrorCode::kQueueContention)) {
+					if (pushed.error().code == ErrorCode::kQueueFull) ++header.queue_full;
+					if (pushed.error().code == ErrorCode::kQueueContention) ++header.queue_contention;
+					++header.wait_calls;
+					const auto deadline = std::chrono::steady_clock::now() +
+					                      std::chrono::milliseconds(wait_timeout_ms);
+					pushed = queue.value().wait_push_until(payload, deadline);
+					if (!pushed && pushed.error().code == ErrorCode::kTimeout) {
+						++header.wait_timeouts;
+					}
+				}
+				if (pushed) {
+					++sequence;
+					++header.published;
+					break;
+				}
+				if (wait_policy == WaitPolicy::kBlocking &&
+				    pushed.error().code == ErrorCode::kTimeout) {
+					note_worker_error(&header, pushed.error(), ChildRole::kProducer, "push");
+					success = false;
+					sequence = messages;
+					break;
+				}
+				switch (pushed.error().code) {
+				case ErrorCode::kQueueFull:
+					++header.queue_full;
+					retry_after(retry_policy);
+					break;
+				case ErrorCode::kQueueContention:
+					++header.queue_contention;
+					retry_after(retry_policy);
+					break;
+				default:
+					note_worker_error(&header, pushed.error(), ChildRole::kProducer, "push");
+					success = false;
+					sequence = messages;
+					break;
+				}
+				if (!success || sequence == messages) break;
 			}
 		}
 	}
@@ -484,9 +528,11 @@ int run_child_producer(int argc, char** argv) {
 
 template <size_t kSize>
 int run_child_consumer(int argc, char** argv) {
+	if (!install_stop_signal_handler()) return 2;
 	const char* name = edge_tool::arg_value(argc, argv, "--name");
 	const char* report_path = edge_tool::arg_value(argc, argv, "--report-file");
 	if (name == nullptr || report_path == nullptr) return 2;
+	const int ready_fd = static_cast<int>(edge_tool::arg_u64(argc, argv, "--ready-fd", 0));
 	const uint32_t capacity =
 	        static_cast<uint32_t>(edge_tool::arg_u64(argc, argv, "--capacity", 0));
 	const uint32_t producer_count =
@@ -494,6 +540,12 @@ int run_child_consumer(int argc, char** argv) {
 	const uint64_t messages = edge_tool::arg_u64(argc, argv, "--messages", 0);
 	const uint64_t target = edge_tool::arg_u64(argc, argv, "--consumer-target", 0);
 	const uint64_t wait_timeout_ms = edge_tool::arg_u64(argc, argv, "--wait-timeout-ms", 30000);
+	const uint64_t test_consumer_hold_ms =
+	        edge_tool::arg_u64(argc, argv, "--test-consumer-hold-ms", 0);
+	const uint64_t test_consumer_delay_us =
+	        edge_tool::arg_u64(argc, argv, "--test-consumer-delay-us", 0);
+	const bool ignore_term = edge_tool::arg_flag(argc, argv, "--test-ignore-term-consumer");
+	if (ignore_term && ::signal(SIGTERM, SIG_IGN) == SIG_ERR) return 2;
 	RetryPolicy retry_policy;
 	if (!parse_retry_policy_args(argc, argv, &retry_policy)) return 2;
 	WaitPolicy wait_policy;
@@ -510,10 +562,25 @@ int run_child_consumer(int argc, char** argv) {
 	auto queue = edge_runtime::MpmcQueue<edge_mpmc_bench::Payload<kSize>>::open(
 	        options, edge_mpmc_bench::schema<kSize>());
 	bool success = queue.has_value();
-	if (!queue) note_worker_error(&header, queue.error(), ChildRole::kConsumer, "open");
+	if (!queue) {
+		report_ready(ready_fd, 'E');
+		note_worker_error(&header, queue.error(), ChildRole::kConsumer, "open");
+	}
 	if (queue) {
-		for (uint64_t delivered = 0; delivered < target;) {
+		report_ready(ready_fd, 'R');
+		if (test_consumer_hold_ms != 0) {
+			::usleep(static_cast<useconds_t>(test_consumer_hold_ms * 1000ull));
+		}
+		for (uint64_t delivered = 0; delivered < target && !g_stop_requested;) {
+			if (g_stop_requested) {
+				success = false;
+				break;
+			}
 			auto popped = queue.value().try_pop();
+			if (g_stop_requested) {
+				success = false;
+				break;
+			}
 			if (!popped && wait_policy == WaitPolicy::kBlocking &&
 			    (popped.error().code == ErrorCode::kQueueEmpty ||
 			     popped.error().code == ErrorCode::kQueueContention)) {
@@ -541,6 +608,9 @@ int run_child_consumer(int argc, char** argv) {
 				        {popped.value().producer, 0, popped.value().sequence, latency_ns});
 				++delivered;
 				++header.delivered;
+				if (test_consumer_delay_us != 0) {
+					::usleep(static_cast<useconds_t>(test_consumer_delay_us));
+				}
 				continue;
 			}
 			if (wait_policy == WaitPolicy::kBlocking &&
@@ -593,8 +663,66 @@ pid_t spawn_child(const std::string& executable, const std::vector<std::string>&
 	::_exit(127);
 }
 
-bool reap_children(std::vector<ChildProcess>* children, uint64_t timeout_ms, bool* timed_out) {
+bool wait_for_ready(int fd, size_t expected, uint64_t timeout_ms, bool* failed) {
+	*failed = false;
+	if (expected == 0) return true;
+	size_t ready = 0;
 	const uint64_t deadline = monotonic_ns() + timeout_ms * 1000000ull;
+	while (ready < expected) {
+		if (g_stop_requested != 0) return false;
+		const uint64_t now = monotonic_ns();
+		if (now >= deadline) return false;
+		const uint64_t remaining_ms = (deadline - now + 999999ull) / 1000000ull;
+		struct pollfd descriptor {fd, POLLIN | POLLHUP, 0};
+		const int poll_result = ::poll(&descriptor, 1,
+		                              static_cast<int>(std::min<uint64_t>(remaining_ms, 50)));
+		if (poll_result < 0) {
+			if (errno == EINTR) continue;
+			return false;
+		}
+		if (poll_result == 0) continue;
+		char values[32]{};
+		const ssize_t count = ::read(fd, values, sizeof(values));
+		if (count > 0) {
+			for (ssize_t i = 0; i < count; ++i) {
+				if (values[i] == 'R') {
+					++ready;
+				} else if (values[i] == 'E') {
+					*failed = true;
+				}
+			}
+			if (*failed) return false;
+			continue;
+		}
+		if (count == 0) return false;
+		if (errno != EINTR) return false;
+	}
+	return true;
+}
+
+bool write_ready_file(const Config& config, const std::string& resource_name,
+	                      uint32_t run_index, const std::vector<ChildProcess>& children) {
+	if (config.ready_file.empty()) return true;
+	FILE* file = std::fopen(config.ready_file.c_str(), "w");
+	if (file == nullptr) return false;
+	bool ok = std::fprintf(file, "READY run=%" PRIu32 " resource=%s\n", run_index,
+	                       resource_name.c_str()) >= 0;
+	for (const auto& child : children) {
+		if (!ok) break;
+		ok = std::fprintf(file, "ROLE role=%s pid=%ld report=%s\n",
+		                  child_role_name(child.role), static_cast<long>(child.pid),
+		                  child.report_path.c_str()) >= 0;
+	}
+	if (std::fclose(file) != 0) ok = false;
+	return ok;
+}
+
+bool reap_children(std::vector<ChildProcess>* children, uint64_t timeout_ms, bool* timed_out,
+	                   bool* kill_sent) {
+	const uint64_t normal_deadline = monotonic_ns() + timeout_ms * 1000000ull;
+	uint64_t deadline = normal_deadline;
+	bool stop_sent = false;
+	*kill_sent = false;
 	size_t remaining = children->size();
 	while (remaining != 0) {
 		for (auto& child : *children) {
@@ -614,10 +742,20 @@ bool reap_children(std::vector<ChildProcess>* children, uint64_t timeout_ms, boo
 			}
 		}
 		if (remaining == 0) return true;
-		if (monotonic_ns() >= deadline) {
+		if (!stop_sent && (g_stop_requested != 0 || monotonic_ns() >= normal_deadline)) {
 			*timed_out = true;
+			stop_sent = true;
+			deadline = monotonic_ns() + 1000ull * 1000000ull;
 			for (auto& child : *children) {
-				if (!child.waited) (void)::kill(child.pid, SIGKILL);
+				if (child.waited) continue;
+				(void)::kill(child.pid, SIGCONT);
+				(void)::kill(child.pid, SIGTERM);
+			}
+		}
+		if (stop_sent && monotonic_ns() >= deadline) {
+			for (auto& child : *children) {
+				if (child.waited) continue;
+				if (::kill(child.pid, SIGKILL) == 0) *kill_sent = true;
 			}
 			for (auto& child : *children) {
 				if (child.waited) continue;
@@ -638,6 +776,23 @@ bool reap_children(std::vector<ChildProcess>* children, uint64_t timeout_ms, boo
 
 bool child_succeeded(const ChildProcess& child) noexcept {
 	return child.waited && WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0;
+}
+
+template <size_t kSize>
+bool remove_and_verify_queue(edge_runtime::MpmcQueue<edge_mpmc_bench::Payload<kSize>>* queue,
+                             const edge_runtime::MpmcQueueOptions& options, uint32_t run_index,
+                             bool stopped, bool child_kill_sent) {
+	const auto removed = queue->remove_if_creator();
+	auto reopened = edge_runtime::MpmcQueue<edge_mpmc_bench::Payload<kSize>>::open(
+	        options, edge_mpmc_bench::schema<kSize>());
+	const bool absent = !reopened && reopened.error().code == ErrorCode::kNotFound;
+	std::printf("CLEANUP run=%" PRIu32
+	            " resource=mpmc name=%s remove=%s reopen=%s stopped=%s child_kill=%s\n",
+	            run_index, options.name.c_str(), removed ? "SUCCESS" : "FAIL",
+	            reopened ? "FOUND" : edge_runtime::to_string(reopened.error().code),
+	            stopped ? "true" : "false", child_kill_sent ? "true" : "false");
+	std::fflush(stdout);
+	return removed && absent;
 }
 
 uint64_t percentile_nearest_rank(const std::vector<uint64_t>& sorted, uint32_t numerator,
@@ -680,7 +835,9 @@ void print_summary(uint32_t run_index, size_t payload_size, const Config& config
 	        "RESULT run=%" PRIu32
 	        " label=VM_ONLY retry_policy=%s wait_policy=%s payload_bytes=%zu producers=%" PRIu32
 	        " consumers=%" PRIu32
-	        " messages_per_producer=%" PRIu64 " capacity=%" PRIu32 " expected=%" PRIu64
+	        " messages_per_producer=%" PRIu64 " capacity=%" PRIu32
+	        " test_consumer_hold_ms=%" PRIu64 " test_consumer_delay_us=%" PRIu64
+	        " expected=%" PRIu64
 	        " published=%" PRIu64 " delivered=%" PRIu64 " queue_full=%" PRIu64
 	        " queue_empty=%" PRIu64 " queue_contention=%" PRIu64 " recovery=%" PRIu64
 	        " errors=%" PRIu64 " wait_calls=%" PRIu64 " wait_timeouts=%" PRIu64
@@ -689,8 +846,9 @@ void print_summary(uint32_t run_index, size_t payload_size, const Config& config
 	        run_index, retry_policy_name(config.retry_policy), wait_policy_name(config.wait_policy),
 	        payload_size, config.producers,
 	        config.consumers, config.messages,
-	        config.capacity, aggregate.expected, aggregate.published, aggregate.delivered,
-	        aggregate.queue_full, aggregate.queue_empty, aggregate.queue_contention,
+	        config.capacity, config.test_consumer_hold_ms, config.test_consumer_delay_us,
+	        aggregate.expected, aggregate.published,
+	        aggregate.delivered, aggregate.queue_full, aggregate.queue_empty, aggregate.queue_contention,
 	        aggregate.recovery, aggregate.errors, aggregate.wait_calls, aggregate.wait_timeouts,
 	        aggregate.wall_us, aggregate.user_cpu_us,
 	        aggregate.system_cpu_us, aggregate.user_cpu_us + aggregate.system_cpu_us);
@@ -730,6 +888,14 @@ int run_parent_once(const std::string& executable, const Config& config, uint32_
 	const uint64_t wall_start = monotonic_ns();
 	std::vector<ChildProcess> children;
 	children.reserve(static_cast<size_t>(config.producers + config.consumers));
+	int ready_pipe[2] = {-1, -1};
+	if (::pipe(ready_pipe) != 0) {
+		std::fprintf(stderr, "READY_PIPE_FAIL run=%" PRIu32 " errno=%d\n", run_index, errno);
+		(void)remove_and_verify_queue(&queue.value(), options, run_index, false, false);
+		return 2;
+	}
+	const int read_flags = ::fcntl(ready_pipe[0], F_GETFD);
+	if (read_flags >= 0) (void)::fcntl(ready_pipe[0], F_SETFD, read_flags | FD_CLOEXEC);
 
 	const uint64_t total_consumers = static_cast<uint64_t>(config.consumers);
 	const uint64_t base_target = aggregate.expected / total_consumers;
@@ -743,15 +909,18 @@ int run_parent_once(const std::string& executable, const Config& config, uint32_
 			++aggregate.errors;
 			continue;
 		}
-		const std::vector<std::string> args = {
+		std::vector<std::string> args = {
 		        executable, "--role", "consumer", "--payload-size", std::to_string(kSize),
 		        "--name", queue_name, "--capacity", std::to_string(config.capacity),
 		        "--producer-count", std::to_string(config.producers),
 		        "--messages", std::to_string(config.messages), "--consumer-target",
 		        std::to_string(target), "--retry-policy", retry_policy_name(config.retry_policy),
 		        "--wait-policy", wait_policy_name(config.wait_policy), "--wait-timeout-ms",
-		        std::to_string(config.timeout_ms),
-		        "--report-file", report};
+		        std::to_string(config.timeout_ms), "--test-consumer-hold-ms",
+		        std::to_string(config.test_consumer_hold_ms), "--test-consumer-delay-us",
+		        std::to_string(config.test_consumer_delay_us), "--ready-fd",
+		        std::to_string(ready_pipe[1]), "--report-file", report};
+		if (config.test_ignore_term_consumer) args.push_back("--test-ignore-term-consumer");
 		const pid_t pid = spawn_child(executable, args);
 		if (pid < 0) {
 			std::fprintf(stderr, "FORK_FAIL run=%" PRIu32 " role=consumer errno=%d\n", run_index,
@@ -776,7 +945,8 @@ int run_parent_once(const std::string& executable, const Config& config, uint32_
 		        std::to_string(config.messages), "--retry-policy",
 		        retry_policy_name(config.retry_policy), "--wait-policy",
 		        wait_policy_name(config.wait_policy), "--wait-timeout-ms",
-		        std::to_string(config.timeout_ms), "--report-file", report};
+		        std::to_string(config.timeout_ms), "--ready-fd", std::to_string(ready_pipe[1]),
+		        "--report-file", report};
 		const pid_t pid = spawn_child(executable, args);
 		if (pid < 0) {
 			std::fprintf(stderr, "FORK_FAIL run=%" PRIu32 " role=producer errno=%d\n", run_index,
@@ -786,9 +956,27 @@ int run_parent_once(const std::string& executable, const Config& config, uint32_
 		}
 		children.push_back({pid, ChildRole::kProducer, report, 0});
 	}
+	(void)::close(ready_pipe[1]);
+	ready_pipe[1] = -1;
+	bool ready_failed = false;
+	const bool ready = wait_for_ready(ready_pipe[0], children.size(), config.timeout_ms, &ready_failed);
+	(void)::close(ready_pipe[0]);
+	ready_pipe[0] = -1;
+	aggregate.ready_failed = !ready || ready_failed;
+	if (ready && !aggregate.ready_failed &&
+	    !write_ready_file(config, queue_name, run_index, children)) {
+		std::fprintf(stderr, "READY_FILE_FAIL run=%" PRIu32 " path=%s errno=%d\n", run_index,
+		             config.ready_file.c_str(), errno);
+		aggregate.ready_failed = true;
+	}
+	if (aggregate.ready_failed) g_stop_requested = 1;
 	bool timed_out = false;
-	const bool all_reaped = reap_children(&children, config.timeout_ms, &timed_out);
-	aggregate.timed_out = !all_reaped || timed_out;
+	bool child_kill_sent = false;
+	const bool all_reaped =
+	        reap_children(&children, config.timeout_ms, &timed_out, &child_kill_sent);
+	aggregate.timed_out = !all_reaped || timed_out || aggregate.ready_failed ||
+	                      g_stop_requested != 0;
+	aggregate.child_kill_sent = child_kill_sent;
 
 	std::vector<ParsedReport> reports;
 	reports.reserve(children.size());
@@ -881,10 +1069,9 @@ int run_parent_once(const std::string& executable, const Config& config, uint32_
 		}
 	}
 	for (const auto& child : children) (void)::unlink(child.report_path.c_str());
-	const auto removed = queue.value().remove_if_creator();
-	if (!removed) {
-		std::fprintf(stderr, "REMOVE_FAIL run=%" PRIu32 " code=%s ctx=%s\n", run_index,
-		             edge_runtime::to_string(removed.error().code), removed.error().context);
+	if (!remove_and_verify_queue(&queue.value(), options, run_index,
+	                             g_stop_requested != 0, child_kill_sent)) {
+		std::fprintf(stderr, "REMOVE_FAIL run=%" PRIu32 "\n", run_index);
 		ids_valid = false;
 	}
 	aggregate.correctness = ids_valid && aggregate.errors == 0;
@@ -897,6 +1084,7 @@ int run_parent(const std::string& executable, const Config& config, uint32_t fir
 	int result = 0;
 	for (uint32_t i = 0; i < config.runs; ++i) {
 		if (run_parent_once<kSize>(executable, config, first_run + i) != 0) result = 1;
+		if (g_stop_requested != 0) break;
 	}
 	return result;
 }
@@ -913,12 +1101,20 @@ bool parse_config(int argc, char** argv, Config* config) {
 	const uint64_t capacity = edge_tool::arg_u64(argc, argv, "--capacity", 64);
 	const uint64_t runs = edge_tool::arg_u64(argc, argv, "--runs", 1);
 	config->timeout_ms = edge_tool::arg_u64(argc, argv, "--timeout-ms", 30000);
+	config->test_consumer_hold_ms =
+	        edge_tool::arg_u64(argc, argv, "--test-consumer-hold-ms", 0);
+	config->test_consumer_delay_us =
+	        edge_tool::arg_u64(argc, argv, "--test-consumer-delay-us", 0);
+	config->test_ignore_term_consumer =
+	        edge_tool::arg_flag(argc, argv, "--test-ignore-term-consumer");
 	if (!parse_retry_policy_args(argc, argv, &config->retry_policy)) return false;
 	if (!parse_wait_policy_args(argc, argv, &config->wait_policy)) return false;
 	const char* out_dir = edge_tool::arg_value(argc, argv, "--out-dir");
+	const char* ready_file = edge_tool::arg_value(argc, argv, "--ready-file");
 	if (producers == 0 || producers > kMaxWorkers || consumers == 0 || consumers > kMaxWorkers ||
 	    messages == 0 || messages > kMaxMessagesPerProducer || capacity == 0 || capacity > 4096 ||
-	    runs == 0 || runs > kMaxRuns || config->timeout_ms == 0) {
+	    runs == 0 || runs > kMaxRuns || config->timeout_ms == 0 ||
+	    config->test_consumer_hold_ms > 10000 || config->test_consumer_delay_us > 1000000) {
 		std::fprintf(stderr, "invalid benchmark bounds\n");
 		return false;
 	}
@@ -929,6 +1125,7 @@ bool parse_config(int argc, char** argv, Config* config) {
 	config->capacity = static_cast<uint32_t>(capacity);
 	config->runs = static_cast<uint32_t>(runs);
 	config->out_dir = out_dir == nullptr ? "" : out_dir;
+	config->ready_file = ready_file == nullptr ? "" : ready_file;
 	if (messages > std::numeric_limits<uint64_t>::max() / producers) {
 		std::fprintf(stderr, "expected message count overflows\n");
 		return false;
@@ -940,7 +1137,9 @@ void print_usage(const char* executable) {
 	std::printf(
 	        "usage: %s [--payload-size 64|1024|4096] [--producers N] [--consumers N] "
 	        "[--messages N] [--capacity N] [--runs N] [--timeout-ms N] "
-	        "[--retry-policy yield|spin] [--wait-policy busy|blocking] [--out-dir DIR]\n"
+	        "[--test-consumer-hold-ms N] [--test-consumer-delay-us N] "
+	        "[--test-ignore-term-consumer] [--retry-policy yield|spin] "
+	        "[--wait-policy busy|blocking] [--out-dir DIR] [--ready-file FILE]\n"
 	        "       %s --smoke\n",
 	        executable, executable);
 }
@@ -998,6 +1197,7 @@ int run_as_child(int argc, char** argv, size_t payload_size) {
 }  // namespace
 
 int main(int argc, char** argv) {
+	if (!install_stop_signal_handler()) return 2;
 	const char* role = edge_tool::arg_value(argc, argv, "--role");
 	const uint64_t payload_size = edge_tool::arg_u64(argc, argv, "--payload-size", 64);
 	if (role != nullptr) return run_as_child(argc, argv, static_cast<size_t>(payload_size));
