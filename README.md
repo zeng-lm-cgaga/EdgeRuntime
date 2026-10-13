@@ -57,25 +57,64 @@ target_link_libraries(app PRIVATE EdgeRuntime::edge_runtime)
 2026-10-13 Linux 验证：Debug、ASan/UBSan 各完成 **180/180** 项启用测试；Debug 完整 C01–C23 崩溃矩阵 **23/23**，Release 安装后的独立消费示例通过。
 执行环境为 `VM_ONLY`；ASan/UBSan 配置为 `detect_leaks=0`。2026-10-07 的关键正常退出路径经 Valgrind 3.27.1 Memcheck 检查；完整崩溃矩阵通过 `edge_crash_matrix` 显式执行。
 
-2026-10-08 的 Release 补测使用自研 benchmark 和真实 `fork/exec`，在 **8 核 Linux 虚拟机（`VM_ONLY`）**上执行：
+### 2026-10-13 跨进程 benchmark
 
-- **并发与背压**：MPMC 覆盖 1P1C、1P4C、4P1C、4P4C、8P8C、16P16C，64B/4KiB 消息及 busy/yield、blocking 两种策略；缓冲池覆盖 4/16KiB、4P4C/16P16C，并测试小队列、小缓冲池和慢消费者。
-- **交付检查**：51 轮 MPMC、18 轮缓冲池共交付 **802.4 万条**，独立逐条核对 producer/sequence，发送数与接收数一致、重复和缺失均为 0。
-- **64B MPMC 吞吐**：capacity64、busy/yield、每生产者 20,000 条、每配置 3 轮；1P1C 约 **131–153 万条/秒**，4P4C 约 **85.1–87.7 万条/秒**，16P16C 约 **83.4–85.2 万条/秒**。
-- **持续负载**：16P16C 单轮交付 **3200 万条**，工具计时 **50.965 秒**、吞吐约 **62.8 万条/秒**，累计子进程 CPU 时间约 393.7 秒；重复、缺失和错误均为 0。
+自研工具通过真实 `fork/exec` 执行。采集源码为 `ec96119`；环境为 **VMware 8 vCPU、Ubuntu 22.04.5、Linux 6.8、GCC 11.4、CMake 3.22.1（`VM_ONLY`）**，Release `-O3 -DNDEBUG`，sanitizer/failpoint 均为 OFF。MPMC/Pool 使用 CPU 0–7 的默认亲和性；SPSC 对照固定 CPU 0 或 CPU 0/1。采集早期的同机 ROS2 构建活动随环境日志记录。
 
-吞吐按工具父进程从启动子进程到回收并读取报告的计时计算；MPMC 延迟从消息首次提交尝试计至消费完成，包含 Full/Contention 重试等待。
-2026-10-09 修正压测工具后，64B、4P4C、capacity64、busy/yield、每生产者 20,000 条的三轮 p99 为 **39.8–44.2µs**（`VM_ONLY`）。
+主配置各执行 3 轮，表格为 **median [min–max]**。吞吐使用父进程从启动 worker 到回收、读取并聚合报告的窗口，包含进程生命周期开销；CSV 输出、资源清理及分位数排序在该窗口之后执行。p50/p95/p99 使用 nearest-rank。MPMC/Pool 统计全部交付样本，SPSC/Socket 统计预热后的样本。
 
-2026-10-07 的 SPSC / Unix Socket 对照使用 64B、同核、100Hz，预热 100 条后统计 900 条，双方样本 gap、torn read 和 queue overlap 均为 0：
+**MPMC**：capacity64，每生产者 20,000 条；busy 使用 yield 重试。延迟从首次构造消息计至成功 pop，包含编码及 Full/Contention/等待重试。
 
-| 传输方式 | p50（µs） | p99（µs） |
+| Payload / 并发 | 等待策略 | 吞吐（万条/s） | p99（µs） |
+|---|---|---:|---:|
+| 64B / 1P1C | busy/yield | 133.38 [130.21–134.85] | 29.29 [27.75–34.82] |
+| 64B / 1P1C | blocking | 136.20 [123.71–136.38] | 79.45 [42.92–93.98] |
+| 64B / 4P4C | busy/yield | 79.79 [77.45–86.41] | 40.05 [39.24–43.68] |
+| 64B / 4P4C | blocking | 7.72 [6.99–8.40] | 166.35 [154.92–185.67] |
+| 64B / 16P16C | busy/yield | 78.90 [77.23–79.59] | 143.45 [141.43–148.42] |
+| 64B / 16P16C | blocking | 53.77 [53.62–60.47] | 493.45 [466.76–494.51] |
+| 4KiB / 4P4C | busy/yield | 43.97 [43.49–44.73] | 165.17 [130.62–183.11] |
+| 4KiB / 4P4C | blocking | 23.87 [23.54–24.43] | 195.66 [193.83–401.58] |
+
+16P16C、64B、busy/yield 的持续负载单轮交付 **2560 万条**：父计时 **32.914447s**，吞吐 **77.78 万条/s（47.47MiB/s）**，p50/p95/p99 为 **5.419/79.917/153.858µs**；累计 worker CPU 时间 **237.508s**。
+
+**SharedBufferPool 描述符链**：block_count128、queue capacity64，每生产者 20,000 条；计量覆盖申请共享块、写 payload、通过 MPMC 传递 handle、独立进程读取及归还。延迟从取得块后的填充开始计至 acquire_read，块申请等待通过 PoolFull/Contention 计数记录。
+
+| 块大小 / 并发 | 吞吐（万条/s） | Payload（MiB/s，中位数） | p99（µs） |
+|---|---:|---:|---:|
+| 4KiB / 4P4C | 27.64 [27.45–27.80] | 1079.72 | 19.84 [19.71–29.69] |
+| 4KiB / 16P16C | 31.02 [30.57–31.77] | 1211.53 | 543.93 [538.39–554.63] |
+| 16KiB / 4P4C | 11.76 [11.75–11.99] | 1836.73 | 39.03 [38.72–48.79] |
+| 16KiB / 16P16C | 13.28 [12.71–13.36] | 2074.51 | 2480.51 [2450.01–2633.48] |
+
+补充配置包括 MPMC 1P4C/4P1C 各一轮，以及 block_count4、capacity2、4P1C、消费者启动延迟 200ms 的缓冲池背压测试。40 轮可靠交付共 **31,108,000 条**，独立逐条核对 producer/sequence、raw worker report 与 CSV，发送=接收、重复=缺失=payload 校验错误=0；每轮 Pool 删除前全部共享块均已归还。
+
+**SPSC / Unix SOCK_STREAM**：双方同为 64B、100Hz、1000 条，预热100后统计900；同核与不同核各3组配对。12轮均达到采样目标，gap、torn read、跨下一次发布的 queue overlap 均为0。实际进程亲和性与 CSV 发布节拍同步核验。
+
+| 亲和性 / 传输方式 | p50（µs） | p99（µs） |
 |---|---:|---:|
-| SPSC SHM + futex | 15.925 | 37.598 |
-| Unix Domain Socket | 18.915 | 41.788 |
+| CPU 0 / SHM + futex | 14.900 [13.470–16.219] | 34.341 [33.191–144.351] |
+| CPU 0 / SOCK_STREAM | 16.127 [15.868–16.759] | 42.939 [38.195–49.079] |
+| CPU 0/1 / SHM + futex | 67.169 [59.861–67.534] | 176.724 [172.316–182.261] |
+| CPU 0/1 / SOCK_STREAM | 68.155 [66.414–73.750] | 178.518 [165.287–222.488] |
 
-压测工具：`edge_shm_bench`、`edge_mpmc_bench`、`edge_buffer_pool_bench`。
-快速矩阵与等待策略对照见 [scripts/](scripts/)；各工具支持配置参数和原始 CSV 输出，便于在目标硬件上复测。
+### 复现入口
+
+`run_formal_bench.py` 串行执行有限矩阵，保留 source/flags/binary SHA、命令、退出码、raw worker report、CPU 及 CSV；`verify_formal_bench.py` 独立核对完整矩阵、配置、交付身份、计数和分位数。每次采集使用新目录，单次 watchdog 为120s；快速 smoke 矩阵另见 [scripts/](scripts/)。
+
+```bash
+cmake --preset release && cmake --build --preset release
+OUT=/absolute/path/to/bench-evidence
+mkdir -p "$OUT"
+for section in spsc mpmc pool; do
+  PYTHONDONTWRITEBYTECODE=1 python3 scripts/run_formal_bench.py \
+    --section "$section" --output-root "$OUT" --cpu-a 0 --cpu-b 1
+done
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/run_formal_bench.py \
+  --section sustained --messages 1600000 --output-root "$OUT"
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify_formal_bench.py \
+  --input-root "$OUT" --output "$OUT/verified.json"
+```
 
 ## 目录结构
 
