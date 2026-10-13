@@ -48,14 +48,14 @@ target_link_libraries(app PRIVATE EdgeRuntime::edge_runtime)
 
 - SPSC payload 始终计算并验证校验和。`enable_payload_checksum` 保留源码兼容，仅接受 `true`；`false` 返回 `InvalidOptions`。工具支持 `--checksum 1`，关闭或其他取值会明确报错。
 - `stale_timeout` 是弃用的兼容字段，仅接受原默认值 `100ms`；样本新鲜度由应用依据 `publish_boot_ns`、`sample_age` 和业务阈值判断。新鲜度与 owner 死亡判定相互独立。
-- memfd 打开使用单个 monotonic 总截止时间；broker 对每个 peer 使用独立、有界的服务预算。进程身份不可验证时，注册和 owner 接管返回 `RecoveryBlocked`。
+- memfd 打开使用单个 monotonic 总截止时间；重试时限为零表示仅做一次交换，I/O 预算为 `20ms`。broker 对每个 peer 使用独立的 `100ms` 服务预算，并以 `10ms` 轮询片段检查停止；这些预算不构成硬实时调度保证。进程身份不可验证时，注册和 owner 接管返回 `RecoveryBlocked`。
 - 创建阶段的 `fstat` 中断会有界重试；失败清理通过打开 FD 的 inode 绑定验证同名对象。身份仍不可验证时保留对象并返回 `RecoveryBlocked`，SPSC 同时保留非 idle journal，恢复需保留现场并核验归属。
 - 安装包自动发现并传播 `Threads::Threads`，下游只需链接 `EdgeRuntime::edge_runtime`。
 
 ## 测试与性能
 
-Debug、ASan/UBSan 各完成 121 项启用测试；完整 C01–C23 崩溃矩阵 23/23。
-关键正常退出路径另经 Valgrind 3.27.1 Memcheck 检查。完整崩溃矩阵由 `edge_crash_matrix` 显式执行。
+2026-10-13 自审修复集成验收：Debug、ASan/UBSan 各完成 **180/180** 项启用测试；Debug 完整 C01–C23 崩溃矩阵 **23/23**，Release 安装后的独立消费示例通过。
+结果为 `VM_ONLY`；ASan 使用 `detect_leaks=0`，不计作 LSan 覆盖。关键正常退出路径此前经 Valgrind 3.27.1 Memcheck 检查，本轮未重跑；完整崩溃矩阵由 `edge_crash_matrix` 显式执行。
 
 2026-10-08 的 Release 补测使用自研 benchmark 和真实 `fork/exec`，在 **8 核 Linux 虚拟机（`VM_ONLY`）**上执行：
 
