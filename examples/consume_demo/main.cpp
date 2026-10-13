@@ -1,5 +1,5 @@
-#include <cstdio>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 
@@ -35,7 +35,8 @@ int main(int argc, char** argv) {
 		return consume_demo::run_pool_child(argv[2], argv[3], parse_fd(argv[4]), true);
 	}
 	if (argc >= 2 && std::string(argv[1]) == "pool-child-fail-after-read" && argc == 5) {
-		return consume_demo::run_pool_child(argv[2], argv[3], parse_fd(argv[4]), false, true);
+		return consume_demo::run_pool_child(argv[2], argv[3], parse_fd(argv[4]), false,
+		                                    true);
 	}
 	if (argc != 1) {
 		std::fprintf(stderr, "usage: %s\n", argv[0]);
@@ -46,6 +47,6 @@ int main(int argc, char** argv) {
 	    !consume_demo::run_queue_flow() || !consume_demo::run_pool_flow()) {
 		return 1;
 	}
-	std::printf("OK installed EdgeRuntime public API fork/exec audit\n");
+	std::printf("OK installed %s public API fork/exec audit\n", consume_demo::kPackageName);
 	return 0;
 }

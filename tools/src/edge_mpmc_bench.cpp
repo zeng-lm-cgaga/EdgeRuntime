@@ -1219,7 +1219,7 @@ int main(int argc, char** argv) {
 	const uint64_t payload_size = edge_tool::arg_u64(argc, argv, "--payload-size", 64);
 	if (role != nullptr) return run_as_child(argc, argv, static_cast<size_t>(payload_size));
 	if (edge_tool::arg_flag(argc, argv, "--help")) {
-		print_usage(argv[0]);
+		print_usage("self_ipcs_mpmc_bench");
 		return 0;
 	}
 	const std::string executable = self_executable();
@@ -1230,7 +1230,7 @@ int main(int argc, char** argv) {
 	if (edge_tool::arg_flag(argc, argv, "--smoke")) return run_smoke(executable);
 	Config config;
 	if (!parse_config(argc, argv, &config)) {
-		print_usage(argv[0]);
+		print_usage("self_ipcs_mpmc_bench");
 		return 2;
 	}
 	switch (config.payload_size) {

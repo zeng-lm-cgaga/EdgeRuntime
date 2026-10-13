@@ -17,6 +17,7 @@ import time
 import traceback
 
 from pressure_process import run_logged_process
+from self_ipcs_compat import default_build_dir, resolve_archive, resolve_binary, validate_release_cache
 
 
 def digest(path: Path) -> str:
@@ -85,16 +86,16 @@ def invocation(case: dict, binary_dir: Path, output: Path, cpu_a: int, cpu_b: in
                repo: Path) -> list[str]:
     if case["kind"] == "spsc":
         placement = case["placement"]
-        return [str(binary_dir / "edge_shm_bench"), "--evidence", "--only",
+        return [str(resolve_binary(binary_dir, "self_ipcs_shm_bench")), "--evidence", "--only",
                 f"shm-futex-64B-{placement}-100-controlled,"
                 f"socket-64B-{placement}-100-controlled",
-                "--producer", str(binary_dir / "edge_shm_bench_producer"),
-                "--consumer", str(binary_dir / "edge_shm_bench_consumer"),
-                "--sock", str(binary_dir / "edge_shm_bench_sock"),
-                "--ctl", str(binary_dir / "edge_shm_ctl"), "--cpu-a", str(cpu_a),
+                "--producer", str(resolve_binary(binary_dir, "self_ipcs_shm_bench_producer")),
+                "--consumer", str(resolve_binary(binary_dir, "self_ipcs_shm_bench_consumer")),
+                "--sock", str(resolve_binary(binary_dir, "self_ipcs_shm_bench_sock")),
+                "--ctl", str(resolve_binary(binary_dir, "self_ipcs_shm_ctl")), "--cpu-a", str(cpu_a),
                 "--cpu-b", str(cpu_b), "--git-dir", str(repo), "--out-dir", str(output)]
-    tool = "edge_mpmc_bench" if case["kind"] == "mpmc" else "edge_buffer_pool_bench"
-    argv = [str(binary_dir / tool), "--producers", str(case["producers"]),
+    tool = "self_ipcs_mpmc_bench" if case["kind"] == "mpmc" else "self_ipcs_buffer_pool_bench"
+    argv = [str(resolve_binary(binary_dir, tool)), "--producers", str(case["producers"]),
             "--consumers", str(case["consumers"]), "--messages", str(case["messages"]),
             "--capacity", str(case.get("capacity", 64)), "--runs", "1",
             "--timeout-ms", "110000", "--out-dir", str(output), "--keep-worker-reports",
@@ -120,7 +121,7 @@ def main() -> int:
     parser.add_argument("--cpu-b", type=int, default=1)
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
-    binary_dir = (args.binary_dir or repo / "build/release/tools").resolve()
+    binary_dir = (args.binary_dir or default_build_dir(repo, "release") / "tools").resolve()
     output_root = args.output_root.resolve()
     if not output_root.is_dir() or str(output_root) == "/":
         parser.error("--output-root must be an existing non-root directory")
@@ -129,11 +130,10 @@ def main() -> int:
     if args.cpu_a == args.cpu_b or not {args.cpu_a, args.cpu_b} <= os.sched_getaffinity(0):
         parser.error("choose two distinct available CPUs")
     cache = binary_dir.parent / "CMakeCache.txt"
-    cache_text = cache.read_text()
-    for setting in ("CMAKE_BUILD_TYPE:STRING=Release", "CMAKE_CXX_FLAGS_RELEASE:STRING=-O3 -DNDEBUG",
-                    "EDGERUNTIME_ENABLE_SANITIZERS:BOOL=OFF", "EDGERUNTIME_ENABLE_FAILPOINTS:BOOL=OFF"):
-        if setting not in cache_text.splitlines():
-            parser.error(f"Release configuration required: {setting}")
+    try:
+        validate_release_cache(cache)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     if shutil.disk_usage(output_root).free < 4 * 1024**3:
         parser.error("at least 4 GiB free disk required")
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
@@ -147,12 +147,13 @@ def main() -> int:
               "environment": "VM_ONLY", "cpu_mask": sorted(os.sched_getaffinity(0)),
               "cpu_a": args.cpu_a, "cpu_b": args.cpu_b, "cwd": str(repo),
               "cache_sha256": digest(cache)}
-    archive = binary_dir.parent / "src/libedge_runtime.a"
+    archive = resolve_archive(binary_dir.parent)
     source["core_archive"] = {"path": str(archive), "sha256": digest(archive)}
     (root / "source.patch").write_text(command_output(["git", "diff", "--binary", "HEAD"], repo))
     shutil.copy2(cache, root / "CMakeCache.txt")
     shutil.copy2(binary_dir.parent / "compile_commands.json", root / "compile_commands.json")
-    source["binaries"] = {str(path): digest(path) for path in sorted(binary_dir.glob("edge_*"))
+    source["binaries"] = {str(path): digest(path) for path in sorted(
+                          set(binary_dir.glob("self_ipcs_*")) | set(binary_dir.glob("edge_*")))
                           if path.is_file() and os.access(path, os.X_OK)}
     for label, argv in (("uname", ["uname", "-a"]), ("cpu", ["lscpu"]),
                         ("compiler", ["g++", "--version"]), ("cmake", ["cmake", "--version"]),
@@ -161,7 +162,8 @@ def main() -> int:
     save_json(root / "manifest.json", source)
     env = os.environ.copy()
     for key in list(env):
-        if key.startswith("EDGE_FAILPOINT") or key in ("LD_PRELOAD", "ASAN_OPTIONS", "UBSAN_OPTIONS"):
+        if (key.startswith(("SELFIPCS_FAILPOINT", "SELF_IPCS_FAILPOINT", "EDGE_FAILPOINT"))
+                or key in ("LD_PRELOAD", "ASAN_OPTIONS", "UBSAN_OPTIONS")):
             env.pop(key)
     env["LC_ALL"] = "C"
     outcomes = []

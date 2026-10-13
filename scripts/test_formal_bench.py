@@ -4,18 +4,25 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stderr
 import copy
 from dataclasses import asdict
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from pressure_process import run_logged_process
-from run_formal_bench import cases, digest, message_budget
-from verify_formal_bench import check_delivery, check_plans, quantiles
+from release_audit import (AuditFailure, assert_downstream_sources, assert_install,
+                           assert_release_configuration)
+from run_formal_bench import cases, digest, invocation, main as runner_main, message_budget
+from self_ipcs_compat import (artifact_names, build_target, default_build_dir, resolve_archive,
+                             resolve_binary, validate_release_cache)
+from verify_formal_bench import check_delivery, check_manifest, check_plans, quantiles
 
 
 BINARY_DIR = None
@@ -23,6 +30,203 @@ OUTPUT_ROOT = Path("/tmp")
 
 
 class FormalBenchTest(unittest.TestCase):
+    def test_platform_probe_name_mapping(self):
+        for name in ("edge_runtime_platform_probe", "self_ipcs_platform_probe"):
+            self.assertEqual(artifact_names(name),
+                             ("self_ipcs_platform_probe", "edge_runtime_platform_probe"))
+
+    def write_release_cache(self, path, prefixes):
+        lines = ["CMAKE_BUILD_TYPE:STRING=Release", "CMAKE_CXX_FLAGS_RELEASE:STRING=-O3 -DNDEBUG",
+                 "BUILD_TESTING:BOOL=OFF"]
+        for prefix in prefixes:
+            lines.extend(f"{prefix}_{suffix}:BOOL={value}" for suffix, value in (
+                ("WARNINGS_AS_ERRORS", "ON"), ("ENABLE_SANITIZERS", "OFF"),
+                ("ENABLE_FAILPOINTS", "OFF")))
+        path.write_text("\n".join(lines) + "\n")
+
+    def make_manifest(self, root, kind, legacy, placement="same"):
+        binary_dir = root / "build" / "tools"
+        binary_dir.mkdir(parents=True)
+        for name in ("shm_bench", "shm_bench_producer", "shm_bench_consumer", "shm_bench_sock",
+                     "shm_ctl", "mpmc_bench", "buffer_pool_bench"):
+            binary = binary_dir / f"{'edge_' if legacy else 'self_ipcs_'}{name}"
+            binary.write_bytes(b"metadata fixture; never executed")
+            binary.chmod(0o700)
+        case = cases(kind, 1)[0]
+        if kind == "spsc":
+            case["placement"] = placement
+        command = root / "evidence" / "case-01" / "command.json"
+        command.parent.mkdir(parents=True)
+        cache = command.parent.parent / "CMakeCache.txt"
+        self.write_release_cache(cache, ("EDGERUNTIME" if legacy else "SELFIPCS",))
+        argv = invocation(case, binary_dir, command.parent / "output", 2, 3, root)
+        metadata = {"case": case, "argv": argv,
+                    "source": {"binaries": {argv[0]: digest(Path(argv[0]))},
+                               "cache_sha256": digest(cache), "cpu_a": 2, "cpu_b": 3}}
+        if kind == "spsc":
+            samples = []
+            for prefix in ("edge_", "self_ipcs_"):
+                for role in ("producer", "consumer"):
+                    name = (f"{prefix}shm_bench_{role}" if prefix == "edge_"
+                            else f"{prefix}shm_bench_sock")
+                    cpu = 3 if placement == "different" and role == "consumer" else 2
+                    samples.append({"argv": [name, "--role", role], "cpus": [cpu]})
+            (command.parent / "process-samples.jsonl").write_text(
+                json.dumps({"affinities": samples}) + "\n")
+        command.write_text(json.dumps(metadata))
+        return command, metadata
+
+    def test_binary_and_archive_prefer_canonical_with_legacy_fallback(self):
+        with tempfile.TemporaryDirectory(dir=OUTPUT_ROOT) as directory:
+            root = Path(directory)
+            for name in ("shm_bench", "shm_bench_producer", "shm_bench_consumer", "shm_bench_sock",
+                         "shm_ctl", "mpmc_bench", "buffer_pool_bench", "crash_matrix"):
+                with self.subTest(tool=name):
+                    canonical, legacy = artifact_names(f"edge_{name}")
+                    old = root / legacy
+                    old.write_bytes(b"legacy fixture")
+                    old.chmod(0o700)
+                    self.assertEqual(resolve_binary(root, canonical), old)
+                    new = root / canonical
+                    new.write_bytes(b"canonical fixture")
+                    new.chmod(0o600)
+                    self.assertEqual(resolve_binary(root, canonical), old)
+                    new.chmod(0o700)
+                    self.assertEqual(resolve_binary(root, legacy), new)
+                    self.assertEqual(resolve_binary(root, canonical), new)
+            (root / "src").mkdir()
+            old_archive = root / "src" / "libedge_runtime.a"
+            old_archive.write_bytes(b"legacy archive")
+            self.assertEqual(resolve_archive(root), old_archive)
+            new_archive = root / "src" / "libself_ipcs.a"
+            new_archive.write_bytes(b"canonical archive")
+            self.assertEqual(resolve_archive(root), new_archive)
+            with self.assertRaises(FileNotFoundError):
+                resolve_binary(root, "self_ipcs_missing")
+
+    def test_build_directories_and_targets_support_both_generations(self):
+        with tempfile.TemporaryDirectory(dir=OUTPUT_ROOT) as directory:
+            root = Path(directory)
+            for preset, suffix in (("dev-debug", "debug"), ("asan-ubsan", "asan-ubsan"),
+                                   ("release", "release")):
+                canonical = root / "build" / f"selfipcs-{suffix}"
+                legacy = root / "build" / preset
+                self.assertEqual(default_build_dir(root, preset), canonical)
+                legacy.mkdir(parents=True)
+                self.assertEqual(default_build_dir(root, preset), legacy)
+                canonical.mkdir()
+                self.assertEqual(default_build_dir(root, preset), canonical)
+            targets = canonical / "CMakeFiles" / "TargetDirectories.txt"
+            targets.parent.mkdir()
+            for name in ("self_ipcs", "self_ipcs_mpmc_bench", "self_ipcs_buffer_pool_bench",
+                         "self_ipcs_mpmc_wait_child", "self_ipcs_shared_buffer_pool_child"):
+                canonical_name, legacy_name = artifact_names(name)
+                targets.write_text(str(canonical / f"{legacy_name}.dir") + "\n")
+                self.assertEqual(build_target(canonical, name), legacy_name)
+                with targets.open("a") as output:
+                    output.write(str(canonical / f"{canonical_name}.dir") + "\n")
+                self.assertEqual(build_target(canonical, name), canonical_name)
+            with self.assertRaises(ValueError):
+                build_target(canonical, "self_ipcs_missing")
+
+    def test_manifest_accepts_new_legacy_and_mixed_affinity_names(self):
+        for legacy in (False, True):
+            for kind, placement in (("spsc", "same"), ("spsc", "different"),
+                                    ("mpmc", "same"), ("pool", "same")):
+                with self.subTest(legacy=legacy, kind=kind, placement=placement):
+                    with tempfile.TemporaryDirectory(dir=OUTPUT_ROOT) as directory:
+                        command, metadata = self.make_manifest(Path(directory), kind, legacy,
+                                                               placement)
+                        check_manifest(command, metadata)
+                        if kind == "spsc":
+                            samples = command.parent / "process-samples.jsonl"
+                            observed = json.loads(samples.read_text())
+                            observed["affinities"][-1]["cpus"] = [4]
+                            samples.write_text(json.dumps(observed) + "\n")
+                            with self.assertRaisesRegex(ValueError, "affinity snapshots"):
+                                check_manifest(command, metadata)
+
+    def test_installed_package_and_default_consumer_use_self_ipcs_archive(self):
+        with tempfile.TemporaryDirectory(dir=OUTPUT_ROOT) as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            prefix = root / "install"
+            for relative in ("lib/libself_ipcs.a", "lib/cmake/SelfIPCs/SelfIPCsConfig.cmake",
+                             "lib/cmake/SelfIPCs/SelfIPCsTargets.cmake",
+                             "include/self_ipcs/queue/mpmc_queue.hpp",
+                             "include/self_ipcs/buffer/shared_buffer_pool.hpp"):
+                artifact = prefix / relative
+                artifact.parent.mkdir(parents=True, exist_ok=True)
+                artifact.write_text("installed metadata fixture\n")
+            assert_install(prefix, repo)
+            downstream = root / "downstream"
+            link = downstream / "CMakeFiles" / "consume_demo.dir" / "link.txt"
+            link.parent.mkdir(parents=True)
+            (downstream / "compile_commands.json").write_text(
+                json.dumps([{"command": f"g++ -I{prefix / 'include'} main.cpp"}]))
+            link.write_text(f"g++ main.o {prefix / 'lib' / 'libself_ipcs.a'} -o consume_demo\n")
+            assert_downstream_sources(downstream, prefix, repo)
+            link.write_text(f"g++ main.o {prefix / 'lib' / 'libedge_runtime.a'} -o consume_demo\n")
+            with self.assertRaisesRegex(AuditFailure, "libself_ipcs.a"):
+                assert_downstream_sources(downstream, prefix, repo)
+            (prefix / "include" / "self_ipcs" / "detail").mkdir()
+            with self.assertRaisesRegex(AuditFailure, "internal detail headers"):
+                assert_install(prefix, repo)
+
+    def test_release_cache_accepts_either_namespace_or_matching_aliases(self):
+        with tempfile.TemporaryDirectory(dir=OUTPUT_ROOT) as directory:
+            root = Path(directory)
+            cache = root / "CMakeCache.txt"
+            for prefixes in (("SELFIPCS",), ("EDGERUNTIME",), ("SELFIPCS", "EDGERUNTIME")):
+                with self.subTest(prefixes=prefixes):
+                    self.write_release_cache(cache, prefixes)
+                    validate_release_cache(cache)
+                    assert_release_configuration(root, root / "audit.log")
+            for suffix in ("ENABLE_SANITIZERS", "ENABLE_FAILPOINTS"):
+                self.write_release_cache(cache, ("SELFIPCS",))
+                original = cache.read_text()
+                for text in (original.replace(f"SELFIPCS_{suffix}:BOOL=OFF", ""),
+                             original.replace(f"SELFIPCS_{suffix}:BOOL=OFF",
+                                              f"SELFIPCS_{suffix}:BOOL=ON")):
+                    cache.write_text(text)
+                    with self.assertRaisesRegex(ValueError, "Release configuration"):
+                        validate_release_cache(cache)
+
+    def test_conflicting_cache_aliases_fail_runner_verifier_and_audit(self):
+        for suffix in ("WARNINGS_AS_ERRORS", "ENABLE_SANITIZERS", "ENABLE_FAILPOINTS"):
+            for canonical_value, legacy_value in (("ON", "OFF"), ("OFF", "ON")):
+                with self.subTest(suffix=suffix, values=(canonical_value, legacy_value)):
+                    with tempfile.TemporaryDirectory(dir=OUTPUT_ROOT) as directory:
+                        root = Path(directory)
+                        command, metadata = self.make_manifest(root, "mpmc", False)
+                        cache = command.parent.parent / "CMakeCache.txt"
+                        self.write_release_cache(cache, ("SELFIPCS", "EDGERUNTIME"))
+                        lines = [line for line in cache.read_text().splitlines()
+                                 if not line.startswith((f"SELFIPCS_{suffix}:", f"EDGERUNTIME_{suffix}:"))]
+                        lines.extend((f"SELFIPCS_{suffix}:BOOL={canonical_value}",
+                                      f"EDGERUNTIME_{suffix}:BOOL={legacy_value}"))
+                        cache.write_text("\n".join(lines) + "\n")
+                        metadata["source"]["cache_sha256"] = digest(cache)
+                        with self.assertRaisesRegex(ValueError, "conflicting cache flags"):
+                            validate_release_cache(cache)
+                        with self.assertRaisesRegex(ValueError, "conflicting cache flags"):
+                            check_manifest(command, metadata)
+                        with self.assertRaisesRegex(AuditFailure, "conflicting cache flags"):
+                            assert_release_configuration(cache.parent, root / "audit.log")
+                        argv = ["run_formal_bench.py", "--section", "mpmc", "--binary-dir",
+                                str(cache.parent / "tools"), "--output-root", str(root)]
+                        stderr = io.StringIO()
+                        with patch("sys.argv", argv), patch("run_formal_bench.os.sched_getaffinity",
+                                                            return_value={0, 1}), \
+                                patch("run_formal_bench.run_logged_process") as workload, \
+                                redirect_stderr(stderr):
+                            with self.assertRaises(SystemExit) as stopped:
+                                runner_main()
+                        self.assertEqual(stopped.exception.code, 2)
+                        self.assertIn("conflicting cache flags", stderr.getvalue())
+                        workload.assert_not_called()
+                        self.assertFalse((root / "audit.log").exists())
+
     def check_matrix(self, section, matrix, require_suite=False):
         with tempfile.TemporaryDirectory(dir=OUTPUT_ROOT) as directory:
             root = Path(directory)
@@ -114,14 +318,14 @@ class FormalBenchTest(unittest.TestCase):
     def test_worker_retention_and_independent_negative_checks(self):
         if BINARY_DIR is None:
             self.skipTest("--binary-dir enables native fork/exec coverage")
-        root = Path(tempfile.mkdtemp(prefix="edgeruntime-formal-regression-", dir=OUTPUT_ROOT))
+        root = Path(tempfile.mkdtemp(prefix="selfipcs-formal-regression-", dir=OUTPUT_ROOT))
         for kind, tool, arguments in (
-                ("mpmc", "edge_mpmc_bench", ["--payload-size", "64"]),
-                ("pool", "edge_buffer_pool_bench", ["--block-size", "4096", "--block-count", "4"])):
+                ("mpmc", "self_ipcs_mpmc_bench", ["--payload-size", "64"]),
+                ("pool", "self_ipcs_buffer_pool_bench", ["--block-size", "4096", "--block-count", "4"])):
             case_dir = root / kind
             case_dir.mkdir()
             output = case_dir / "output"
-            argv = [str(BINARY_DIR / tool), *arguments, "--producers", "2", "--consumers", "2",
+            argv = [str(resolve_binary(BINARY_DIR, tool)), *arguments, "--producers", "2", "--consumers", "2",
                     "--messages", "32", "--capacity", "2", "--timeout-ms", "5000",
                     "--out-dir", str(output), "--keep-worker-reports"]
             result = run_logged_process(argv, cwd=case_dir, env=os.environ.copy(),

@@ -15,6 +15,7 @@ import struct
 import sys
 
 from run_formal_bench import digest
+from self_ipcs_compat import canonical_name, validate_release_cache
 
 
 RECORD = struct.Struct("<IIQQ")
@@ -266,10 +267,7 @@ def check_manifest(path: Path, metadata: dict) -> None:
     cache = path.parent.parent / "CMakeCache.txt"
     if digest(cache) != source["cache_sha256"]:
         raise ValueError("Release cache SHA mismatch")
-    for setting in ("CMAKE_BUILD_TYPE:STRING=Release", "CMAKE_CXX_FLAGS_RELEASE:STRING=-O3 -DNDEBUG",
-                    "EDGERUNTIME_ENABLE_SANITIZERS:BOOL=OFF", "EDGERUNTIME_ENABLE_FAILPOINTS:BOOL=OFF"):
-        if setting not in cache.read_text().splitlines():
-            raise ValueError("unexpected Release build configuration")
+    validate_release_cache(cache)
     options = {}
     for index, token in enumerate(argv[1:], 1):
         if token.startswith("--") and index + 1 < len(argv) and not argv[index + 1].startswith("--"):
@@ -284,17 +282,20 @@ def check_manifest(path: Path, metadata: dict) -> None:
         if options.get("--only") != (f"shm-futex-64B-{placement}-100-controlled,"
                                      f"socket-64B-{placement}-100-controlled"):
             raise ValueError("controlled SPSC selector mismatch")
-        expected = {"edge_shm_bench_producer": source["cpu_a"],
-                    "edge_shm_bench_consumer": source["cpu_a"] if placement == "same" else source["cpu_b"]}
+        expected = {"self_ipcs_shm_bench_producer": source["cpu_a"],
+                    "self_ipcs_shm_bench_consumer": (source["cpu_a"] if placement == "same"
+                                                   else source["cpu_b"])}
         found = set()
         for line in (path.parent / "process-samples.jsonl").read_text().splitlines():
             for sample in json.loads(line).get("affinities", []):
                 if not sample["argv"]:
                     continue
-                name = Path(sample["argv"][0]).name
-                if name == "edge_shm_bench_sock":
+                name = canonical_name(Path(sample["argv"][0]).name)
+                if name == "self_ipcs_shm_bench_sock":
                     role_index = sample["argv"].index("--role")
-                    name = "edge_shm_bench_producer" if sample["argv"][role_index + 1] == "producer" else "edge_shm_bench_consumer"
+                    name = ("self_ipcs_shm_bench_producer"
+                            if sample["argv"][role_index + 1] == "producer"
+                            else "self_ipcs_shm_bench_consumer")
                     name = "socket_" + name
                 base_name = name.removeprefix("socket_")
                 if base_name in expected and sample["cpus"] == [expected[base_name]]:

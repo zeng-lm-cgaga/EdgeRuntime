@@ -1,5 +1,14 @@
 # 集成测试必须通过独立可执行文件和 fork/exec 验证进程边界行为。
 
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME cmake_option_compatibility
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cmake_options_test.py
+            --cmake ${CMAKE_COMMAND})
+  set_tests_properties(cmake_option_compatibility PROPERTIES TIMEOUT 120 LABELS packaging
+    ENVIRONMENT PYTHONDONTWRITEBYTECODE=1)
+endif()
+
 add_executable(channel_options_cli_test channel_options_cli_test.cpp)
 edgeruntime_apply_project_options(channel_options_cli_test)
 target_link_libraries(channel_options_cli_test PRIVATE GTest::gtest)

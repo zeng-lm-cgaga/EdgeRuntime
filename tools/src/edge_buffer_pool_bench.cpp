@@ -1240,7 +1240,7 @@ int main(int argc, char** argv) {
 	if (!install_stop_signal_handler()) return 2;
 	if (edge_tool::arg_value(argc, argv, "--role") != nullptr) return run_as_child(argc, argv);
 	if (edge_tool::arg_flag(argc, argv, "--help")) {
-		print_usage(argv[0]);
+		print_usage("self_ipcs_buffer_pool_bench");
 		return 0;
 	}
 	const std::string executable = self_executable();
@@ -1251,7 +1251,7 @@ int main(int argc, char** argv) {
 	if (edge_tool::arg_flag(argc, argv, "--smoke")) return run_smoke(executable);
 	Config config;
 	if (!parse_config(argc, argv, &config)) {
-		print_usage(argv[0]);
+		print_usage("self_ipcs_buffer_pool_bench");
 		return 2;
 	}
 	return run_parent(executable, config, 1);

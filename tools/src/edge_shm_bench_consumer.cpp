@@ -200,13 +200,13 @@ int run_consume_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) {
 
 int main(int argc, char** argv) {
 	const char* name = edge_tool::arg_value(argc, argv, "--name");
-	if (name == nullptr || *name == '\0') {
+	if (edge_tool::arg_flag(argc, argv, "--help") || name == nullptr || *name == '\0') {
 		std::fprintf(stderr,
-		             "usage: edge_shm_bench_consumer --name <name> --payload <bytes> "
+		             "usage: self_ipcs_shm_bench_consumer --name <name> --payload <bytes> "
 		             "--csv <path> [--mode futex|poll] [--max-samples N] "
 		             "[--max-time-ms T] [--idle-ms N] [--poll-bound N] "
 		             "[--open-retry-ms N] [--checksum 1]\n");
-		return 2;
+		return edge_tool::arg_flag(argc, argv, "--help") ? 0 : 2;
 	}
 	Args a;
 	a.name = name;
@@ -215,7 +215,7 @@ int main(int argc, char** argv) {
 	a.use_wait = mode == nullptr || std::string(mode) == "futex";
 	const char* csv = edge_tool::arg_value(argc, argv, "--csv");
 	if (csv == nullptr || *csv == '\0') {
-		std::fprintf(stderr, "edge_shm_bench_consumer: --csv is required\n");
+		std::fprintf(stderr, "self_ipcs_shm_bench_consumer: --csv is required\n");
 		return 2;
 	}
 	a.csv_path = csv;

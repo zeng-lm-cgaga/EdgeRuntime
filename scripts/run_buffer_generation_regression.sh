@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)
+compat_helper="$script_dir/self_ipcs_compat.py"
 runs=${1:-10}
 preset=${2:-dev-debug}
 
@@ -12,8 +13,10 @@ if [[ ! "$runs" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 cd "$repo_root"
+build_dir="$(python3 "$compat_helper" build-dir "$repo_root" "$preset")"
+child_target="$(python3 "$compat_helper" target "$build_dir" self_ipcs_shared_buffer_pool_child)"
 cmake --build --preset "$preset" \
-	--target shared_buffer_pool_integration_test edge_shared_buffer_pool_child
+	--target shared_buffer_pool_integration_test "$child_target"
 
 for ((run = 1; run <= runs; ++run)); do
 	printf 'buffer generation regression run %d/%d (%s)\n' "$run" "$runs" "$preset"

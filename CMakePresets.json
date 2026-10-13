@@ -8,39 +8,39 @@
   "configurePresets": [
     {
       "name": "dev-debug",
-      "displayName": "GCC Debug (out-of-source: build/dev-debug)",
-      "description": "Build outside the source tree under ${sourceDir}/build/dev-debug; src/CMakeLists.txt owns the library sources.",
+      "displayName": "SelfIPCs GCC Debug",
+      "description": "Out-of-source SelfIPCs build; src/CMakeLists.txt owns the library sources.",
       "generator": "Unix Makefiles",
-      "binaryDir": "${sourceDir}/build/dev-debug",
+      "binaryDir": "${sourceDir}/build/selfipcs-debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_CXX_COMPILER": "g++",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "BUILD_TESTING": "ON",
-        "EDGERUNTIME_WARNINGS_AS_ERRORS": "ON"
+        "SELFIPCS_WARNINGS_AS_ERRORS": "ON"
       }
     },
     {
       "name": "asan-ubsan",
-      "displayName": "GCC ASan + UBSan (out-of-source: build/asan-ubsan)",
-      "description": "Sanitized out-of-source build under ${sourceDir}/build/asan-ubsan; src/CMakeLists.txt owns the library sources.",
+      "displayName": "SelfIPCs GCC ASan + UBSan",
+      "description": "Sanitized out-of-source SelfIPCs build.",
       "inherits": "dev-debug",
-      "binaryDir": "${sourceDir}/build/asan-ubsan",
+      "binaryDir": "${sourceDir}/build/selfipcs-asan-ubsan",
       "cacheVariables": {
-        "EDGERUNTIME_ENABLE_SANITIZERS": "ON"
+        "SELFIPCS_ENABLE_SANITIZERS": "ON"
       }
     },
     {
       "name": "release",
-      "displayName": "GCC Release (out-of-source: build/release)",
-      "description": "Release out-of-source build under ${sourceDir}/build/release; src/CMakeLists.txt owns the library sources.",
+      "displayName": "SelfIPCs GCC Release",
+      "description": "Release out-of-source SelfIPCs build.",
       "inherits": "dev-debug",
-      "binaryDir": "${sourceDir}/build/release",
+      "binaryDir": "${sourceDir}/build/selfipcs-release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "BUILD_TESTING": "OFF",
-        "EDGERUNTIME_ENABLE_FAILPOINTS": "OFF",
-        "EDGERUNTIME_ENABLE_SANITIZERS": "OFF"
+        "SELFIPCS_ENABLE_FAILPOINTS": "OFF",
+        "SELFIPCS_ENABLE_SANITIZERS": "OFF"
       }
     }
   ],

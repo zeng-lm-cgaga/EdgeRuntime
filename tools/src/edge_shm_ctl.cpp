@@ -564,12 +564,12 @@ int cmd_remove(const std::string& channel_name, bool has_expect_gen, uint64_t ex
 }
 
 int main(int argc, char** argv) {
-	if (argc < 3) {
+	if (edge_tool::arg_flag(argc, argv, "--help") || argc < 3) {
 		std::fprintf(stderr,
-		             "usage: edge_shm_ctl inspect <name>\n"
-		             "       edge_shm_ctl remove  <name> "
+		             "usage: self_ipcs_shm_ctl inspect <name>\n"
+		             "       self_ipcs_shm_ctl remove  <name> "
 		             "[--expect-generation N] [--expect-nonce HEX32]\n");
-		return 2;
+		return edge_tool::arg_flag(argc, argv, "--help") ? 0 : 2;
 	}
 	const std::string sub = argv[1];
 	const std::string name = argv[2];

@@ -14,6 +14,8 @@ import tempfile
 import time
 from typing import Iterable, Optional
 
+from self_ipcs_compat import validate_release_cache
+
 
 class AuditFailure(RuntimeError):
 	"""A required audit stage failed."""
@@ -113,24 +115,15 @@ def run_command(label: str, args: list[str], cwd: pathlib.Path, log_path: pathli
 			raise AuditFailure(f"{label} exited with {process.returncode}")
 
 
-def parse_cache(cache_path: pathlib.Path) -> dict[str, str]:
-	values: dict[str, str] = {}
-	for line in cache_path.read_text(encoding="utf-8").splitlines():
-		if "=" not in line or line.startswith("//") or line.startswith("#"):
-			continue
-		key, value = line.split("=", 1)
-		key = key.split(":", 1)[0]
-		values[key] = value
-	return values
-
-
 def assert_release_configuration(build_dir: pathlib.Path, log_path: pathlib.Path) -> None:
-	cache = parse_cache(build_dir / "CMakeCache.txt")
+	try:
+		cache = validate_release_cache(build_dir / "CMakeCache.txt", require_testing_off=True,
+									  require_optimization=False)
+	except ValueError as error:
+		raise AuditFailure(str(error)) from error
 	expected = {
 		"CMAKE_BUILD_TYPE": "Release",
 		"BUILD_TESTING": "OFF",
-		"EDGERUNTIME_ENABLE_FAILPOINTS": "OFF",
-		"EDGERUNTIME_ENABLE_SANITIZERS": "OFF",
 	}
 	for key, value in expected.items():
 		if cache.get(key) != value:
@@ -138,24 +131,28 @@ def assert_release_configuration(build_dir: pathlib.Path, log_path: pathlib.Path
 	compile_commands = build_dir / "compile_commands.json"
 	if compile_commands.exists():
 		text = compile_commands.read_text(encoding="utf-8")
-		if "-fsanitize=" in text or "EDGERUNTIME_ENABLE_FAILPOINTS" in text:
+		if "-fsanitize=" in text or any(flag in text for flag in
+										("SELFIPCS_ENABLE_FAILPOINTS", "EDGERUNTIME_ENABLE_FAILPOINTS")):
 			raise AuditFailure("Release compile commands contain sanitizer or failpoint flags")
 	with log_path.open("a", encoding="utf-8") as log:
-		log.write(f"\n[release-cache] {expected}\n")
+		flags = {key: value for key, value in cache.items()
+				 if key.startswith(("SELFIPCS_", "EDGERUNTIME_"))}
+		log.write(f"\n[release-cache] {expected | flags}\n")
 
 
 def assert_install(prefix: pathlib.Path, root: pathlib.Path) -> None:
 	required = [
-		prefix / "lib" / "libedge_runtime.a",
-		prefix / "lib" / "cmake" / "EdgeRuntime" / "EdgeRuntimeConfig.cmake",
-		prefix / "lib" / "cmake" / "EdgeRuntime" / "EdgeRuntimeTargets.cmake",
-		prefix / "include" / "edge_runtime" / "queue" / "mpmc_queue.hpp",
-		prefix / "include" / "edge_runtime" / "buffer" / "shared_buffer_pool.hpp",
+		prefix / "lib" / "libself_ipcs.a",
+		prefix / "lib" / "cmake" / "SelfIPCs" / "SelfIPCsConfig.cmake",
+		prefix / "lib" / "cmake" / "SelfIPCs" / "SelfIPCsTargets.cmake",
+		prefix / "include" / "self_ipcs" / "queue" / "mpmc_queue.hpp",
+		prefix / "include" / "self_ipcs" / "buffer" / "shared_buffer_pool.hpp",
 	]
 	for path in required:
 		if not path.is_file():
 			raise AuditFailure(f"missing installed artifact: {path}")
-	if (prefix / "include" / "edge_runtime" / "detail").exists():
+	if any((prefix / "include" / namespace / "detail").exists()
+		   for namespace in ("self_ipcs", "edge_runtime")):
 		raise AuditFailure("internal detail headers leaked into the install")
 	for path in prefix.rglob("*"):
 		if path.is_file():
@@ -176,10 +173,10 @@ def assert_downstream_sources(build_dir: pathlib.Path, prefix: pathlib.Path,
 	if str(prefix / "include") not in text:
 		raise AuditFailure("downstream compile command does not use the install prefix")
 	link_file = build_dir / "CMakeFiles" / "consume_demo.dir" / "link.txt"
-	if not link_file.is_file() or str(prefix / "lib" / "libedge_runtime.a") not in link_file.read_text(
+	if not link_file.is_file() or str(prefix / "lib" / "libself_ipcs.a") not in link_file.read_text(
 		encoding="utf-8"
 	):
-		raise AuditFailure("downstream link command does not use installed libedge_runtime.a")
+		raise AuditFailure("downstream link command does not use installed libself_ipcs.a")
 
 
 def run_safety_self_test(root: pathlib.Path) -> None:
@@ -194,7 +191,7 @@ def run_safety_self_test(root: pathlib.Path) -> None:
 		)
 		if result.returncode != 2:
 			raise AuditFailure(f"unsafe path accepted: {invalid!r}: {result.stdout}")
-	with tempfile.TemporaryDirectory(prefix="edgeruntime-audit-safety-") as temp:
+	with tempfile.TemporaryDirectory(prefix="selfipcs-audit-safety-") as temp:
 		base = pathlib.Path(temp) / "out"
 		base.mkdir()
 		sentinel = base / "sentinel"
@@ -234,7 +231,7 @@ def run_audit(args: argparse.Namespace, root: pathlib.Path) -> pathlib.Path:
 	run_dir = make_run_dir(base)
 	log_path = run_dir / "ci.log"
 	log_path.write_text(f"repo={root}\nrun={run_dir}\nstarted={time.time()}\n", encoding="utf-8")
-	scratch_dir = pathlib.Path(tempfile.mkdtemp(prefix="edgeruntime-ci-", dir="/tmp")).resolve()
+	scratch_dir = pathlib.Path(tempfile.mkdtemp(prefix="selfipcs-ci-", dir="/tmp")).resolve()
 	with log_path.open("a", encoding="utf-8") as log:
 		log.write(f"scratch={scratch_dir}\n")
 	print(f"[ci] run directory: {run_dir}")
@@ -252,7 +249,7 @@ def run_audit(args: argparse.Namespace, root: pathlib.Path) -> pathlib.Path:
 			900,
 		)
 
-	release_build = scratch_dir / "release-build"
+	release_build = scratch_dir / "build" / "selfipcs-release"
 	install_prefix = scratch_dir / "install"
 	downstream_source = scratch_dir / "downstream-source"
 	downstream_build = scratch_dir / "downstream-build"
@@ -268,9 +265,9 @@ def run_audit(args: argparse.Namespace, root: pathlib.Path) -> pathlib.Path:
 			"Unix Makefiles",
 			"-DCMAKE_BUILD_TYPE=Release",
 			"-DBUILD_TESTING=OFF",
-			"-DEDGERUNTIME_ENABLE_FAILPOINTS=OFF",
-			"-DEDGERUNTIME_ENABLE_SANITIZERS=OFF",
-			"-DEDGERUNTIME_WARNINGS_AS_ERRORS=ON",
+			"-DSELFIPCS_ENABLE_FAILPOINTS=OFF",
+			"-DSELFIPCS_ENABLE_SANITIZERS=OFF",
+			"-DSELFIPCS_WARNINGS_AS_ERRORS=ON",
 			"-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
 		],
 		root,
@@ -301,7 +298,7 @@ def run_audit(args: argparse.Namespace, root: pathlib.Path) -> pathlib.Path:
 			"Unix Makefiles",
 			"-DCMAKE_BUILD_TYPE=Release",
 			f"-DCMAKE_PREFIX_PATH={install_prefix}",
-			f"-DEdgeRuntime_DIR={install_prefix / 'lib' / 'cmake' / 'EdgeRuntime'}",
+			f"-DSelfIPCs_DIR={install_prefix / 'lib' / 'cmake' / 'SelfIPCs'}",
 			"-DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF",
 			"-DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=OFF",
 			"-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
@@ -319,6 +316,7 @@ def run_audit(args: argparse.Namespace, root: pathlib.Path) -> pathlib.Path:
 		raise AuditFailure("audit log disappeared")
 	print(f"[ci] transcript: {log_path}")
 	print(f"[ci] install prefix: {install_prefix}")
+	print(f"[ci] installed package: {install_prefix / 'lib' / 'cmake' / 'SelfIPCs'}")
 	print(f"[ci] private scratch retained: {scratch_dir}")
 	return run_dir
 

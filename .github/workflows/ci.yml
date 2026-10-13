@@ -1,4 +1,4 @@
-# CI — the EdgeRuntime release-audit gate (design §26 completion definition).
+# CI — the SelfIPCs release-audit gate (design §26 completion definition).
 #
 # Same stages as scripts/ci.sh, run on a clean ubuntu-22.04 runner with the
 # contract toolchain (GCC 11, CMake 3.22). A green run on the default branch is
@@ -32,4 +32,4 @@ jobs:
           sudo apt-get install -y g++ cmake
 
       - name: Release audit and independent downstream consumer
-        run: scripts/ci.sh --out-dir "$RUNNER_TEMP/edgeruntime-ci"
+        run: scripts/ci.sh --out-dir "$RUNNER_TEMP/selfipcs-ci"

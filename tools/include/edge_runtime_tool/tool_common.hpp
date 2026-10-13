@@ -4,6 +4,7 @@
 // 工具共用参数解析、时钟、CPU 时间和 Schema 构造，输出格式由驱动程序消费。
 #include <sys/resource.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <array>
 #include <cerrno>
@@ -16,6 +17,16 @@
 #include "edge_runtime/common/schema.hpp"
 
 namespace edge_tool {
+
+inline std::string sibling_executable(const char* name) {
+	char path[4096]{};
+	const ssize_t length = ::readlink("/proc/self/exe", path, sizeof(path) - 1);
+	if (length <= 0 || static_cast<size_t>(length) == sizeof(path) - 1) return {};
+	const std::string executable(path, static_cast<size_t>(length));
+	const size_t separator = executable.find_last_of('/');
+	if (separator == std::string::npos) return {};
+	return executable.substr(0, separator + 1) + name;
+}
 
 inline int64_t monotonic_ms_now() {
 	struct timespec ts {};

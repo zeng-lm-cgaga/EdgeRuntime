@@ -1,30 +1,28 @@
 #include "consume_demo/channel_flow.hpp"
 
-#include <cstdio>
 #include <fcntl.h>
-#include <string>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <cstdio>
+#include <string>
+
 #include "consume_demo/common.hpp"
-#include "edge_runtime/channel/consumer.hpp"
-#include "edge_runtime/channel/loan.hpp"
-#include "edge_runtime/channel/producer.hpp"
 
 namespace consume_demo {
 
 namespace {
 
-using Consumer = edge_runtime::Consumer<Point>;
-using Producer = edge_runtime::Producer<Point>;
+using Consumer = ipc::Consumer<Point>;
+using Producer = ipc::Producer<Point>;
 
-void cleanup(ChildProcess* child, Producer* producer, const edge_runtime::ChannelOptions& options) {
+void cleanup(ChildProcess* child, Producer* producer, const ipc::ChannelOptions& options) {
 	if (child != nullptr && child->pid > 0) stop_child(child);
 	if (producer != nullptr) {
 		const auto removed = producer->remove_if_owner();
 		if (!removed) {
 			std::fprintf(stderr, "channel cleanup failed: %s\n",
-			             edge_runtime::to_string(removed.error().code));
+			             ipc::to_string(removed.error().code));
 		}
 	}
 	(void)options;
@@ -34,7 +32,7 @@ void cleanup(ChildProcess* child, Producer* producer, const edge_runtime::Channe
 }  // namespace
 
 int run_channel_child(const std::string& name, int event_fd) {
-	edge_runtime::ChannelOptions options;
+	ipc::ChannelOptions options;
 	options.name = name;
 	auto opened = Consumer::open(options, point_schema());
 	if (!opened) {
@@ -45,7 +43,8 @@ int run_channel_child(const std::string& name, int event_fd) {
 	if (!write_token(event_fd, 'R')) return 3;
 	auto read_loan = consumer.wait_loan_latest(std::chrono::milliseconds(2500));
 	Point point{};
-	if (!read_loan || !decode_point(read_loan.value().data(), read_loan.value().size(), &point) ||
+	if (!read_loan ||
+	    !decode_point(read_loan.value().data(), read_loan.value().size(), &point) ||
 	    point.x != 3 || point.y != 4 || read_loan.value().sequence() == 0) {
 		(void)write_token(event_fd, 'F');
 		return 3;
@@ -57,12 +56,12 @@ int run_channel_child(const std::string& name, int event_fd) {
 
 bool run_channel_flow() {
 	const std::string name = unique_name("er_demo_channel");
-	edge_runtime::ChannelOptions options;
+	ipc::ChannelOptions options;
 	options.name = name;
 	auto created = Producer::create(options, point_schema());
 	if (!created) {
 		std::fprintf(stderr, "channel create failed: %s\n",
-		             edge_runtime::to_string(created.error().code));
+		             ipc::to_string(created.error().code));
 		return false;
 	}
 	Producer producer = std::move(created.value());
@@ -71,8 +70,8 @@ bool run_channel_flow() {
 		cleanup(nullptr, &producer, options);
 		return false;
 	}
-	const ChildProcess spawned = spawn_child(
-	        "channel-child", {name, std::to_string(events[1])}, {events[0], events[1]}, {events[1]});
+	const ChildProcess spawned = spawn_child("channel-child", {name, std::to_string(events[1])},
+	                                         {events[0], events[1]}, {events[1]});
 	ChildProcess child = spawned;
 	const int child_pid = child.pid;
 	(void)::close(events[1]);
@@ -104,10 +103,11 @@ bool run_channel_flow() {
 	const auto removed = producer.remove_if_owner();
 	if (!removed) return false;
 	const auto reopened = Consumer::open(options, point_schema());
-	if (reopened || reopened.error().code != edge_runtime::ErrorCode::kNotFound) return false;
-	std::printf("channel: parent_pid=%d child_pid=%d child_exit=0 fork/exec loan sequence "
-	            "verified cleanup=creator-unlinked\n",
-	            static_cast<int>(::getpid()), child_pid);
+	if (reopened || reopened.error().code != ipc::ErrorCode::kNotFound) return false;
+	std::printf(
+	        "channel: parent_pid=%d child_pid=%d child_exit=0 fork/exec loan sequence "
+	        "verified cleanup=creator-unlinked\n",
+	        static_cast<int>(::getpid()), child_pid);
 	return true;
 }
 

@@ -644,16 +644,19 @@ int run_parent(int argc, char** argv, const std::string& executable) {
 }  // namespace
 
 int main(int argc, char** argv) {
+	for (int index = 1; index < argc; ++index) {
+		if (std::strcmp(argv[index], "--help") == 0) {
+			std::printf("self_ipcs_mpmc_handshake_helper --producers N --consumers N "
+			            "--messages N --capacity N [--delay-us N] "
+			            "[--wait-policy busy|blocking]\n");
+			return 0;
+		}
+	}
 	const char* role = value_of(argc, argv, "--role");
 	if (role != nullptr) {
 		if (std::strcmp(role, "producer") == 0) return run_child(argc, argv, 'P');
 		if (std::strcmp(role, "consumer") == 0) return run_child(argc, argv, 'C');
 		return 2;
-	}
-	if (value_of(argc, argv, "--help") != nullptr) {
-		std::printf("mpmc_handshake_helper --producers N --consumers N --messages N "
-		            "--capacity N --delay-us N --wait-policy busy|blocking\n");
-		return 0;
 	}
 	const char* executable = "/proc/self/exe";
 	char path[4096]{};

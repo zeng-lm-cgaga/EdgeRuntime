@@ -18,7 +18,8 @@ USAGE
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
-build_preset="${EDGE_RUNTIME_BENCH_PRESET:-dev-debug}"
+compat_helper="$script_dir/self_ipcs_compat.py"
+build_preset="${SELFIPCS_BENCH_PRESET:-${EDGE_RUNTIME_BENCH_PRESET:-dev-debug}}"
 output_dir=""
 runs=1
 timeout_ms=10000
@@ -92,20 +93,18 @@ cd -- "$repo_root"
 
 if [[ -z "$output_dir" ]]; then
 	temp_parent="${TMPDIR:-/tmp}"
-	output_dir="$(mktemp -d "${temp_parent%/}/edgeruntime-mpmc-ab.XXXXXX")"
+	output_dir="$(mktemp -d "${temp_parent%/}/selfipcs-mpmc-ab.XXXXXX")"
 elif [[ "$output_dir" != /* ]]; then
 	output_dir="$repo_root/$output_dir"
 fi
 mkdir -p -- "$output_dir"
 
 cmake --preset "$build_preset"
-cmake --build --preset "$build_preset" --target edge_mpmc_bench
+build_dir="$(python3 "$compat_helper" build-dir "$repo_root" "$build_preset")"
+benchmark_target="$(python3 "$compat_helper" target "$build_dir" self_ipcs_mpmc_bench)"
+cmake --build --preset "$build_preset" --target "$benchmark_target"
 
-benchmark="$repo_root/build/$build_preset/tools/edge_mpmc_bench"
-if [[ ! -x "$benchmark" ]]; then
-	echo "benchmark executable was not produced: $benchmark" >&2
-	exit 1
-fi
+benchmark="$(python3 "$compat_helper" binary "$build_dir/tools" self_ipcs_mpmc_bench)"
 
 matrix_log="$(mktemp "$output_dir/mpmc_ab.XXXXXX.log")"
 

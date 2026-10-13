@@ -214,9 +214,9 @@ int main(int argc, char** argv) {
 		}
 	}
 
-	if (a.name.empty()) {
+	if (edge_tool::arg_flag(argc, argv, "--help") || a.name.empty()) {
 		std::fprintf(stderr,
-		             "usage: edge_shm_consumer --name <name> "
+		             "usage: self_ipcs_shm_consumer --name <name> "
 		             "--schema-hex <64hex> [--schema-version N] "
 		             "[--schema testpayloadv1|testpayloadv2] "
 		             "[--reads N] [--expect-last-seq N] "
@@ -224,7 +224,7 @@ int main(int argc, char** argv) {
 		             "[--open-retry-ms N] [--seq-start N] "
 		             "[--use-wait-ms N] [--checksum 1] [--transport fd|posix] "
 		             "[--loaned 0|1]\n");
-		return 2;
+		return edge_tool::arg_flag(argc, argv, "--help") ? 0 : 2;
 	}
 
 	const char* schema_name = edge_tool::arg_value(argc, argv, "--schema");

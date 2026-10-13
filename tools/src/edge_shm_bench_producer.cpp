@@ -111,12 +111,12 @@ int run_producer_n(const Args& a, const edge_runtime::SchemaDescriptor& schema) 
 
 int main(int argc, char** argv) {
 	const char* name = edge_tool::arg_value(argc, argv, "--name");
-	if (name == nullptr || *name == '\0') {
+	if (edge_tool::arg_flag(argc, argv, "--help") || name == nullptr || *name == '\0') {
 		std::fprintf(stderr,
-		             "usage: edge_shm_bench_producer --name <name> --payload <bytes> "
+		             "usage: self_ipcs_shm_bench_producer --name <name> --payload <bytes> "
 		             "[--samples N] [--max-time-ms T] [--rate hz] "
 		             "[--wait-consumer-ms N] [--checksum 1]\n");
-		return 2;
+		return edge_tool::arg_flag(argc, argv, "--help") ? 0 : 2;
 	}
 	Args a;
 	a.name = name;

@@ -511,6 +511,11 @@ int run_supervisor(int argc, char** argv, const std::string& executable) {
 }  // namespace
 
 int main(int argc, char** argv) {
+	if (has_flag(argc, argv, "--help")) {
+		std::printf("usage: self_ipcs_benchmark_watchdog_helper --kind mpmc|pool "
+		            "--ready-file FILE [--ignore-term-worker]\n");
+		return 0;
+	}
 	const std::string executable = self_executable();
 	if (executable.empty()) return 2;
 	const char* role = value_of(argc, argv, "--role");

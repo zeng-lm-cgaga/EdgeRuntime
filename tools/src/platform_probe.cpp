@@ -150,7 +150,13 @@ bool check_shm_lifecycle() {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
+	for (int index = 1; index < argc; ++index) {
+		if (std::strcmp(argv[index], "--help") == 0) {
+			std::printf("usage: self_ipcs_platform_probe\n");
+			return 0;
+		}
+	}
 #if !defined(__linux__) || !defined(__x86_64__) || !defined(__GNUC__)
 	std::cerr << "FAIL compile_contract requires Linux x86-64 and GCC-compatible atomics\n";
 	return 1;

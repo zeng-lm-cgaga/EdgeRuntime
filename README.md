@@ -1,4 +1,4 @@
-# EdgeRuntime
+# SelfIPCs
 
 面向同机 Linux 进程的 **C++17 共享内存 IPC 库**，用于连续状态、离散任务和大块数据传递。
 
@@ -15,13 +15,13 @@ SPSC 支持 POSIX shm、memfd + SCM_RIGHTS 和共享槽位的原地读写。
 
 - **同步与所有权**：进程共享 futex、MPMC 生产/消费分侧 gate、RAII 管理共享缓冲区所有权；校验 schema、实例代次和进程身份。
 - **故障处理**：SPSC 支持经身份校验的崩溃恢复；MPMC/Pool 在所有权存在歧义时返回 `RecoveryBlocked`。
-- **监督与诊断**：`ProducerSupervisor` 基于 pidfd 监督自身启动的 SPSC producer 子进程；`edge_shm_ctl` 查看通道状态并管理实例。
+- **监督与诊断**：`ProducerSupervisor` 基于 pidfd 监督自身启动的 SPSC producer 子进程；`self_ipcs_shm_ctl` 查看通道状态并管理实例。
 
 队列负责至多一次成功出队，业务执行结果与 ACK 由应用层管理；共享资源由 creator 和使用方按所有权释放。
 
 ## 快速开始
 
-环境：Ubuntu 22.04 / Linux ≥ 5.15、GCC 11、CMake 3.22。构建产物位于 `build/<preset>/`。
+环境：Ubuntu 22.04 / Linux ≥ 5.15、GCC 11、CMake 3.22。新构建使用 `build/selfipcs-debug`、`build/selfipcs-asan-ubsan`、`build/selfipcs-release`。
 
 ```bash
 cmake --preset dev-debug && cmake --build --preset dev-debug
@@ -29,7 +29,7 @@ ctest --preset dev-debug
 
 # Release 构建与安装
 cmake --preset release && cmake --build --preset release
-cmake --install build/release --prefix /your/prefix
+cmake --install build/selfipcs-release --prefix /your/prefix
 
 # 完整流水线：Debug、ASan/UBSan、Release 安装及独立消费示例
 scripts/ci.sh
@@ -38,11 +38,21 @@ scripts/ci.sh
 下游通过安装包链接：
 
 ```cmake
-find_package(EdgeRuntime CONFIG REQUIRED)
-target_link_libraries(app PRIVATE EdgeRuntime::edge_runtime)
+find_package(SelfIPCs CONFIG REQUIRED)
+target_link_libraries(app PRIVATE SelfIPCs::self_ipcs)
 ```
 
 使用示例见 [examples/consume_demo/](examples/consume_demo/)，覆盖 channel、queue+wait 和缓冲池句柄传递。
+
+### 新入口与兼容
+
+公共头按 `self_ipcs/{common,channel,queue,buffer,process}/` 划分，例如 `#include <self_ipcs/queue/mpmc_queue.hpp>`，C++ 使用 `self_ipcs::MpmcQueue<T>`。`self_ipcs` 是原实现命名空间的 alias，新旧入口共用 `libself_ipcs.a`，保留原有链接符号与进程间协议。
+
+已有工程可继续使用 `find_package(EdgeRuntime CONFIG REQUIRED)`、`EdgeRuntime::edge_runtime`、`edge_runtime/...` 头路径和 `edge_runtime::`。工具安装同时提供 `self_ipcs_*` 名称和对应的 `edge_*` 兼容入口；共享内存标识、ABI 版本及实例校验保持原值。
+
+`PayloadCodec` 特化在全局作用域使用 qualified 名称：`template <> struct self_ipcs::PayloadCodec<MyPayload> { /* codec members */ };`，具体编译示例见 [examples/compat_demo/](examples/compat_demo/)。
+
+CMake 选项使用 `SELFIPCS_WARNINGS_AS_ERRORS`、`SELFIPCS_ENABLE_SANITIZERS`、`SELFIPCS_ENABLE_FAILPOINTS`，对应的 `EDGERUNTIME_*` 兼容选项同步到同一配置。首次配置同时指定冲突值会报错；重新配置时单独修改任一入口会同步另一入口。Debug 默认启用 failpoints，Release 默认关闭；ASan/UBSan preset 明确启用 sanitizer。
 
 ## 配置与恢复边界
 
@@ -50,16 +60,18 @@ target_link_libraries(app PRIVATE EdgeRuntime::edge_runtime)
 - `stale_timeout` 是弃用的兼容字段，仅接受原默认值 `100ms`；样本新鲜度由应用依据 `publish_boot_ns`、`sample_age` 和业务阈值判断。新鲜度与 owner 死亡判定相互独立。
 - memfd 的 broker 交换及 observer 重试路径使用单个 monotonic 总截止时间；重试时限为零表示仅做一次交换，I/O 预算为 `20ms`。broker 对每个 peer 使用独立的 `100ms` 服务预算，并以 `10ms` 轮询片段检查停止；实际完成时间受系统调度影响。进程身份不可验证时，注册和 owner 接管返回 `RecoveryBlocked`。
 - 创建阶段的 `fstat` 中断会有界重试；失败清理通过打开 FD 的 inode 绑定验证同名对象。身份仍不可验证时保留对象并返回 `RecoveryBlocked`，SPSC 同时保留非 idle journal，恢复需保留现场并核验归属。
-- 安装包自动发现并传播 `Threads::Threads`，下游只需链接 `EdgeRuntime::edge_runtime`。
+- 安装包自动发现并传播 `Threads::Threads`，下游只需链接 `SelfIPCs::self_ipcs`。
 
 ## 测试与性能
 
 2026-10-13 Linux 验证：Debug、ASan/UBSan 各完成 **180/180** 项启用测试；Debug 完整 C01–C23 崩溃矩阵 **23/23**，Release 安装后的独立消费示例通过。
-执行环境为 `VM_ONLY`；ASan/UBSan 配置为 `detect_leaks=0`。2026-10-07 的关键正常退出路径经 Valgrind 3.27.1 Memcheck 检查；完整崩溃矩阵通过 `edge_crash_matrix` 显式执行。
+执行环境为 Linux 虚拟机（`VM_ONLY`）；ASan/UBSan 配置为 `detect_leaks=0`。2026-10-07 的关键正常退出路径经 Valgrind 3.27.1 Memcheck 检查；完整崩溃矩阵通过当时的 `edge_crash_matrix` 显式执行。
+
+2026-10-14 SelfIPCs 验证：全新 Debug 构建完成 **217/217** 项启用测试，ASan/UBSan 的工具、CLI、配置兼容及负例检查 **47/47**。Release 和 sanitizer 安装包均完成新入口、旧入口及两种包查找顺序的独立消费；双向新旧进程组合通过 channel、queue+wait 和 Pool 描述符链。公共 qualified `PayloadCodec` 特化、15 组新旧工具入口及默认子进程路径同步验证。
 
 ### 2026-10-13 跨进程 benchmark
 
-自研工具通过真实 `fork/exec` 执行。采集源码为 `ec96119`；环境为 **VMware 8 vCPU、Ubuntu 22.04.5、Linux 6.8、GCC 11.4、CMake 3.22.1（`VM_ONLY`）**，Release `-O3 -DNDEBUG`，sanitizer/failpoint 均为 OFF。MPMC/Pool 使用 CPU 0–7 的默认亲和性；SPSC 对照固定 CPU 0 或 CPU 0/1。采集早期的同机 ROS2 构建活动随环境日志记录。
+以下为 **2026-10-13 Linux虚拟机实测**，自研工具通过真实 `fork/exec` 执行，历史采集版本为改名前的 `ec96119`。环境为 **VMware 8 vCPU、Ubuntu 22.04.5、Linux 6.8、GCC 11.4、CMake 3.22.1（`VM_ONLY`）**，Release `-O3 -DNDEBUG`，sanitizer/failpoint 均为 OFF。MPMC/Pool 使用 CPU 0–7 的默认亲和性；SPSC 对照固定 CPU 0 或 CPU 0/1。采集早期的同机 ROS2 构建活动随环境日志记录。
 
 主配置各执行 3 轮，表格为 **median [min–max]**。吞吐使用父进程从启动 worker 到回收、读取并聚合报告的窗口，包含进程生命周期开销；CSV 输出、资源清理及分位数排序在该窗口之后执行。p50/p95/p99 使用 nearest-rank。MPMC/Pool 统计全部交付样本，SPSC/Socket 统计预热后的样本。
 
@@ -100,7 +112,7 @@ target_link_libraries(app PRIVATE EdgeRuntime::edge_runtime)
 
 ### 复现入口
 
-`run_formal_bench.py` 串行执行有限矩阵，保留 source/flags/binary SHA、命令、退出码、raw worker report、CPU 及 CSV；`verify_formal_bench.py` 独立核对完整矩阵、配置、交付身份、计数和分位数。每次采集使用新目录，单次 watchdog 为120s；快速 smoke 矩阵另见 [scripts/](scripts/)。
+`run_formal_bench.py` 串行执行有限矩阵，保留 source/flags/binary SHA、命令、退出码、raw worker report、CPU 及 CSV；`verify_formal_bench.py` 按独立规范核对所选 section 的配置集合、重复次数、交付身份、计数和分位数。`--require-suite` 要求四个 section 各一阶段，`--metadata-only` 仅验配置覆盖。新工具和受支持的旧归档格式均可验证。每次采集使用新目录，单次 watchdog 为120s；快速 smoke 矩阵另见 [scripts/](scripts/)。
 
 ```bash
 cmake --preset release && cmake --build --preset release
@@ -113,13 +125,13 @@ done
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/run_formal_bench.py \
   --section sustained --messages 1600000 --output-root "$OUT"
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify_formal_bench.py \
-  --input-root "$OUT" --output "$OUT/verified.json"
+  --require-suite --input-root "$OUT" --output "$OUT/verified.json"
 ```
 
 ## 目录结构
 
-- `include/edge_runtime/{common,channel,queue,buffer,process}/`：按功能划分的公共接口。
-- `src/edge_runtime/`：对应功能的实现与私有头，统一由 `src/CMakeLists.txt` 构建。
+- `include/self_ipcs/{common,channel,queue,buffer,process}/`：按功能划分的公共入口；`include/edge_runtime/` 保留兼容声明。
+- `src/edge_runtime/`：共用的实现与私有头，保留链接符号和协议标识，统一由 `src/CMakeLists.txt` 构建。
 - `tools/{include,src}/`：诊断、benchmark 和崩溃矩阵工具。
 - `test/`：单元测试与跨进程集成测试。
 - `examples/`：独立安装包消费示例。

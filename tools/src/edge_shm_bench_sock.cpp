@@ -285,13 +285,14 @@ int dispatch_sock_payload(const Args& a) {
 int main(int argc, char** argv) {
 	const char* role = edge_tool::arg_value(argc, argv, "--role");
 	const char* path = edge_tool::arg_value(argc, argv, "--sock-path");
-	if (role == nullptr || path == nullptr || *path == '\0') {
+	if (edge_tool::arg_flag(argc, argv, "--help") || role == nullptr || path == nullptr ||
+	    *path == '\0') {
 		std::fprintf(stderr,
-		             "usage: edge_shm_bench_sock --role producer|consumer "
+		             "usage: self_ipcs_shm_bench_sock --role producer|consumer "
 		             "--sock-path <path> --payload <bytes> "
 		             "[--samples N] [--max-time-ms T] [--rate hz] "
 		             "[--idle-ms N] [--open-retry-ms N] [--csv <path>]\n");
-		return 2;
+		return edge_tool::arg_flag(argc, argv, "--help") ? 0 : 2;
 	}
 	Args a;
 	a.role = role;
@@ -308,7 +309,8 @@ int main(int argc, char** argv) {
 	if (a.role == "producer") return dispatch_sock_payload<SockProducerRole>(a);
 	if (a.role == "consumer") {
 		if (a.csv_path.empty()) {
-			std::fprintf(stderr, "edge_shm_bench_sock consumer: --csv is required\n");
+			std::fprintf(stderr,
+			             "self_ipcs_shm_bench_sock consumer: --csv is required\n");
 			return 2;
 		}
 		return dispatch_sock_payload<SockConsumerRole>(a);

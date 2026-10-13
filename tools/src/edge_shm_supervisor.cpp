@@ -62,14 +62,16 @@ void on_event(const edge_runtime::SupervisorEventInfo& info, void*) {
 int main(int argc, char** argv) {
 	const char* name = edge_tool::arg_value(argc, argv, "--name");
 	const char* producer_argv_str = edge_tool::arg_value(argc, argv, "--producer-argv");
-	if (name == nullptr || producer_argv_str == nullptr) {
+	if (edge_tool::arg_flag(argc, argv, "--help") || name == nullptr ||
+	    producer_argv_str == nullptr) {
 		std::fprintf(stderr,
-		             "usage: edge_shm_supervisor --name <name> --producer-argv \"bin --args\" "
+		             "usage: self_ipcs_shm_supervisor --name <name> "
+		             "--producer-argv \"bin --args\" "
 		             "[--transport fd|posix] [--initial-delay-ms N] [--max-delay-ms N] "
 		             "[--multiplier N] [--max-restarts N] [--stable-reset-ms N] "
 		             "[--stall-grace-ms N] [--watch-interval-ms N] [--create-timeout-ms N] "
 		             "[--child-env K=V]... [--forward-stdout 0|1]\n");
-		return 2;
+		return edge_tool::arg_flag(argc, argv, "--help") ? 0 : 2;
 	}
 
 	edge_runtime::SupervisorOptions opts;

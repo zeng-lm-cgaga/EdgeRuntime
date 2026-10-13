@@ -28,6 +28,7 @@
 #include "edge_runtime/channel/slot_protocol.hpp"
 #include "edge_runtime/common/error.hpp"
 #include "edge_runtime/channel/producer.hpp"
+#include "edge_runtime_tool/tool_common.hpp"
 #include "test_payload.hpp"
 
 namespace {
@@ -1305,7 +1306,7 @@ bool arg_has(int argc, char** argv, const char* flag) {
 
 int main(int argc, char** argv) {
 	if (arg_has(argc, argv, "--list")) {
-		std::printf("edge_crash_matrix case table:\n");
+		std::printf("self_ipcs_crash_matrix case table:\n");
 		for (const CaseDef& c : kCases) {
 			std::printf("  %-4s  %s\n", c.id, c.desc);
 		}
@@ -1315,21 +1316,30 @@ int main(int argc, char** argv) {
 		return 0;
 	}
 
-	const char* prod = arg_value(argc, argv, "--producer");
-	const char* cons = arg_value(argc, argv, "--consumer");
-	const char* ctl = arg_value(argc, argv, "--ctl");
-	const char* supervisor = arg_value(argc, argv, "--supervisor");
+	const std::string prod = arg_value(argc, argv, "--producer") != nullptr
+	                                 ? arg_value(argc, argv, "--producer")
+	                                 : edge_tool::sibling_executable("self_ipcs_shm_producer");
+	const std::string cons = arg_value(argc, argv, "--consumer") != nullptr
+	                                 ? arg_value(argc, argv, "--consumer")
+	                                 : edge_tool::sibling_executable("self_ipcs_shm_consumer");
+	const std::string ctl = arg_value(argc, argv, "--ctl") != nullptr
+	                                ? arg_value(argc, argv, "--ctl")
+	                                : edge_tool::sibling_executable("self_ipcs_shm_ctl");
+	const std::string supervisor =
+	        arg_value(argc, argv, "--supervisor") != nullptr
+	                ? arg_value(argc, argv, "--supervisor")
+	                : edge_tool::sibling_executable("self_ipcs_shm_supervisor");
 	const char* out_dir = arg_value(argc, argv, "--out-dir");
 	const char* seed = arg_value(argc, argv, "--seed");
 	const bool smoke = arg_has(argc, argv, "--smoke");
 	const char* only = arg_value(argc, argv, "--only");
 
-	if (prod == nullptr || cons == nullptr || ctl == nullptr) {
+	if (arg_has(argc, argv, "--help") || prod.empty() || cons.empty() || ctl.empty()) {
 		std::fprintf(stderr,
-		             "usage: edge_crash_matrix --producer <bin> --consumer <bin> "
-		             "--ctl <bin> [--supervisor <bin>] [--smoke] [--only C01,C03] "
+		             "usage: self_ipcs_crash_matrix [--producer <bin>] [--consumer <bin>] "
+		             "[--ctl <bin>] [--supervisor <bin>] [--smoke] [--only C01,C03] "
 		             "[--seed N] [--out-dir P]\n");
-		return 2;
+		return arg_has(argc, argv, "--help") ? 0 : 2;
 	}
 
 	std::vector<const CaseDef*> selected;
@@ -1384,10 +1394,10 @@ int main(int argc, char** argv) {
 	d.prod_bin = prod;
 	d.cons_bin = cons;
 	d.ctl_bin = ctl;
-	d.supervisor_bin = supervisor != nullptr ? supervisor : "";
+	d.supervisor_bin = supervisor;
 	d.run_dir = run_dir;
 
-	std::printf("edge_crash_matrix run=%s cases=%zu\n", run_id, selected.size());
+	std::printf("self_ipcs_crash_matrix run=%s cases=%zu\n", run_id, selected.size());
 	std::fflush(stdout);
 	for (const CaseDef* c : selected) {
 		const bool ok = c->fn(d);

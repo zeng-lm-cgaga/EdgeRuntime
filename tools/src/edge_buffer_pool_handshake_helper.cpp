@@ -645,6 +645,15 @@ int run_parent(int argc, char** argv, const std::string& executable) {
 }  // namespace
 
 int main(int argc, char** argv) {
+	for (int index = 1; index < argc; ++index) {
+		if (std::strcmp(argv[index], "--help") == 0) {
+			std::printf("self_ipcs_buffer_pool_handshake_helper "
+			            "--block-size 4096|16384 "
+			            "--block-count N --producers N --consumers N --messages N "
+			            "--capacity N [--delay-us N] [--timeout-ms N]\n");
+			return 0;
+		}
+	}
 	const char* role = value_of(argc, argv, "--role");
 	if (role != nullptr) {
 		if (std::strcmp(role, "producer") == 0) return run_child(argc, argv, 'P');

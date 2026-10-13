@@ -1,37 +1,78 @@
 # 工具用于运行诊断、故障恢复和跨进程性能采集，不属于公共 API。
-add_executable(edge_runtime_platform_probe src/platform_probe.cpp)
-edgeruntime_apply_project_options(edge_runtime_platform_probe)
-target_link_libraries(edge_runtime_platform_probe PRIVATE EdgeRuntime::edge_runtime rt)
-
-function(edgeruntime_tool name)
-  add_executable(${name} src/${name}.cpp)
-  edgeruntime_apply_project_options(${name})
-  target_link_libraries(${name} PRIVATE EdgeRuntime::edge_runtime Threads::Threads rt)
+function(selfipcs_tool name output_name)
+  if(ARGC GREATER 2)
+    set(source ${ARGV2})
+  else()
+    set(source src/${name}.cpp)
+  endif()
+  add_executable(${name} ${source})
+  set_target_properties(${name} PROPERTIES OUTPUT_NAME ${output_name})
+  cmake_language(EVAL CODE "
+    cmake_language(
+      DEFER DIRECTORY \"${CMAKE_SOURCE_DIR}\"
+      CALL add_custom_target ${output_name} DEPENDS ${name})
+  ")
+  selfipcs_apply_project_options(${name})
+  target_link_libraries(${name} PRIVATE SelfIPCs::self_ipcs Threads::Threads rt)
   target_include_directories(
     ${name} PRIVATE
       ${CMAKE_SOURCE_DIR}/test/fixtures
       ${CMAKE_SOURCE_DIR}/src
       ${CMAKE_CURRENT_SOURCE_DIR}/include
       ${CMAKE_CURRENT_SOURCE_DIR})
+
+  add_custom_command(
+    TARGET ${name} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E rm -f $<TARGET_FILE_DIR:${name}>/${name}
+    COMMAND ${CMAKE_COMMAND} -E create_symlink
+            $<TARGET_FILE_NAME:${name}> $<TARGET_FILE_DIR:${name}>/${name}
+    VERBATIM)
+  set_property(
+    TARGET ${name} APPEND PROPERTY ADDITIONAL_CLEAN_FILES
+    $<TARGET_FILE_DIR:${name}>/${name})
+
+  install(TARGETS ${name} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  if(IS_ABSOLUTE "${CMAKE_INSTALL_BINDIR}")
+    set(alias_directory "\$ENV{DESTDIR}${CMAKE_INSTALL_BINDIR}")
+  else()
+    set(alias_directory "\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}")
+  endif()
+  install(CODE "
+    set(_selfipcs_tool_directory \"${alias_directory}\")
+    file(REMOVE \"\${_selfipcs_tool_directory}/${name}\")
+    file(CREATE_LINK \"${output_name}\" \"\${_selfipcs_tool_directory}/${name}\" SYMBOLIC)
+  ")
+
+  if(BUILD_TESTING)
+    add_test(NAME ${output_name}_help COMMAND ${name} --help)
+    add_test(
+      NAME ${output_name}_legacy_help
+      COMMAND $<TARGET_FILE_DIR:${name}>/${name} --help)
+    set_tests_properties(
+      ${output_name}_help ${output_name}_legacy_help
+      PROPERTIES TIMEOUT 10 LABELS cli WORKING_DIRECTORY /
+      PASS_REGULAR_EXPRESSION "${output_name}")
+  endif()
 endfunction()
 
-edgeruntime_tool(edge_shm_producer)
-edgeruntime_tool(edge_shm_consumer)
+selfipcs_tool(edge_runtime_platform_probe self_ipcs_platform_probe src/platform_probe.cpp)
+selfipcs_tool(edge_shm_producer self_ipcs_shm_producer)
+selfipcs_tool(edge_shm_consumer self_ipcs_shm_consumer)
 
-edgeruntime_tool(edge_shm_ctl)
-edgeruntime_tool(edge_shm_supervisor)
+selfipcs_tool(edge_shm_ctl self_ipcs_shm_ctl)
+selfipcs_tool(edge_shm_supervisor self_ipcs_shm_supervisor)
 
-edgeruntime_tool(edge_crash_matrix)
+selfipcs_tool(edge_crash_matrix self_ipcs_crash_matrix)
 
-edgeruntime_tool(edge_shm_bench)
-edgeruntime_tool(edge_shm_bench_producer)
-edgeruntime_tool(edge_shm_bench_consumer)
-edgeruntime_tool(edge_shm_bench_sock)
-edgeruntime_tool(edge_mpmc_bench)
-edgeruntime_tool(edge_buffer_pool_bench)
-edgeruntime_tool(edge_mpmc_handshake_helper)
-edgeruntime_tool(edge_buffer_pool_handshake_helper)
-edgeruntime_tool(edge_benchmark_watchdog_helper)
+selfipcs_tool(edge_shm_bench self_ipcs_shm_bench)
+selfipcs_tool(edge_shm_bench_producer self_ipcs_shm_bench_producer)
+selfipcs_tool(edge_shm_bench_consumer self_ipcs_shm_bench_consumer)
+selfipcs_tool(edge_shm_bench_sock self_ipcs_shm_bench_sock)
+selfipcs_tool(edge_mpmc_bench self_ipcs_mpmc_bench)
+selfipcs_tool(edge_buffer_pool_bench self_ipcs_buffer_pool_bench)
+selfipcs_tool(edge_mpmc_handshake_helper self_ipcs_mpmc_handshake_helper)
+selfipcs_tool(edge_buffer_pool_handshake_helper self_ipcs_buffer_pool_handshake_helper)
+selfipcs_tool(edge_benchmark_watchdog_helper self_ipcs_benchmark_watchdog_helper)
 
 if(BUILD_TESTING)
   find_package(Python3 QUIET COMPONENTS Interpreter)
@@ -40,12 +81,52 @@ if(BUILD_TESTING)
   set_tests_properties(platform_contract PROPERTIES TIMEOUT 10)
 
   add_test(
+    NAME self_ipcs_cli_canonical_parent_legacy_child
+    COMMAND ${CMAKE_COMMAND} -DSUPERVISOR=$<TARGET_FILE:edge_shm_supervisor>
+            -DPRODUCER=$<TARGET_FILE_DIR:edge_shm_producer>/edge_shm_producer
+            -P ${CMAKE_SOURCE_DIR}/test/integration/cli_alias_test.cmake)
+  add_test(
+    NAME self_ipcs_cli_legacy_parent_canonical_child
+    COMMAND ${CMAKE_COMMAND}
+            -DSUPERVISOR=$<TARGET_FILE_DIR:edge_shm_supervisor>/edge_shm_supervisor
+            -DPRODUCER=$<TARGET_FILE:edge_shm_producer>
+            -P ${CMAKE_SOURCE_DIR}/test/integration/cli_alias_test.cmake)
+  set_tests_properties(
+    self_ipcs_cli_canonical_parent_legacy_child self_ipcs_cli_legacy_parent_canonical_child
+    PROPERTIES TIMEOUT 15 LABELS cli WORKING_DIRECTORY /
+    PASS_REGULAR_EXPRESSION "HELP_CHILD_EXECUTED")
+
+  add_test(
+    NAME self_ipcs_cli_legacy_default_children
+    COMMAND $<TARGET_FILE_DIR:edge_crash_matrix>/edge_crash_matrix --only C17
+            --out-dir ${CMAKE_BINARY_DIR}/metadata/tools/cli-compat/default-children)
+  set_tests_properties(
+    self_ipcs_cli_legacy_default_children PROPERTIES TIMEOUT 30 LABELS cli
+    WORKING_DIRECTORY / PASS_REGULAR_EXPRESSION "CASE C17 PASS")
+
+  add_test(
+    NAME self_ipcs_cli_legacy_mpmc_forkexec
+    COMMAND $<TARGET_FILE_DIR:edge_mpmc_bench>/edge_mpmc_bench
+            --payload-size 64 --producers 2 --consumers 2 --messages 8 --capacity 4
+            --timeout-ms 10000 --out-dir ${CMAKE_BINARY_DIR}/metadata/tools/cli-compat/mpmc)
+  add_test(
+    NAME self_ipcs_cli_legacy_buffer_pool_forkexec
+    COMMAND $<TARGET_FILE_DIR:edge_buffer_pool_bench>/edge_buffer_pool_bench
+            --block-size 4096 --block-count 2 --producers 2 --consumers 2 --messages 8
+            --capacity 4 --timeout-ms 10000
+            --out-dir ${CMAKE_BINARY_DIR}/metadata/tools/cli-compat/buffer-pool)
+  set_tests_properties(
+    self_ipcs_cli_legacy_mpmc_forkexec self_ipcs_cli_legacy_buffer_pool_forkexec
+    PROPERTIES TIMEOUT 30 LABELS cli WORKING_DIRECTORY /
+    PASS_REGULAR_EXPRESSION "correctness=PASS")
+
+  add_test(
     NAME crash_matrix_smoke
     COMMAND edge_crash_matrix --smoke
             --producer $<TARGET_FILE:edge_shm_producer>
             --consumer $<TARGET_FILE:edge_shm_consumer>
             --ctl $<TARGET_FILE:edge_shm_ctl>
-            --out-dir ${CMAKE_BINARY_DIR}/evidence/crash)
+            --out-dir ${CMAKE_BINARY_DIR}/metadata/tools/crash)
   set_tests_properties(crash_matrix_smoke PROPERTIES TIMEOUT 240 LABELS crash)
 
   add_test(
@@ -54,7 +135,7 @@ if(BUILD_TESTING)
             --producer $<TARGET_FILE:edge_shm_producer>
             --consumer $<TARGET_FILE:edge_shm_consumer>
             --ctl $<TARGET_FILE:edge_shm_ctl>
-            --out-dir ${CMAKE_BINARY_DIR}/evidence/crash)
+            --out-dir ${CMAKE_BINARY_DIR}/metadata/tools/crash)
   set_tests_properties(
     crash_matrix PROPERTIES TIMEOUT 900 LABELS crash DISABLED TRUE)
 
@@ -65,7 +146,7 @@ if(BUILD_TESTING)
             --consumer $<TARGET_FILE:edge_shm_bench_consumer>
             --sock $<TARGET_FILE:edge_shm_bench_sock>
             --ctl $<TARGET_FILE:edge_shm_ctl>
-            --out-dir ${CMAKE_BINARY_DIR}/evidence/performance)
+            --out-dir ${CMAKE_BINARY_DIR}/metadata/tools/performance)
   set_tests_properties(
     bench_smoke PROPERTIES TIMEOUT 300 LABELS benchmark)
 

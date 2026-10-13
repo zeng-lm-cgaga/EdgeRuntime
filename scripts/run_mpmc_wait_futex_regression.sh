@@ -4,27 +4,27 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
+compat_helper="$script_dir/self_ipcs_compat.py"
 cd "$repo_root"
 
 preset="${1:-dev-debug}"
 output_dir="${2:-}"
 if [[ -z "$output_dir" ]]; then
-	output_dir="$(mktemp -d /tmp/edgeruntime-mpmc-wait.XXXXXX)"
+	output_dir="$(mktemp -d /tmp/selfipcs-mpmc-wait.XXXXXX)"
 else
 	mkdir -p "$output_dir"
 fi
 
+build_dir="$(python3 "$compat_helper" build-dir "$repo_root" "$preset")"
+library_target="$(python3 "$compat_helper" target "$build_dir" self_ipcs)"
+child_target="$(python3 "$compat_helper" target "$build_dir" self_ipcs_mpmc_wait_child)"
 cmake --build --preset "$preset" \
-	--target edge_runtime mpmc_wait_test edge_mpmc_wait_child
+	--target "$library_target" mpmc_wait_test "$child_target"
 
-test_binary="$repo_root/build/$preset/test/integration/mpmc_wait_test"
-child_binary="$repo_root/build/$preset/test/integration/edge_mpmc_wait_child"
+test_binary="$(python3 "$compat_helper" binary "$build_dir/test/integration" mpmc_wait_test)"
+child_binary="$(python3 "$compat_helper" binary "$build_dir/test/integration" self_ipcs_mpmc_wait_child)"
 trace_prefix="$output_dir/futex.%p"
 
-if [[ ! -x "$test_binary" || ! -x "$child_binary" ]]; then
-	echo "missing wait test binaries under $repo_root/build/$preset" >&2
-	exit 2
-fi
 if ! command -v strace >/dev/null 2>&1; then
 	echo "strace is required for the external futex evidence check" >&2
 	exit 2

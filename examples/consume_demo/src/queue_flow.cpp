@@ -1,26 +1,26 @@
 #include "consume_demo/queue_flow.hpp"
 
-#include <chrono>
-#include <cstdio>
-#include <string>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <chrono>
+#include <cstdio>
+#include <string>
+
 #include "consume_demo/common.hpp"
-#include "edge_runtime/queue/mpmc_queue.hpp"
 
 namespace consume_demo {
 
 namespace {
 
-using Queue = edge_runtime::MpmcQueue<QueueMessage>;
+using Queue = ipc::MpmcQueue<QueueMessage>;
 
 bool retry_push(Queue* queue, const QueueMessage& message,
-				std::chrono::steady_clock::time_point deadline) {
+                std::chrono::steady_clock::time_point deadline) {
 	for (;;) {
 		auto result = queue->wait_push_until(message, deadline);
 		if (result) return true;
-		if (result.error().code != edge_runtime::ErrorCode::kQueueContention ||
+		if (result.error().code != ipc::ErrorCode::kQueueContention ||
 		    std::chrono::steady_clock::now() >= deadline) {
 			return false;
 		}
@@ -33,7 +33,7 @@ void cleanup(ChildProcess* child, Queue* queue) {
 		const auto removed = queue->remove_if_creator();
 		if (!removed) {
 			std::fprintf(stderr, "queue cleanup failed: %s\n",
-			             edge_runtime::to_string(removed.error().code));
+			             ipc::to_string(removed.error().code));
 		}
 	}
 	close_child(child);
@@ -42,7 +42,7 @@ void cleanup(ChildProcess* child, Queue* queue) {
 }  // namespace
 
 int run_queue_child(const std::string& name, int event_fd, int command_fd) {
-	edge_runtime::MpmcQueueOptions options;
+	ipc::MpmcQueueOptions options;
 	options.name = name;
 	options.capacity = 1;
 	auto opened = Queue::open(options, queue_schema());
@@ -53,15 +53,15 @@ int run_queue_child(const std::string& name, int event_fd, int command_fd) {
 	Queue queue = std::move(opened.value());
 	const auto empty = queue.wait_pop_until(std::chrono::steady_clock::now() +
 	                                        std::chrono::milliseconds(150));
-	if (empty || empty.error().code != edge_runtime::ErrorCode::kTimeout) {
+	if (empty || empty.error().code != ipc::ErrorCode::kTimeout) {
 		(void)write_token(event_fd, 'F');
 		return 3;
 	}
 	if (!write_token(event_fd, 'E') || !read_token(command_fd, 'P', std::chrono::seconds(3))) {
 		return 3;
 	}
-	const auto received = queue.wait_pop_until(std::chrono::steady_clock::now() +
-	                                           std::chrono::seconds(3));
+	const auto received =
+	        queue.wait_pop_until(std::chrono::steady_clock::now() + std::chrono::seconds(3));
 	if (!received || received.value().sequence != 1 || received.value().value != 42) {
 		(void)write_token(event_fd, 'F');
 		return 3;
@@ -72,13 +72,13 @@ int run_queue_child(const std::string& name, int event_fd, int command_fd) {
 
 bool run_queue_flow() {
 	const std::string name = unique_name("er_demo_queue");
-	edge_runtime::MpmcQueueOptions options;
+	ipc::MpmcQueueOptions options;
 	options.name = name;
 	options.capacity = 1;
 	auto created = Queue::create(options, queue_schema());
 	if (!created) {
 		std::fprintf(stderr, "queue create failed: %s\n",
-		             edge_runtime::to_string(created.error().code));
+		             ipc::to_string(created.error().code));
 		return false;
 	}
 	Queue queue = std::move(created.value());
@@ -118,9 +118,10 @@ bool run_queue_flow() {
 		cleanup(&child, &queue);
 		return false;
 	}
-	const auto full_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(180);
+	const auto full_deadline =
+	        std::chrono::steady_clock::now() + std::chrono::milliseconds(180);
 	const auto full = queue.wait_push_until(QueueMessage{2, 84, 0}, full_deadline);
-	if (full || full.error().code != edge_runtime::ErrorCode::kTimeout) {
+	if (full || full.error().code != ipc::ErrorCode::kTimeout) {
 		std::fprintf(stderr, "queue full boundary did not timeout\n");
 		cleanup(&child, &queue);
 		return false;
@@ -135,10 +136,11 @@ bool run_queue_flow() {
 	const auto removed = queue.remove_if_creator();
 	if (!removed) return false;
 	const auto reopened = Queue::open(options, queue_schema());
-	if (reopened || reopened.error().code != edge_runtime::ErrorCode::kNotFound) return false;
-	std::printf("queue: parent_pid=%d child_pid=%d child_exit=0 empty/full deadlines, wait "
-	            "push/pop, cleanup=creator-unlinked\n",
-	            static_cast<int>(::getpid()), child_pid);
+	if (reopened || reopened.error().code != ipc::ErrorCode::kNotFound) return false;
+	std::printf(
+	        "queue: parent_pid=%d child_pid=%d child_exit=0 empty/full deadlines, wait "
+	        "push/pop, cleanup=creator-unlinked\n",
+	        static_cast<int>(::getpid()), child_pid);
 	return true;
 }
 

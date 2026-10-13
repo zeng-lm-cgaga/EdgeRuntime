@@ -1,18 +1,16 @@
 #include "consume_demo/common.hpp"
 
-#include <cerrno>
-#include <chrono>
-#include <cstdio>
-#include <cstring>
 #include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <array>
-
-#include "edge_runtime/common/error.hpp"
-#include "edge_runtime/common/schema.hpp"
+#include <cerrno>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace consume_demo {
 
@@ -27,7 +25,7 @@ bool read_one(int fd, char* token, std::chrono::milliseconds timeout) {
 		const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
 		        deadline - Clock::now());
 		if (remaining.count() <= 0) return false;
-		struct pollfd descriptor{};
+		struct pollfd descriptor {};
 		descriptor.fd = fd;
 		descriptor.events = POLLIN;
 		int rc = 0;
@@ -45,7 +43,7 @@ bool read_one(int fd, char* token, std::chrono::milliseconds timeout) {
 bool wait_for_exit(pid_t pid, int* status, std::chrono::milliseconds timeout) {
 	const auto deadline = Clock::now() + timeout;
 	for (;;) {
-	const pid_t result = ::waitpid(pid, status, WNOHANG);
+		const pid_t result = ::waitpid(pid, status, WNOHANG);
 		if (result == pid) return true;
 		if (result < 0 && errno != EINTR) return false;
 		if (Clock::now() >= deadline) return false;
@@ -128,8 +126,7 @@ void close_child(ChildProcess* child) {
 }
 
 ChildProcess spawn_child(const std::string& mode, const std::vector<std::string>& args,
-						const std::vector<int>& inherited_fds,
-						const std::vector<int>& keep_fds) {
+                         const std::vector<int>& inherited_fds, const std::vector<int>& keep_fds) {
 	ChildProcess child;
 	child.pid = static_cast<int>(::fork());
 	if (child.pid < 0) return child;
@@ -144,7 +141,11 @@ ChildProcess spawn_child(const std::string& mode, const std::vector<std::string>
 			}
 			if (!keep) (void)::close(fd);
 		}
-		const std::string executable = executable_path();
+		const char* configured_executable = std::getenv("SELFIPCS_DEMO_CHILD");
+		const std::string executable =
+		        configured_executable != nullptr && configured_executable[0] != '\0'
+		                ? std::string(configured_executable)
+		                : executable_path();
 		std::vector<std::string> values;
 		values.reserve(args.size() + 2);
 		values.push_back(executable);
@@ -160,24 +161,24 @@ ChildProcess spawn_child(const std::string& mode, const std::vector<std::string>
 	return child;
 }
 
-edge_runtime::SchemaDescriptor point_schema() {
-	edge_runtime::SchemaDescriptor schema;
+ipc::SchemaDescriptor point_schema() {
+	ipc::SchemaDescriptor schema;
 	schema.fingerprint.fill(std::byte{0x31});
 	schema.version = 1;
 	schema.debug_name = "consume_demo.point";
 	return schema;
 }
 
-edge_runtime::SchemaDescriptor queue_schema() {
-	edge_runtime::SchemaDescriptor schema;
+ipc::SchemaDescriptor queue_schema() {
+	ipc::SchemaDescriptor schema;
 	schema.fingerprint.fill(std::byte{0x32});
 	schema.version = 1;
 	schema.debug_name = "consume_demo.queue";
 	return schema;
 }
 
-edge_runtime::SchemaDescriptor buffer_schema() {
-	edge_runtime::SchemaDescriptor schema;
+ipc::SchemaDescriptor buffer_schema() {
+	ipc::SchemaDescriptor schema;
 	schema.fingerprint.fill(std::byte{0x33});
 	schema.version = 1;
 	schema.debug_name = "consume_demo.buffer";

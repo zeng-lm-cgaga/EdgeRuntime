@@ -1076,16 +1076,16 @@ int main(int argc, char** argv) {
 	Config cfg;
 	cfg.producer_bin = edge_tool::arg_value(argc, argv, "--producer") != nullptr
 	                           ? edge_tool::arg_value(argc, argv, "--producer")
-	                           : "";
+	                           : edge_tool::sibling_executable("self_ipcs_shm_bench_producer");
 	cfg.consumer_bin = edge_tool::arg_value(argc, argv, "--consumer") != nullptr
 	                           ? edge_tool::arg_value(argc, argv, "--consumer")
-	                           : "";
+	                           : edge_tool::sibling_executable("self_ipcs_shm_bench_consumer");
 	cfg.sock_bin = edge_tool::arg_value(argc, argv, "--sock") != nullptr
 	                       ? edge_tool::arg_value(argc, argv, "--sock")
-	                       : "";
+	                       : edge_tool::sibling_executable("self_ipcs_shm_bench_sock");
 	cfg.ctl_bin = edge_tool::arg_value(argc, argv, "--ctl") != nullptr
 	                      ? edge_tool::arg_value(argc, argv, "--ctl")
-	                      : "";
+	                      : edge_tool::sibling_executable("self_ipcs_shm_ctl");
 	if (const char* od = edge_tool::arg_value(argc, argv, "--out-dir")) {
 		cfg.out_dir = od;
 	}
@@ -1119,12 +1119,12 @@ int main(int argc, char** argv) {
 		}
 		return 0;
 	}
-	if (!has_helpers) {
+	if (edge_tool::arg_flag(argc, argv, "--help") || !has_helpers) {
 		std::fprintf(stderr,
-		             "usage: edge_shm_bench (--smoke|--evidence|--matrix) "
-		             "--producer <bin> --consumer <bin> --sock <bin> "
+		             "usage: self_ipcs_shm_bench (--smoke|--evidence|--matrix) "
+		             "[--producer <bin>] [--consumer <bin>] [--sock <bin>] "
 		             "[--ctl <bin>] [--out-dir <dir>] [--only <id,...>]\n");
-		return 2;
+		return edge_tool::arg_flag(argc, argv, "--help") ? 0 : 2;
 	}
 
 	const std::vector<std::string> git = {"git", "-C", cfg.git_dir, "rev-parse", "HEAD"};
@@ -1184,7 +1184,8 @@ int main(int argc, char** argv) {
 	}
 	if (runs.empty()) {
 		std::fprintf(stderr,
-		             "edge_shm_bench: no runs selected (--smoke/--evidence/--matrix)\n");
+		             "self_ipcs_shm_bench: no runs selected "
+		             "(--smoke/--evidence/--matrix)\n");
 		return 2;
 	}
 
