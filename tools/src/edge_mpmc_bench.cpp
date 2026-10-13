@@ -151,6 +151,7 @@ struct Config {
 	uint64_t test_consumer_hold_ms = 0;
 	uint64_t test_consumer_delay_us = 0;
 	bool test_ignore_term_consumer = false;
+	bool keep_worker_reports = false;
 	RetryPolicy retry_policy = RetryPolicy::kYield;
 	WaitPolicy wait_policy = WaitPolicy::kBusy;
 	std::string out_dir;
@@ -291,8 +292,8 @@ std::string make_queue_name(uint32_t run_index) {
 	       std::to_string(static_cast<unsigned long long>(monotonic_ns()));
 }
 
-std::string make_report_path(uint32_t run_index, uint32_t child_index) {
-	return "/tmp/er_mpmc_bench_" +
+std::string make_report_path(const Config& config, uint32_t run_index, uint32_t child_index) {
+	return (config.keep_worker_reports ? config.out_dir : "/tmp") + "/er_mpmc_bench_" +
 	       std::to_string(static_cast<unsigned long>(::getpid())) + "_" +
 	       std::to_string(run_index) + "_" + std::to_string(child_index) + ".report";
 }
@@ -872,6 +873,7 @@ void print_summary(uint32_t run_index, size_t payload_size, const Config& config
 
 template <size_t kSize>
 int run_parent_once(const std::string& executable, const Config& config, uint32_t run_index) {
+	if (config.keep_worker_reports && !mkdirs(config.out_dir)) return 2;
 	using Queue = edge_runtime::MpmcQueue<edge_mpmc_bench::Payload<kSize>>;
 	const std::string queue_name = make_queue_name(run_index);
 	edge_runtime::MpmcQueueOptions options;
@@ -902,7 +904,7 @@ int run_parent_once(const std::string& executable, const Config& config, uint32_
 	const uint64_t remainder = aggregate.expected % total_consumers;
 	for (uint32_t i = 0; i < config.consumers; ++i) {
 		const uint64_t target = base_target + (static_cast<uint64_t>(i) < remainder ? 1 : 0);
-		const std::string report = make_report_path(run_index, i);
+		const std::string report = make_report_path(config, run_index, i);
 		if (!prepare_report_path(report)) {
 			std::fprintf(stderr, "REPORT_PATH_FAIL run=%" PRIu32 " role=consumer path=%s errno=%d\n",
 			             run_index, report.c_str(), errno);
@@ -931,7 +933,7 @@ int run_parent_once(const std::string& executable, const Config& config, uint32_
 		children.push_back({pid, ChildRole::kConsumer, report, target});
 	}
 	for (uint32_t i = 0; i < config.producers; ++i) {
-		const std::string report = make_report_path(run_index, config.consumers + i);
+		const std::string report = make_report_path(config, run_index, config.consumers + i);
 		if (!prepare_report_path(report)) {
 			std::fprintf(stderr, "REPORT_PATH_FAIL run=%" PRIu32 " role=producer path=%s errno=%d\n",
 			             run_index, report.c_str(), errno);
@@ -983,6 +985,13 @@ int run_parent_once(const std::string& executable, const Config& config, uint32_
 	for (const auto& child : children) {
 		aggregate.user_cpu_us += rusage_user_us(child.usage);
 		aggregate.system_cpu_us += rusage_system_us(child.usage);
+		if (config.keep_worker_reports) {
+			std::printf("WORKER run=%" PRIu32 " pid=%ld role=%s status=%d user_cpu_us=%" PRIu64
+			            " system_cpu_us=%" PRIu64 " report=%s\n",
+			            run_index, static_cast<long>(child.pid), child_role_name(child.role),
+			            child.status, rusage_user_us(child.usage), rusage_system_us(child.usage),
+			            child.report_path.c_str());
+		}
 		if (!child_succeeded(child)) ++aggregate.errors;
 		reports.push_back(read_report(child.report_path, child.role, child.expected_records));
 	}
@@ -1068,7 +1077,9 @@ int run_parent_once(const std::string& executable, const Config& config, uint32_
 			}
 		}
 	}
-	for (const auto& child : children) (void)::unlink(child.report_path.c_str());
+	if (!config.keep_worker_reports) {
+		for (const auto& child : children) (void)::unlink(child.report_path.c_str());
+	}
 	if (!remove_and_verify_queue(&queue.value(), options, run_index,
 	                             g_stop_requested != 0, child_kill_sent)) {
 		std::fprintf(stderr, "REMOVE_FAIL run=%" PRIu32 "\n", run_index);
@@ -1111,6 +1122,11 @@ bool parse_config(int argc, char** argv, Config* config) {
 	if (!parse_wait_policy_args(argc, argv, &config->wait_policy)) return false;
 	const char* out_dir = edge_tool::arg_value(argc, argv, "--out-dir");
 	const char* ready_file = edge_tool::arg_value(argc, argv, "--ready-file");
+	config->keep_worker_reports = edge_tool::arg_flag(argc, argv, "--keep-worker-reports");
+	if (config->keep_worker_reports && (out_dir == nullptr || *out_dir == '\0')) {
+		std::fprintf(stderr, "--keep-worker-reports requires --out-dir\n");
+		return false;
+	}
 	if (producers == 0 || producers > kMaxWorkers || consumers == 0 || consumers > kMaxWorkers ||
 	    messages == 0 || messages > kMaxMessagesPerProducer || capacity == 0 || capacity > 4096 ||
 	    runs == 0 || runs > kMaxRuns || config->timeout_ms == 0 ||
@@ -1139,7 +1155,8 @@ void print_usage(const char* executable) {
 	        "[--messages N] [--capacity N] [--runs N] [--timeout-ms N] "
 	        "[--test-consumer-hold-ms N] [--test-consumer-delay-us N] "
 	        "[--test-ignore-term-consumer] [--retry-policy yield|spin] "
-	        "[--wait-policy busy|blocking] [--out-dir DIR] [--ready-file FILE]\n"
+	        "[--wait-policy busy|blocking] [--out-dir DIR] [--keep-worker-reports] "
+	        "[--ready-file FILE]\n"
 	        "       %s --smoke\n",
 	        executable, executable);
 }

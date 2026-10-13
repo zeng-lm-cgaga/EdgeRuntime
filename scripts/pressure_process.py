@@ -115,6 +115,7 @@ def run_logged_process(
     ready_path: Optional[Path] = None,
     ready_roles: Optional[set[str]] = None,
     startup_timeout_s: float = 10.0,
+    capture_affinity: bool = False,
 ) -> ProcessResult:
     """Run argv in its own process group with bounded cleanup and file-backed output.
 
@@ -164,11 +165,23 @@ def run_logged_process(
             while process.poll() is None:
                 children = child_snapshot(process.pid)
                 observed.update(children)
+                affinity_samples = []
+                if capture_affinity:
+                    for child in children:
+                        try:
+                            affinity_samples.append({
+                                "pid": child,
+                                "argv": Path(f"/proc/{child}/cmdline").read_bytes().decode().split("\0")[:-1],
+                                "cpus": sorted(os.sched_getaffinity(child)),
+                            })
+                        except (ProcessLookupError, FileNotFoundError):
+                            continue
                 samples.write(json.dumps({
                     "epoch_ns": time.time_ns(),
                     "parent_pid": process.pid,
                     "process_group": pgid,
                     "children": children,
+                    "affinities": affinity_samples,
                     "ready": _ready_roles(ready_path, ready_roles)
                     if ready_path is not None and ready_roles else None,
                 }) + "\n")

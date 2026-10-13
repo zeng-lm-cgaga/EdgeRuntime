@@ -446,6 +446,16 @@ void write_command(const RunSpec& spec, const std::string& dir,
 
 void write_process_status(const Config&, const std::string& dir, const ChildResult& prod,
                           const ChildResult& cons) {
+	const std::vector<std::string> roles = {"producer", "consumer"};
+	const std::vector<const ChildResult*> children = {&prod, &cons};
+	for (size_t index = 0; index < roles.size(); ++index) {
+		FILE* output = std::fopen((dir + "/" + roles[index] + ".raw").c_str(), "w");
+		if (output != nullptr) {
+			const auto& child = *children[index];
+			std::fwrite(child.out.data(), 1, child.out.size(), output);
+			std::fclose(output);
+		}
+	}
 	std::string s;
 	s += "producer (wait4 rusage):\n";
 	s += "  cpu_us=" + std::to_string(rusage_cpu_us(prod.ru)) +
@@ -968,6 +978,10 @@ std::vector<RunSpec> evidence_specs() {
 	                1000, 15000, 100, true),
 	        spec_of("socket-64B-same-100-controlled", "socket", "block", 64, "same", "100", 100,
 	                1000, 15000, 100, true),
+	        spec_of("shm-futex-64B-different-100-controlled", "shm", "futex", 64, "different",
+	                "100", 100, 1000, 15000, 100, true),
+	        spec_of("socket-64B-different-100-controlled", "socket", "block", 64, "different",
+	                "100", 100, 1000, 15000, 100, true),
 	};
 }
 
