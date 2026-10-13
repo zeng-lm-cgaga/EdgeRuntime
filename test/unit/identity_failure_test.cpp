@@ -32,6 +32,7 @@ int stat_descriptor = -1;
 int boot_descriptor = -1;
 int read_error = EIO;
 bool malformed_boot = false;
+bool truncated_stat = false;
 
 class IdentityFailureTest : public ::testing::Test {
        protected:
@@ -46,6 +47,7 @@ class IdentityFailureTest : public ::testing::Test {
 		boot_descriptor = -1;
 		read_error = EIO;
 		malformed_boot = false;
+		truncated_stat = false;
 	}
 };
 
@@ -89,6 +91,16 @@ TEST_F(IdentityFailureTest, ActualStatReadErrorPropagatesBeforeRegistration) {
 	EXPECT_EQ(identity.error().code, edge_runtime::ErrorCode::kRecoveryBlocked);
 	EXPECT_EQ(identity.error().errno_value, EIO);
 	EXPECT_EQ(fault_hits, 1);
+}
+
+TEST_F(IdentityFailureTest, TruncatedStatStarttimeFailsClosed) {
+	truncated_stat = true;
+	const auto result = edge_runtime::detail::read_current_process_identity();
+	EXPECT_FALSE(result);
+	EXPECT_EQ(fault_hits, 1);
+	if (!result) {
+		EXPECT_EQ(result.error().code, edge_runtime::ErrorCode::kRecoveryBlocked);
+	}
 }
 
 TEST_F(IdentityFailureTest, ActualBootReadErrorInvalidatesHash) {
@@ -350,7 +362,24 @@ extern "C" ssize_t __wrap_read(int descriptor, void* buffer, size_t count) {
 		std::memset(buffer, 'x', 36);
 		return 36;
 	}
-	return __real_read(descriptor, buffer, count);
+	const ssize_t actual = __real_read(descriptor, buffer, count);
+	if (descriptor == stat_descriptor && truncated_stat && actual > 0) {
+		const std::string contents(static_cast<const char*>(buffer),
+		                           static_cast<size_t>(actual));
+		size_t position = contents.rfind(')');
+		if (position != std::string::npos) {
+			position += 2;
+			for (int field = 0; field < 19 && position != std::string::npos; ++field) {
+				const size_t space = contents.find(' ', position);
+				position = space == std::string::npos ? space : space + 1;
+			}
+			if (position != std::string::npos && position + 1 < contents.size()) {
+				++fault_hits;
+				return static_cast<ssize_t>(position + 1);
+			}
+		}
+	}
+	return actual;
 }
 
 extern "C" int __wrap_poll(struct pollfd* descriptors, nfds_t count, int timeout) {

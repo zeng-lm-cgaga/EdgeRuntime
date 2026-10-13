@@ -118,6 +118,8 @@ class CreationFailureTest : public ::testing::TestWithParam<CreationKind> {
 		const auto result = create_and_remove();
 		faults.disarm();
 		assert_injection(faults, false);
+		EXPECT_EQ(faults.evidence().fstat_fault_hits,
+		          fault == CreationFault::kPersistentEintr ? 8u : 1u);
 		ASSERT_FALSE(result) << "creation must not succeed after persistent fstat failures";
 		const auto named = faults.named_object();
 		const auto created = faults.created_object();
@@ -146,7 +148,10 @@ class CreationFailureTest : public ::testing::TestWithParam<CreationKind> {
 		if (GetParam() == CreationKind::kSpsc) {
 			ControlJournalV1 before{};
 			ASSERT_TRUE(read_journal(&before));
-			EXPECT_NE(before.state, static_cast<uint32_t>(JournalState::kIdle));
+			EXPECT_EQ(before.state,
+			          static_cast<uint32_t>(JournalState::kCreatingObject));
+			EXPECT_EQ(before.target_dev, 0u);
+			EXPECT_EQ(before.target_ino, 0u);
 			EXPECT_EQ(before.creator.pid, static_cast<uint64_t>(::getpid()));
 			EXPECT_NE(before.creator.proc_start_ticks, 0u);
 			EXPECT_NE(before.new_nonce_hi | before.new_nonce_lo, 0u);
@@ -229,9 +234,23 @@ TEST_P(CreationFailureTest, SameNameExternalSentinelSurvivesFailedCreation) {
 	EXPECT_EQ(named.ino, sentinel.ino);
 	EXPECT_TRUE(faults.sentinel_contents_match());
 	EXPECT_EQ(created.links, 0u);
+	EXPECT_EQ(result.error().code, ErrorCode::kNameRaceDetected);
+	ControlJournalV1 before{};
+	if (GetParam() == CreationKind::kSpsc) {
+		ASSERT_TRUE(read_journal(&before));
+		EXPECT_EQ(before.state, static_cast<uint32_t>(JournalState::kCreatingObject));
+		EXPECT_EQ(before.target_dev, created.dev);
+		EXPECT_EQ(before.target_ino, created.ino);
+		EXPECT_NE(before.target_ino, sentinel.ino);
+	}
 	const auto retry_with_sentinel = create_and_remove();
 	EXPECT_FALSE(retry_with_sentinel);
 	EXPECT_TRUE(faults.sentinel_contents_match());
+	if (GetParam() == CreationKind::kSpsc) {
+		ControlJournalV1 after{};
+		ASSERT_TRUE(read_journal(&after));
+		EXPECT_EQ(std::memcmp(&before, &after, sizeof(before)), 0);
+	}
 	ASSERT_TRUE(faults.cleanup_fixture_owned());
 	const auto recreated = create_and_remove();
 	if (GetParam() == CreationKind::kSpsc && !recreated &&

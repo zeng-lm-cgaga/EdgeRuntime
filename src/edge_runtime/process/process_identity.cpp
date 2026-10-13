@@ -87,7 +87,7 @@ Result<uint64_t> proc_stat_starttime(int pid) noexcept {
 	errno = 0;
 	const unsigned long long value = std::strtoull(p, &end, 10);
 	if (*p < '0' || *p > '9' || end == p || errno == ERANGE || value == 0 ||
-	    (*end != ' ' && *end != '\n' && *end != '\0')) {
+	    (*end != ' ' && *end != '\n')) {
 		return make_error(ErrorCode::kRecoveryBlocked, "proc_stat_starttime",
 		                  "malformed stat (starttime)");
 	}
