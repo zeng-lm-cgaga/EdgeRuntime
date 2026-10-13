@@ -7,9 +7,9 @@
 #include <cstdint>
 #include <string>
 
-#include "edge_runtime/transport/shm_object.hpp"
 #include "edge_runtime/common/result.hpp"
 #include "edge_runtime/common/schema.hpp"
+#include "edge_runtime/transport/shm_object.hpp"
 
 namespace edge_runtime::detail {
 
@@ -20,6 +20,8 @@ inline constexpr uint32_t kFdBrokerVersion = 1;
 inline constexpr size_t kFdBrokerRequestSize = 64;
 inline constexpr size_t kFdBrokerReplySize = 64;
 inline constexpr uint32_t kFdBrokerFlagReadonly = 1u << 0;
+inline constexpr uint64_t kFdBrokerSingleAttemptTimeoutMs = 20;
+inline constexpr uint64_t kFdBrokerPeerIoTimeoutMs = 100;
 
 enum class FdBrokerStatus : uint32_t {
 	kOk = 0,
@@ -74,14 +76,18 @@ Result<UniqueFd> memfd_create_object(const std::string& channel_name);
 
 Result<UniqueFd> fd_broker_bind(const std::string& socket_path);
 
-void fd_broker_serve_loop(int listen_fd, int shm_fd, std::byte* base,
-                          const uint32_t* channel_hash,
+void fd_broker_serve_loop(int listen_fd, int shm_fd, std::byte* base, const uint32_t* channel_hash,
                           const std::array<std::byte, 32>* schema_fingerprint,
                           std::atomic<bool>* stop) noexcept;
 
 Result<UniqueFd> fd_broker_request_fd(const std::string& socket_path, uint32_t channel_hash,
                                       const SchemaDescriptor& schema, bool readonly,
                                       FdBrokerReplyAbi* reply_out, uint64_t retry_ms) noexcept;
+
+Result<UniqueFd> fd_broker_request_fd_until(const std::string& socket_path, uint32_t channel_hash,
+                                            const SchemaDescriptor& schema, bool readonly,
+                                            FdBrokerReplyAbi* reply_out, uint64_t deadline_ns,
+                                            bool allow_retry) noexcept;
 
 }  // 命名空间 edge_runtime::detail
 

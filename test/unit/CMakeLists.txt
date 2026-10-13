@@ -40,3 +40,21 @@ target_sources(creation_failure_test PRIVATE ../fixtures/creation_faults.cpp)
 target_link_options(creation_failure_test PRIVATE
   "-Wl,--wrap=fstat" "-Wl,--wrap=shm_open" "-Wl,--wrap=statx")
 edgeruntime_unit_test(channel_options_test)
+
+add_executable(broker_observer_peer broker_observer_peer.cpp broker_observer_fixture.cpp
+  broker_observer_syscall_fixture.cpp)
+edgeruntime_apply_project_options(broker_observer_peer)
+target_link_libraries(broker_observer_peer PRIVATE edge_runtime Threads::Threads rt)
+target_include_directories(broker_observer_peer PRIVATE ../fixtures ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(broker_observer_peer PRIVATE
+  BROKER_OBSERVER_PEER="$<TARGET_FILE:broker_observer_peer>")
+target_link_options(broker_observer_peer PRIVATE
+  "LINKER:--wrap=connect,--wrap=send,--wrap=recvmsg,--wrap=sendmsg")
+
+foreach(name IN ITEMS fd_broker_deadline_test channel_observer_ready_test)
+  edgeruntime_unit_test(${name})
+  target_sources(${name} PRIVATE broker_observer_fixture.cpp)
+  target_compile_definitions(${name} PRIVATE
+    BROKER_OBSERVER_PEER="$<TARGET_FILE:broker_observer_peer>")
+  add_dependencies(${name} broker_observer_peer)
+endforeach()
