@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from array import array
+from collections import Counter
 import csv
 import json
 import mmap
@@ -312,7 +313,45 @@ def check_manifest(path: Path, metadata: dict) -> None:
             raise ValueError("CLI configuration mismatch")
 
 
-def check_plans(root: Path) -> list[dict]:
+def specification(section: str, planned: list[dict]) -> list[dict]:
+    expected = []
+    if section == "spsc":
+        for placement in ("same", "different"):
+            expected.extend({"kind": "spsc", "placement": placement, "repeat": repeat}
+                            for repeat in (1, 2, 3))
+    elif section == "mpmc":
+        for payload, producers, consumers in ((64, 1, 1), (64, 4, 4), (64, 16, 16),
+                                               (4096, 4, 4)):
+            for wait in ("busy", "blocking"):
+                expected.extend({"kind": "mpmc", "payload": payload, "producers": producers,
+                                 "consumers": consumers, "messages": 20000, "wait": wait,
+                                 "repeat": repeat} for repeat in (1, 2, 3))
+        expected.extend({"kind": "mpmc", "payload": 64, "producers": producers,
+                         "consumers": consumers, "messages": 20000, "wait": "busy",
+                         "repeat": 1, "supplemental": True}
+                        for producers, consumers in ((1, 4), (4, 1)))
+    elif section == "pool":
+        for payload in (4096, 16384):
+            for workers in (4, 16):
+                expected.extend({"kind": "pool", "payload": payload, "producers": workers,
+                                 "consumers": workers, "messages": 20000, "blocks": 128,
+                                 "capacity": 64, "repeat": repeat} for repeat in (1, 2, 3))
+        expected.append({"kind": "pool", "payload": 4096, "producers": 4, "consumers": 1,
+                         "messages": 2000, "blocks": 4, "capacity": 2, "hold_ms": 200,
+                         "repeat": 1, "supplemental": True})
+    elif section == "sustained":
+        messages = planned[0].get("messages") if len(planned) == 1 else None
+        if type(messages) is not int or not 1 <= messages <= 2000000:
+            raise ValueError("sustained messages must be an integer in 1..2000000 per producer")
+        expected.append({"kind": "mpmc", "payload": 64, "producers": 16, "consumers": 16,
+                         "wait": "busy", "messages": messages, "repeat": 1,
+                         "supplemental": True})
+    else:
+        raise ValueError(f"unsupported formal section: {section}")
+    return expected
+
+
+def check_plans(root: Path, require_suite: bool = False) -> list[dict]:
     planned_paths = sorted(set(root.glob("*/planned.json")) | set(root.glob("planned.json")))
     checks = []
     for path in planned_paths:
@@ -330,18 +369,22 @@ def check_plans(root: Path) -> list[dict]:
         outcomes = path.with_name("outcomes.json")
         if not outcomes.is_file() or len(json.loads(outcomes.read_text())) != len(plan["cases"]):
             errors.append("missing/incomplete final outcomes")
-        counts = {"spsc": 6, "mpmc": 26, "pool": 13, "sustained": 1}
-        if len(plan["cases"]) != counts.get(plan["section"]):
-            errors.append("formal section matrix count mismatch")
-        grouped = {}
-        for case in plan["cases"]:
-            key = json.dumps({name: value for name, value in case.items() if name != "repeat"}, sort_keys=True)
-            grouped.setdefault(key, []).append(case["repeat"])
-        for key, repeats in grouped.items():
-            supplemental = json.loads(key).get("supplemental", False)
-            if sorted(repeats) != ([1] if supplemental else [1, 2, 3]):
-                errors.append("missing/duplicate formal repetition")
-        checks.append({"directory": str(path.parent), "errors": errors})
+        try:
+            expected = specification(plan["section"], plan["cases"])
+            expected_counts = Counter(json.dumps(case, sort_keys=True) for case in expected)
+            observed_counts = Counter(json.dumps(case, sort_keys=True) for case in plan["cases"])
+            if observed_counts != expected_counts:
+                errors.append("formal specification mismatch: "
+                              f"missing={list((expected_counts - observed_counts).elements())}; "
+                              f"unexpected={list((observed_counts - expected_counts).elements())}")
+        except ValueError as error:
+            errors.append(str(error))
+        checks.append({"directory": str(path.parent), "section": plan["section"], "errors": errors})
+    if require_suite:
+        sections = Counter(item["section"] for item in checks)
+        if sections != Counter({name: 1 for name in ("spsc", "mpmc", "pool", "sustained")}):
+            checks.append({"directory": str(root), "section": "suite",
+                           "errors": ["suite requires exactly one spsc, mpmc, pool and sustained phase"]})
     return checks
 
 
@@ -380,6 +423,10 @@ def main() -> int:
     parser.add_argument("--input-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--include-calibration", action="store_true")
+    parser.add_argument("--metadata-only", action="store_true",
+                        help="validate section configurations without reading delivery CSVs")
+    parser.add_argument("--require-suite", action="store_true",
+                        help="require exactly one phase of each of the four formal sections")
     args = parser.parse_args()
     commands = sorted(set(args.input_root.glob("*/case-*/command.json")) |
                       set(args.input_root.glob("case-*/command.json")))
@@ -387,7 +434,13 @@ def main() -> int:
         parser.error("no formal command manifests found")
     rows = []
     excluded = []
-    completeness = check_plans(args.input_root)
+    completeness = check_plans(args.input_root, args.require_suite)
+    if args.metadata_only:
+        with args.output.open("x", encoding="utf-8") as output:
+            json.dump({"coverage_mode": "suite" if args.require_suite else "local_sections",
+                       "metadata_only": True, "completeness": completeness}, output, indent=2)
+            output.write("\n")
+        return 0 if completeness and not any(item["errors"] for item in completeness) else 1
     for path in commands:
         metadata = json.loads(path.read_text())
         case = metadata["case"]
@@ -407,6 +460,7 @@ def main() -> int:
         json.dump({"runs": rows, "groups": aggregate(rows),
                    "excluded_calibration": excluded,
                    "completeness": completeness,
+                   "coverage_mode": "suite" if args.require_suite else "local_sections",
                    "valid": sum(row["valid"] for row in rows),
                    "invalid": sum(not row["valid"] for row in rows)}, output, indent=2, sort_keys=True)
         output.write("\n")

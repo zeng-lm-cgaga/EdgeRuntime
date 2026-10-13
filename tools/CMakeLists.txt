@@ -89,6 +89,13 @@ if(BUILD_TESTING)
 
   if(Python3_Interpreter_FOUND)
     add_test(
+      NAME formal_benchmark_metadata_regression
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test_formal_bench.py)
+    set_tests_properties(
+      formal_benchmark_metadata_regression PROPERTIES TIMEOUT 15 LABELS benchmark
+      ENVIRONMENT PYTHONDONTWRITEBYTECODE=1)
+
+    add_test(
       NAME benchmark_pressure_watchdog_regression
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test_pressure_watchdog.py
               --mpmc-binary $<TARGET_FILE:edge_mpmc_bench>

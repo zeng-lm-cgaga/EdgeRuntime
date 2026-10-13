@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from dataclasses import asdict
 import hashlib
 import json
@@ -22,6 +23,63 @@ OUTPUT_ROOT = Path("/tmp")
 
 
 class FormalBenchTest(unittest.TestCase):
+    def check_matrix(self, section, matrix, require_suite=False):
+        with tempfile.TemporaryDirectory(dir=OUTPUT_ROOT) as directory:
+            root = Path(directory)
+            (root / "planned.json").write_text(json.dumps({"section": section, "cases": matrix}))
+            (root / "outcomes.json").write_text(json.dumps([{} for case in matrix]))
+            for ordinal, case in enumerate(matrix, 1):
+                command = root / f"case-{ordinal:02d}/command.json"
+                command.parent.mkdir()
+                command.write_text(json.dumps({"case": case}))
+            return [error for check in check_plans(root, require_suite) for error in check["errors"]]
+
+    def test_specification_accepts_real_matrix_and_local_sections(self):
+        for section in ("spsc", "mpmc", "pool", "sustained"):
+            with self.subTest(section=section):
+                self.assertEqual(self.check_matrix(section, cases(section, 1600000)), [])
+        for messages in (1, 123, 2000000):
+            self.assertEqual(self.check_matrix("sustained", cases("sustained", messages)), [])
+
+    def test_local_section_cannot_claim_suite(self):
+        self.assertTrue(self.check_matrix("spsc", cases("spsc", 1), require_suite=True))
+        self.assertTrue(self.check_matrix("unknown", cases("mpmc", 1)))
+
+    def test_consistent_8k_replacement_fails(self):
+        matrix = cases("mpmc", 1)
+        for case in matrix:
+            if case["payload"] == 4096:
+                case["payload"] = 8192
+        self.assertTrue(self.check_matrix("mpmc", matrix))
+
+    def test_same_count_replacement_and_missing_supplement_fail(self):
+        for section in ("spsc", "mpmc", "pool"):
+            with self.subTest(section=section):
+                matrix = cases(section, 1)
+                matrix[-1] = copy.deepcopy(matrix[0])
+                self.assertTrue(self.check_matrix(section, matrix))
+        matrix = cases("mpmc", 1)
+        for case in matrix[:3]:
+            case["producers"] = 2
+            case["consumers"] = 2
+        self.assertTrue(self.check_matrix("mpmc", matrix))
+
+    def test_duplicate_and_abnormal_repeat_fail(self):
+        for repeat in (0, 4, True, "1"):
+            matrix = cases("pool", 1)
+            matrix[0]["repeat"] = repeat
+            self.assertTrue(self.check_matrix("pool", matrix))
+        matrix = cases("mpmc", 1)
+        matrix[1] = copy.deepcopy(matrix[0])
+        self.assertTrue(self.check_matrix("mpmc", matrix))
+
+    def test_sustained_bounds_and_configuration_fail(self):
+        for messages in (0, 2000001, True, "123"):
+            self.assertTrue(self.check_matrix("sustained", cases("sustained", messages)))
+        matrix = cases("sustained", 123)
+        matrix[0]["consumers"] = 4
+        self.assertTrue(self.check_matrix("sustained", matrix))
+
     def test_finite_matrix(self):
         self.assertEqual(len(cases("spsc", 1)), 6)
         matrix = cases("mpmc", 1)
