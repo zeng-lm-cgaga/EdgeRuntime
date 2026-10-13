@@ -31,4 +31,4 @@ target_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR})
 
 edgeruntime_apply_project_options(edge_runtime)
-target_link_libraries(edge_runtime PRIVATE rt)
+target_link_libraries(edge_runtime PUBLIC Threads::Threads PRIVATE rt)
