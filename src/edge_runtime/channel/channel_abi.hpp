@@ -5,13 +5,17 @@
 #include <cstdint>
 
 #include "edge_runtime/channel/channel_layout.hpp"
+#include "edge_runtime/channel/channel_options.hpp"
 #include "edge_runtime/channel/control_lock.hpp"
-#include "edge_runtime/process/process_identity.hpp"
-#include "edge_runtime/sync/shared_atomic.hpp"
 #include "edge_runtime/channel/sample.hpp"
 #include "edge_runtime/common/schema.hpp"
+#include "edge_runtime/process/process_identity.hpp"
+#include "edge_runtime/sync/shared_atomic.hpp"
 
 namespace edge_runtime::detail {
+
+Result<void> validate_channel_option_contract(const ChannelOptions& options,
+                                              const char* operation) noexcept;
 
 // 共享内存中的身份记录采用奇偶 role_epoch，读者遇到写入中的奇数值时必须重试。
 inline constexpr int kIdentitySnapshotRetries = 8;

@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 
 #include <cerrno>
 #include <cstdint>
@@ -11,6 +12,16 @@ namespace edge_runtime::detail {
 
 namespace {
 constexpr mode_t kExpectedShmMode = S_IRUSR | S_IWUSR;
+constexpr int kMaxInterruptedAttempts = 8;
+
+int bounded_fstat(int fd, struct stat* status) noexcept {
+	int result = -1;
+	for (int attempt = 0; attempt < kMaxInterruptedAttempts; ++attempt) {
+		result = ::fstat(fd, status);
+		if (result == 0 || errno != EINTR) break;
+	}
+	return result;
+}
 }
 
 // 创建后先保持空对象，调用方完成截断、写头和 READY 提交后才对消费者可见。
@@ -73,7 +84,7 @@ Result<MappedRegion> mmap_region_readonly(const UniqueFd& fd, uint64_t size) {
 Result<void> shm_fstat_and_capture(const UniqueFd& fd, uint64_t* dev, uint64_t* ino,
                                    uint64_t* size) {
 	struct stat st {};
-	if (::fstat(fd.get(), &st) != 0) {
+	if (bounded_fstat(fd.get(), &st) != 0) {
 		const int e = errno;
 		return make_errno_error(e, "shm_fstat_and_capture", std::strerror(e));
 	}
@@ -95,10 +106,35 @@ Result<void> shm_fstat_and_capture(const UniqueFd& fd, uint64_t* dev, uint64_t* 
 	return Result<void>::ok();
 }
 
+Result<void> shm_capture_created_identity(const UniqueFd& fd, uint64_t* dev, uint64_t* ino) {
+	struct statx status {};
+	int result = -1;
+	for (int attempt = 0; attempt < kMaxInterruptedAttempts; ++attempt) {
+		result = ::statx(fd.get(), "", AT_EMPTY_PATH | AT_STATX_SYNC_AS_STAT,
+		                 STATX_BASIC_STATS, &status);
+		if (result == 0 || errno != EINTR) break;
+	}
+	if (result != 0) {
+		return make_errno_error(ErrorCode::kRecoveryBlocked, errno,
+		                        "shm_capture_created_identity",
+		                        "created object retained; identity unavailable");
+	}
+	constexpr unsigned int kRequired = STATX_TYPE | STATX_MODE | STATX_UID | STATX_INO;
+	if ((status.stx_mask & kRequired) != kRequired || !S_ISREG(status.stx_mode) ||
+	    status.stx_uid != geteuid() || (status.stx_mode & 0777) != kExpectedShmMode ||
+	    status.stx_ino == 0) {
+		return make_error(ErrorCode::kRecoveryBlocked, "shm_capture_created_identity",
+		                  "created object retained; invalid identity");
+	}
+	*dev = static_cast<uint64_t>(makedev(status.stx_dev_major, status.stx_dev_minor));
+	*ino = status.stx_ino;
+	return Result<void>::ok();
+}
+
 Result<void> memfd_fstat_and_capture(const UniqueFd& fd, uint64_t* dev, uint64_t* ino,
                                      uint64_t* size) {
 	struct stat st {};
-	if (::fstat(fd.get(), &st) != 0) {
+	if (bounded_fstat(fd.get(), &st) != 0) {
 		const int e = errno;
 		return make_errno_error(e, "memfd_fstat_and_capture", std::strerror(e));
 	}
@@ -131,7 +167,10 @@ Result<void> shm_unlink_checked(const std::string& posix_name, uint64_t expected
 	uint64_t ino = 0;
 	uint64_t size = 0;
 	auto fst = shm_fstat_and_capture(re.value(), &dev, &ino, &size);
-	if (!fst) return fst.error();
+	if (!fst) {
+		auto captured = shm_capture_created_identity(re.value(), &dev, &ino);
+		if (!captured) return captured.error();
+	}
 	if (dev != expected_dev || ino != expected_ino) {
 		return make_error(ErrorCode::kNameRaceDetected, "shm_unlink_checked",
 		                  "inode changed before unlink");

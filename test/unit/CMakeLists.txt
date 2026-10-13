@@ -32,3 +32,11 @@ edgeruntime_unit_test(supervisor_policy_test)     # 重启上限、退避和参�
 edgeruntime_unit_test(mpmc_layout_test)           # MPMC 共享内存 ABI 和映射边界
 edgeruntime_unit_test(shared_buffer_pool_test)    # 固定块池 ABI、状态和 handle 校验
 edgeruntime_unit_test(owner_snapshot_test)        # MPMC/Pool 共享 owner tuple 与 epoch 边界
+edgeruntime_unit_test(identity_failure_test)
+target_link_options(identity_failure_test PRIVATE
+  "-Wl,--wrap=open" "-Wl,--wrap=poll" "-Wl,--wrap=read")
+edgeruntime_unit_test(creation_failure_test)
+target_sources(creation_failure_test PRIVATE ../fixtures/creation_faults.cpp)
+target_link_options(creation_failure_test PRIVATE
+  "-Wl,--wrap=fstat" "-Wl,--wrap=shm_open" "-Wl,--wrap=statx")
+edgeruntime_unit_test(channel_options_test)

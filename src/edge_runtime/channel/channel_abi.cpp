@@ -15,6 +15,19 @@ inline constexpr size_t kBootstrapMagicLen = sizeof(kBootstrapMagic) - 1;
 inline constexpr size_t kHeaderMagicLen = sizeof(kChannelHeaderMagic) - 1;
 }
 
+Result<void> validate_channel_option_contract(const ChannelOptions& options,
+                                              const char* operation) noexcept {
+	if (!options.enable_payload_checksum) {
+		return make_error(ErrorCode::kInvalidOptions, operation,
+		                  "payload checksum is mandatory");
+	}
+	if (options.stale_timeout != std::chrono::milliseconds(100)) {
+		return make_error(ErrorCode::kInvalidOptions, operation,
+		                  "stale_timeout is deprecated; retain 100ms");
+	}
+	return Result<void>::ok();
+}
+
 // 读取身份时必须前后两次观察相同的偶数 epoch，否则只能报告恢复阻塞。
 Result<ProcessIdentityAbi> identity_snapshot_read(ProcessIdentityAbi* abi) noexcept {
 	for (int attempt = 0; attempt < kIdentitySnapshotRetries; ++attempt) {

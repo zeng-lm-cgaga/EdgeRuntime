@@ -44,16 +44,20 @@ TEST(ProcessIdentity, ReapedChildIsExited) {
 	int status = 0;
 	::waitpid(child, &status, 0);
 
-	EXPECT_EQ(probe_liveness(static_cast<uint64_t>(child), 0), Liveness::kExited);
+	EXPECT_EQ(probe_liveness(static_cast<uint64_t>(child), 1), Liveness::kExited);
 }
 
-TEST(ProcessIdentity, ImplausiblePidIsExited) {
-	EXPECT_EQ(probe_liveness(UINT64_MAX, 0), Liveness::kExited);
+TEST(ProcessIdentity, ImplausiblePidIsUnverifiable) {
+	EXPECT_EQ(probe_liveness(UINT64_MAX, 1), Liveness::kUnverifiable);
 }
 
 TEST(ProcessIdentity, StaleStarttimeIsPidReuse) {
-
-	EXPECT_EQ(probe_liveness(1, 0), Liveness::kPidReused);
+	const auto identity = current_process_identity();
+	EXPECT_EQ(probe_liveness(identity.pid, identity.proc_start_ticks + 1),
+	          Liveness::kPidReused);
 }
 
+TEST(ProcessIdentity, ZeroStarttimeIsUnverifiable) {
+	EXPECT_EQ(probe_liveness(static_cast<uint64_t>(getpid()), 0), Liveness::kUnverifiable);
+}
 }

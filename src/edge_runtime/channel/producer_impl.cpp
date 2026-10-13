@@ -33,13 +33,18 @@ struct JournalGuard {
 
 struct CreatedObjectGuard {
 	std::string name;
+	JournalGuard* journal_guard = nullptr;
 	bool armed = false;
 	uint64_t dev = 0;
 	uint64_t ino = 0;
 
 	~CreatedObjectGuard() {
 		if (armed) {
-			(void)shm_unlink_checked(name, dev, ino);
+			auto removed = shm_unlink_checked(name, dev, ino);
+			if (!removed && removed.error().code != ErrorCode::kNotFound &&
+			    journal_guard != nullptr) {
+				journal_guard->armed = false;
+			}
 		}
 	}
 };
@@ -147,6 +152,12 @@ Result<ControlJournalV1> reconcile_stale_journal(ControlLock& lock, const Contro
                                                  const std::string& shm_name) {
 	const auto state = static_cast<JournalState>(journal.state);
 	if (state == JournalState::kIdle) return journal;
+	if (!process_identity_valid({journal.creator.pid, journal.creator.proc_start_ticks,
+	                             journal.creator.boot_id_hash_hi,
+	                             journal.creator.boot_id_hash_lo})) {
+		return make_error(ErrorCode::kRecoveryBlocked, "Producer::create",
+		                  "invalid prior creator");
+	}
 
 	const Liveness creator_liv =
 	        probe_liveness(journal.creator.pid, journal.creator.proc_start_ticks);
@@ -270,11 +281,16 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 		return make_error(ErrorCode::kInvalidOptions, "Producer::create",
 		                  "name/schema/payload invalid");
 	}
+	auto contract = validate_channel_option_contract(options, "Producer::create");
+	if (!contract) return contract.error();
 	if (options.transport != Transport::kPosixShm &&
 	    options.transport != Transport::kMemfdFdPass) {
 		return make_error(ErrorCode::kInvalidOptions, "Producer::create",
 		                  "unknown transport");
 	}
+	auto identity = read_current_process_identity();
+	if (!identity) return identity.error();
+	const ProcessIdentity self = identity.value();
 	const bool fd_mode = options.transport == Transport::kMemfdFdPass;
 	const std::string shm_name = channel_shm_name(options.name);
 	const std::string lock_path = channel_lock_path(options.name);
@@ -291,6 +307,10 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 	if (journal.channel_hash != 0 && journal.channel_hash != name_hash) {
 		return make_error(ErrorCode::kRecoveryBlocked, "Producer::create",
 		                  "journal channel mismatch");
+	}
+	if (journal.version == 0) {
+		journal = make_control_journal(options.name, JournalState::kIdle, 0, 0, 0, 0, 0, 0,
+		                               {});
 	}
 	if (journal.state != static_cast<uint32_t>(JournalState::kIdle)) {
 
@@ -361,6 +381,12 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 		        pstate == static_cast<uint32_t>(EndpointState::kOnline) ||
 		        pstate == static_cast<uint32_t>(EndpointState::kStopping) ||
 		        pstate == static_cast<uint32_t>(EndpointState::kFault);
+		if (actively_owned &&
+		    !process_identity_valid({opid.pid, opid.proc_start_ticks, opid.boot_id_hash_hi,
+		                             opid.boot_id_hash_lo})) {
+			return make_error(ErrorCode::kRecoveryBlocked, "Producer::create",
+			                  "invalid old producer");
+		}
 		if (opid.pid != 0) {
 			const Liveness liv = probe_liveness(opid.pid, opid.proc_start_ticks);
 			if (liv == Liveness::kAlive && actively_owned) {
@@ -390,7 +416,6 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 		return existing.error();
 	}
 
-	const ProcessIdentity self = current_process_identity();
 	uint8_t nonce_bytes[16]{};
 	if (!random_bytes(nonce_bytes, sizeof(nonce_bytes))) {
 		const int e = errno;
@@ -417,6 +442,7 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 	uint64_t cdev = 0;
 	uint64_t cino = 0;
 	CreatedObjectGuard created;
+	created.journal_guard = &journal_guard;
 	if (fd_mode) {
 
 		auto mfd = memfd_create_object(options.name);
@@ -438,7 +464,21 @@ Result<std::shared_ptr<ProducerHandle>> producer_create_impl(const ChannelOption
 		EDGE_FAILPOINT(C01);
 		created.name = shm_name;
 		auto cst = shm_fstat_and_capture(fd, &cdev, &cino, nullptr);
-		if (!cst) return cst.error();
+		if (!cst) {
+			journal_guard.armed = false;
+			auto captured = shm_capture_created_identity(fd, &cdev, &cino);
+			j0.state = static_cast<uint32_t>(JournalState::kCreatingObject);
+			j0.target_dev = cdev;
+			j0.target_ino = cino;
+			auto retained = lock.write_journal(j0);
+			if (!retained) return retained.error();
+			if (!captured) return captured.error();
+			auto removed = shm_unlink_checked(shm_name, cdev, cino);
+			if (!removed && removed.error().code != ErrorCode::kNotFound)
+				return removed.error();
+			journal_guard.armed = true;
+			return cst.error();
+		}
 		created.dev = cdev;
 		created.ino = cino;
 		created.armed = true;

@@ -115,7 +115,7 @@ int main(int argc, char** argv) {
 		std::fprintf(stderr,
 		             "usage: edge_shm_bench_producer --name <name> --payload <bytes> "
 		             "[--samples N] [--max-time-ms T] [--rate hz] "
-		             "[--wait-consumer-ms N] [--checksum 0|1]\n");
+		             "[--wait-consumer-ms N] [--checksum 1]\n");
 		return 2;
 	}
 	Args a;
@@ -125,8 +125,7 @@ int main(int argc, char** argv) {
 	a.max_time_ms = edge_tool::arg_u64(argc, argv, "--max-time-ms", 60000);
 	a.rate_hz = edge_tool::arg_u64(argc, argv, "--rate", 0);
 	a.wait_consumer_ms = edge_tool::arg_u64(argc, argv, "--wait-consumer-ms", 0);
-	a.checksum = edge_tool::arg_u64(argc, argv, "--checksum", 1) != 0;
-	if (edge_tool::arg_flag(argc, argv, "--checksum-off")) a.checksum = false;
+	a.checksum = edge_tool::mandatory_payload_checksum(argc, argv);
 
 	const edge_runtime::SchemaDescriptor schema{bench::bench_fingerprint(a.payload), 1,
 	                                            "BenchPayloadV1"};

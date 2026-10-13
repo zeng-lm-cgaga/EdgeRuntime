@@ -102,6 +102,8 @@ Result<MappedRegion> mmap_region_readonly(const UniqueFd& fd, uint64_t size);
 Result<void> shm_fstat_and_capture(const UniqueFd& fd, uint64_t* dev, uint64_t* ino,
                                    uint64_t* size);
 
+Result<void> shm_capture_created_identity(const UniqueFd& fd, uint64_t* dev, uint64_t* ino);
+
 Result<void> shm_unlink_checked(const std::string& posix_name, uint64_t expected_dev,
                                 uint64_t expected_ino);
 

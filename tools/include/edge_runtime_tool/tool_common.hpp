@@ -104,6 +104,18 @@ inline uint64_t arg_u64(int argc, char** argv, const char* name, uint64_t fallba
 	return static_cast<uint64_t>(parsed);
 }
 
+inline bool mandatory_payload_checksum(int argc, char** argv) {
+	const char* value = arg_value(argc, argv, "--checksum");
+	if (arg_flag(argc, argv, "--checksum-off") ||
+	    (arg_flag(argc, argv, "--checksum") &&
+	     (value == nullptr || std::strcmp(value, "1") != 0))) {
+		std::fprintf(stderr,
+		             "payload checksum is mandatory; only --checksum 1 is supported\n");
+		std::exit(2);
+	}
+	return true;
+}
+
 inline std::array<std::byte, 32> parse_fingerprint_hex(const char* hex) {
 	std::array<std::byte, 32> fp{};
 	if (hex == nullptr || std::strlen(hex) != 64) {

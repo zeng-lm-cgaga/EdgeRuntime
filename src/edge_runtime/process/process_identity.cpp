@@ -14,6 +14,7 @@
 namespace edge_runtime::detail {
 
 namespace {
+constexpr int kMaxInterruptedAttempts = 8;
 
 constexpr uint64_t kFnvOffset = 14695981039346656037ULL;
 constexpr uint64_t kFnvPrime = 1099511628211ULL;
@@ -41,15 +42,20 @@ Result<uint64_t> proc_stat_starttime(int pid) noexcept {
 	}
 
 	char buf[4096];
-	const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+	int fd = -1;
+	for (int attempt = 0; attempt < kMaxInterruptedAttempts; ++attempt) {
+		fd = ::open(path, O_RDONLY | O_CLOEXEC);
+		if (fd >= 0 || errno != EINTR) break;
+	}
 	if (fd < 0) {
 		const int e = errno;
 		return make_errno_error(e, "proc_stat_starttime", std::strerror(e));
 	}
 	ssize_t n = -1;
-	do {
+	for (int attempt = 0; attempt < kMaxInterruptedAttempts; ++attempt) {
 		n = ::read(fd, buf, sizeof(buf) - 1);
-	} while (n < 0 && errno == EINTR);
+		if (n >= 0 || errno != EINTR) break;
+	}
 	const int read_errno = errno;
 	::close(fd);
 	if (n < 0) {
@@ -78,43 +84,96 @@ Result<uint64_t> proc_stat_starttime(int pid) noexcept {
 		++p;
 	}
 	char* end = nullptr;
+	errno = 0;
 	const unsigned long long value = std::strtoull(p, &end, 10);
-	if (end == p) {
+	if (*p < '0' || *p > '9' || end == p || errno == ERANGE || value == 0 ||
+	    (*end != ' ' && *end != '\n' && *end != '\0')) {
 		return make_error(ErrorCode::kRecoveryBlocked, "proc_stat_starttime",
 		                  "malformed stat (starttime)");
 	}
 	return Result<uint64_t>(static_cast<uint64_t>(value));
 }
 
-void current_boot_id_hash(uint64_t* hi, uint64_t* lo) noexcept {
-	const int fd = ::open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
+Result<void> current_boot_id_hash(uint64_t* hi, uint64_t* lo) noexcept {
+	if (hi != nullptr) *hi = 0;
+	if (lo != nullptr) *lo = 0;
+	int fd = -1;
+	for (int attempt = 0; attempt < kMaxInterruptedAttempts; ++attempt) {
+		fd = ::open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
+		if (fd >= 0 || errno != EINTR) break;
+	}
+	if (fd < 0) {
+		return make_errno_error(ErrorCode::kRecoveryBlocked, errno, "current_boot_id_hash",
+		                        "boot identity unreadable");
+	}
 	char buf[64]{};
 	ssize_t n = -1;
-	if (fd >= 0) {
+	for (int attempt = 0; attempt < kMaxInterruptedAttempts; ++attempt) {
 		n = ::read(fd, buf, sizeof(buf) - 1);
-		::close(fd);
+		if (n >= 0 || errno != EINTR) break;
 	}
-	const size_t len = n > 0 ? static_cast<size_t>(n) : 0;
+	const int read_errno = errno;
+	::close(fd);
+	if (n < 0) {
+		return make_errno_error(ErrorCode::kRecoveryBlocked, read_errno,
+		                        "current_boot_id_hash", "boot identity unreadable");
+	}
+	if (n != 36 && (n != 37 || buf[36] != '\n')) {
+		return make_error(ErrorCode::kRecoveryBlocked, "current_boot_id_hash",
+		                  "invalid boot id");
+	}
+	for (size_t index = 0; index < 36; ++index) {
+		const bool separator = index == 8 || index == 13 || index == 18 || index == 23;
+		const char byte = buf[index];
+		const bool hexadecimal = (byte >= '0' && byte <= '9') ||
+		                         (byte >= 'a' && byte <= 'f') ||
+		                         (byte >= 'A' && byte <= 'F');
+		if ((separator && byte != '-') || (!separator && !hexadecimal)) {
+			return make_error(ErrorCode::kRecoveryBlocked, "current_boot_id_hash",
+			                  "invalid boot id");
+		}
+	}
+	const size_t len = static_cast<size_t>(n);
 	const auto* bytes = reinterpret_cast<const uint8_t*>(buf);
 	uint64_t h0 = kFnvOffset;
 	uint64_t h1 = kFnvOffset ^ 0x9E3779B97F4A7C15ULL;
 	fnv_hash_bytes(bytes, len, &h0, &h1);
+	if (h0 == 0 || h1 == 0) {
+		return make_error(ErrorCode::kRecoveryBlocked, "current_boot_id_hash",
+		                  "invalid boot hash");
+	}
 	if (hi != nullptr) *hi = h0;
 	if (lo != nullptr) *lo = h1;
+	return Result<void>::ok();
 }
 
-ProcessIdentity current_process_identity() noexcept {
+bool process_identity_valid(const ProcessIdentity& id) noexcept {
+	return id.pid != 0 && id.pid <= static_cast<uint64_t>(INT32_MAX) &&
+	       id.proc_start_ticks != 0 && id.boot_id_hash_hi != 0 && id.boot_id_hash_lo != 0;
+}
+
+Result<ProcessIdentity> read_current_process_identity() noexcept {
 	ProcessIdentity id;
 	id.pid = static_cast<uint64_t>(getpid());
 	auto start = proc_stat_starttime(getpid());
-	if (start) id.proc_start_ticks = start.value();
-	current_boot_id_hash(&id.boot_id_hash_hi, &id.boot_id_hash_lo);
+	if (!start) {
+		return make_errno_error(ErrorCode::kRecoveryBlocked, start.error().errno_value,
+		                        "current_process_identity", "process identity unreadable");
+	}
+	id.proc_start_ticks = start.value();
+	auto boot = current_boot_id_hash(&id.boot_id_hash_hi, &id.boot_id_hash_lo);
+	if (!boot) return boot.error();
 	return id;
 }
 
+ProcessIdentity current_process_identity() noexcept {
+	auto identity = read_current_process_identity();
+	return identity ? identity.value() : ProcessIdentity{};
+}
+
 Liveness probe_liveness(uint64_t pid, uint64_t expected_start_ticks) noexcept {
-	if (pid == 0 || pid > static_cast<uint64_t>(INT32_MAX)) {
-		return Liveness::kExited;
+	if (pid == 0 || pid > static_cast<uint64_t>(INT32_MAX) || expected_start_ticks == 0) {
+		return Liveness::kUnverifiable;
 	}
 	const int pidfd = static_cast<int>(::syscall(SYS_pidfd_open, static_cast<pid_t>(pid), 0));
 	if (pidfd < 0) {
@@ -124,10 +183,15 @@ Liveness probe_liveness(uint64_t pid, uint64_t expected_start_ticks) noexcept {
 	struct pollfd pfd {};
 	pfd.fd = pidfd;
 	pfd.events = POLLIN;
-	const int rc = ::poll(&pfd, 1, 0);
+	int rc = -1;
+	for (int attempt = 0; attempt < kMaxInterruptedAttempts; ++attempt) {
+		rc = ::poll(&pfd, 1, 0);
+		if (rc >= 0 || errno != EINTR) break;
+	}
 	::close(pidfd);
-	if (rc > 0) return Liveness::kExited;
-	if (rc < 0 && errno != EINTR) return Liveness::kUnverifiable;
+	if (rc < 0) return Liveness::kUnverifiable;
+	if (rc > 0)
+		return (pfd.revents & POLLIN) != 0 ? Liveness::kExited : Liveness::kUnverifiable;
 
 	auto start = proc_stat_starttime(static_cast<int>(pid));
 	if (!start) return Liveness::kUnverifiable;
@@ -136,13 +200,14 @@ Liveness probe_liveness(uint64_t pid, uint64_t expected_start_ticks) noexcept {
 }
 
 bool identity_matches_current(const ProcessIdentity& id) noexcept {
+	if (!process_identity_valid(id)) return false;
 	if (id.pid != static_cast<uint64_t>(getpid())) return false;
 	auto start = proc_stat_starttime(getpid());
 	if (!start) return false;
 	if (start.value() != id.proc_start_ticks) return false;
 	uint64_t hi = 0;
 	uint64_t lo = 0;
-	current_boot_id_hash(&hi, &lo);
+	if (!current_boot_id_hash(&hi, &lo)) return false;
 	return hi == id.boot_id_hash_hi && lo == id.boot_id_hash_lo;
 }
 

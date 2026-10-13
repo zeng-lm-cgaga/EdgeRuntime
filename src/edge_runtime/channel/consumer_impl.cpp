@@ -73,6 +73,8 @@ Result<std::shared_ptr<ConsumerHandle>> consumer_open_impl(const ChannelOptions&
 		return make_error(ErrorCode::kInvalidOptions, "Consumer::open", "unsupported transport");
 	}
 	const int64_t reconnect_timeout_ms = options.reconnect_timeout.count();
+	auto contract = validate_channel_option_contract(options, "Consumer::open");
+	if (!contract) return contract.error();
 	if (reconnect_timeout_ms < 0 ||
 	    static_cast<uint64_t>(reconnect_timeout_ms) > UINT64_MAX / 1'000'000ull) {
 		return make_error(ErrorCode::kInvalidOptions, "Consumer::open",
@@ -91,6 +93,9 @@ Result<std::shared_ptr<ConsumerHandle>> consumer_open_impl(const ChannelOptions&
 	}
 
 	const std::string shm_name = channel_shm_name(options.name);
+	auto identity = read_current_process_identity();
+	if (!identity) return identity.error();
+	const ProcessIdentity self = identity.value();
 	const std::string lock_path = channel_lock_path(options.name);
 	const std::string socket_path = channel_socket_path(options.name);
 	const uint32_t name_hash = channel_name_hash(options.name.c_str(), options.name.size());
@@ -143,9 +148,8 @@ Result<std::shared_ptr<ConsumerHandle>> consumer_open_impl(const ChannelOptions&
 	}
 
 	{
-		uint64_t bhi = 0, blo = 0;
-		current_boot_id_hash(&bhi, &blo);
-		if (boot.creator_boot_id_hash_hi != bhi || boot.creator_boot_id_hash_lo != blo) {
+		if (boot.creator_boot_id_hash_hi != self.boot_id_hash_hi ||
+		    boot.creator_boot_id_hash_lo != self.boot_id_hash_lo) {
 			return make_error(ErrorCode::kCorruptHeader, "Consumer::open",
 			                  "segment from previous boot");
 		}
@@ -205,6 +209,14 @@ Result<std::shared_ptr<ConsumerHandle>> consumer_open_impl(const ChannelOptions&
 		return make_error(ErrorCode::kRecoveryBlocked, "Consumer::open",
 		                  "consumer identity unreadable");
 	}
+	const uint32_t old_state = shared_load_acquire(&header->consumer_state);
+	if (old_state != static_cast<uint32_t>(EndpointState::kOffline) &&
+	    !process_identity_valid({old_cid.value().pid, old_cid.value().proc_start_ticks,
+	                             old_cid.value().boot_id_hash_hi,
+	                             old_cid.value().boot_id_hash_lo})) {
+		return make_error(ErrorCode::kRecoveryBlocked, "Consumer::open",
+		                  "invalid old consumer");
+	}
 	if (old_cid.value().pid != 0) {
 		const uint32_t cstate = shared_load_acquire(&header->consumer_state);
 		const bool actively_owned =
@@ -230,7 +242,6 @@ Result<std::shared_ptr<ConsumerHandle>> consumer_open_impl(const ChannelOptions&
 
 	}
 
-	const ProcessIdentity self = current_process_identity();
 	ProcessIdentityAbi cid{};
 	cid.pid = self.pid;
 	cid.proc_start_ticks = self.proc_start_ticks;

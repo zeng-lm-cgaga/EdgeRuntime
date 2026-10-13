@@ -206,7 +206,7 @@ int main(int argc, char** argv) {
 	a.use_wait_ms = edge_tool::arg_u64(argc, argv, "--use-wait-ms", 0);
 	a.loaned = edge_tool::arg_flag(argc, argv, "--loaned") ||
 	           edge_tool::arg_u64(argc, argv, "--loaned", 0) != 0;
-	a.checksum = edge_tool::arg_u64(argc, argv, "--checksum", 1) != 0;
+	a.checksum = edge_tool::mandatory_payload_checksum(argc, argv);
 	{
 		const char* transport_arg = edge_tool::arg_value(argc, argv, "--transport");
 		if (transport_arg != nullptr && std::string(transport_arg) == "fd") {
@@ -222,7 +222,7 @@ int main(int argc, char** argv) {
 		             "[--reads N] [--expect-last-seq N] "
 		             "[--read-interval-ms N] [--read-timeout-ms N] "
 		             "[--open-retry-ms N] [--seq-start N] "
-		             "[--use-wait-ms N] [--checksum 0|1] [--transport fd|posix] "
+		             "[--use-wait-ms N] [--checksum 1] [--transport fd|posix] "
 		             "[--loaned 0|1]\n");
 		return 2;
 	}

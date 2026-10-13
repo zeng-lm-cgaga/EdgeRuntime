@@ -338,6 +338,8 @@ namespace {
 
 Result<std::shared_ptr<SharedBufferPoolHandle>> open_existing(
         const SharedBufferPoolOptions& options) {
+	auto identity = read_current_process_identity();
+	if (!identity) return identity.error();
 	const std::string shm_name = pool_shm_name(options.name);
 	auto fd = shm_open_existing(shm_name);
 	if (!fd) return fd.error();
@@ -364,7 +366,7 @@ Result<std::shared_ptr<SharedBufferPoolHandle>> open_existing(
 	auto handle = std::make_shared<SharedBufferPoolHandle>();
 	handle->object = std::move(object);
 	handle->shm_name = shm_name;
-	handle->self = current_process_identity();
+	handle->self = identity.value();
 	return Result<std::shared_ptr<SharedBufferPoolHandle>>(std::move(handle));
 }
 
@@ -374,6 +376,8 @@ Result<std::shared_ptr<SharedBufferPoolHandle>> shared_buffer_pool_create_impl(
         const SharedBufferPoolOptions& options) {
 	auto valid = validate_options(options);
 	if (!valid) return valid.error();
+	auto identity = read_current_process_identity();
+	if (!identity) return identity.error();
 	uint64_t mapping_size = 0;
 	if (!shared_buffer_pool_mapping_size_for(options.block_size, options.block_count,
 	                                         &mapping_size)) {
@@ -387,7 +391,14 @@ Result<std::shared_ptr<SharedBufferPoolHandle>> shared_buffer_pool_create_impl(
 	object.name = shm_name;
 	object.fd = std::move(fd.value());
 	auto stat = shm_fstat_and_capture(object.fd, &object.dev, &object.ino, &object.size);
-	if (!stat) return stat.error();
+	if (!stat) {
+		auto captured = shm_capture_created_identity(object.fd, &object.dev, &object.ino);
+		if (!captured) return captured.error();
+		auto removed = shm_unlink_checked(shm_name, object.dev, object.ino);
+		if (!removed && removed.error().code != ErrorCode::kNotFound)
+			return removed.error();
+		return stat.error();
+	}
 	auto truncate = shm_truncate(object.fd, mapping_size);
 	if (!truncate) {
 		(void)cleanup_created(shm_name, &object);
@@ -401,7 +412,7 @@ Result<std::shared_ptr<SharedBufferPoolHandle>> shared_buffer_pool_create_impl(
 	object.mapping = std::move(mapping.value());
 	object.size = mapping_size;
 	std::memset(object.mapping.get(), 0, static_cast<size_t>(mapping_size));
-	const ProcessIdentity self = current_process_identity();
+	const ProcessIdentity self = identity.value();
 	uint64_t nonce_hi = 0;
 	uint64_t nonce_lo = 0;
 	if (!owner_valid(owner_from_process(self)) || !random_bytes(&nonce_hi, sizeof(nonce_hi)) ||

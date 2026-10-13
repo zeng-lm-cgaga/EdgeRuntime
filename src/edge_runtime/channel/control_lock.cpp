@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstring>
 
+#include "edge_runtime/process/process_identity.hpp"
 #include "edge_runtime/utility/checksum.hpp"
 
 namespace edge_runtime::detail {
@@ -124,6 +125,13 @@ Result<ControlJournalV1> ControlLock::read_journal() noexcept {
 }
 
 Result<void> ControlLock::write_journal(const ControlJournalV1& journal) noexcept {
+	if (journal.state != static_cast<uint32_t>(JournalState::kIdle) &&
+	    !process_identity_valid({journal.creator.pid, journal.creator.proc_start_ticks,
+	                             journal.creator.boot_id_hash_hi,
+	                             journal.creator.boot_id_hash_lo})) {
+		return make_error(ErrorCode::kRecoveryBlocked, "control_lock_write_journal",
+		                  "invalid creator");
+	}
 	ControlJournalV1 rec = journal;
 	rec.record_checksum = journal_checksum(rec);
 	const char* src = reinterpret_cast<const char*>(&rec);

@@ -16,8 +16,10 @@ enum class Transport : uint32_t {
 
 struct ChannelOptions {
 	std::string name;
+	// 源兼容保留的弃用字段：仅接受默认 100ms；样本新鲜度由调用方按时间戳判断。
 	std::chrono::milliseconds stale_timeout{100};
 	std::chrono::milliseconds reconnect_timeout{1000};
+	// 完整性校验始终开启；false 在 create/open 时返回 InvalidOptions。
 	bool enable_payload_checksum{true};
 	Transport transport{Transport::kPosixShm};
 	// 大于零时，Producer 可用 BOOTTIME 报告应用仍在推进；零表示关闭。

@@ -573,6 +573,8 @@ void mark_slot_protocol_failure(MpmcSlotHeaderAbi* slot, OwnerCommitResult resul
 Result<std::shared_ptr<MpmcQueueHandle>> open_existing(const MpmcQueueOptions& options,
                                                        const SchemaDescriptor& schema,
                                                        uint32_t payload_size) {
+	auto identity = read_current_process_identity();
+	if (!identity) return identity.error();
 	const std::string shm_name = mpmc_shm_name(options.name);
 	auto fd = shm_open_existing(shm_name);
 	if (!fd) return fd.error();
@@ -616,7 +618,7 @@ Result<std::shared_ptr<MpmcQueueHandle>> open_existing(const MpmcQueueOptions& o
 	auto handle = std::make_shared<MpmcQueueHandle>();
 	handle->object = std::move(object);
 	handle->shm_name = shm_name;
-	handle->self = current_process_identity();
+	handle->self = identity.value();
 	handle->slot_stride = stride;
 	return Result<std::shared_ptr<MpmcQueueHandle>>(std::move(handle));
 }
@@ -632,6 +634,8 @@ Result<std::shared_ptr<MpmcQueueHandle>> mpmc_create_impl(const MpmcQueueOptions
                                                           uint32_t payload_size) {
 	auto opts = validate_options(options, schema, payload_size);
 	if (!opts) return opts.error();
+	auto identity = read_current_process_identity();
+	if (!identity) return identity.error();
 	uint64_t mapping_size = 0;
 	if (!mpmc_mapping_size_for(options.capacity, payload_size, &mapping_size)) {
 		return make_error(ErrorCode::kInvalidOptions, "MpmcQueue::create", "mapping size overflow");
@@ -643,7 +647,14 @@ Result<std::shared_ptr<MpmcQueueHandle>> mpmc_create_impl(const MpmcQueueOptions
 	object.name = shm_name;
 	object.fd = std::move(fd.value());
 	auto stat_before = shm_fstat_and_capture(object.fd, &object.dev, &object.ino, &object.size);
-	if (!stat_before) return stat_before.error();
+	if (!stat_before) {
+		auto captured = shm_capture_created_identity(object.fd, &object.dev, &object.ino);
+		if (!captured) return captured.error();
+		auto removed = shm_unlink_checked(shm_name, object.dev, object.ino);
+		if (!removed && removed.error().code != ErrorCode::kNotFound)
+			return removed.error();
+		return stat_before.error();
+	}
 	auto truncate = shm_truncate(object.fd, mapping_size);
 	if (!truncate) {
 		(void)cleanup_created(shm_name, &object);
@@ -658,7 +669,7 @@ Result<std::shared_ptr<MpmcQueueHandle>> mpmc_create_impl(const MpmcQueueOptions
 	object.size = mapping_size;
 	auto* header = static_cast<MpmcQueueHeaderAbi*>(object.mapping.get());
 	std::memset(object.mapping.get(), 0, static_cast<size_t>(mapping_size));
-	const ProcessIdentity self = current_process_identity();
+	const ProcessIdentity self = identity.value();
 	if (self.pid == 0 || self.proc_start_ticks == 0 || self.boot_id_hash_hi == 0 ||
 	    self.boot_id_hash_lo == 0 || !random_bytes(&header->instance_nonce_hi, sizeof(uint64_t)) ||
 	    !random_bytes(&header->instance_nonce_lo, sizeof(uint64_t))) {

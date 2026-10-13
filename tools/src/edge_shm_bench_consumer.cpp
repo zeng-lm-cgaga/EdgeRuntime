@@ -205,7 +205,7 @@ int main(int argc, char** argv) {
 		             "usage: edge_shm_bench_consumer --name <name> --payload <bytes> "
 		             "--csv <path> [--mode futex|poll] [--max-samples N] "
 		             "[--max-time-ms T] [--idle-ms N] [--poll-bound N] "
-		             "[--open-retry-ms N] [--checksum 0|1]\n");
+		             "[--open-retry-ms N] [--checksum 1]\n");
 		return 2;
 	}
 	Args a;
@@ -224,7 +224,7 @@ int main(int argc, char** argv) {
 	a.idle_ms = arg_u64(argc, argv, "--idle-ms", 1500);
 	a.poll_bound = arg_u64(argc, argv, "--poll-bound", 1024);
 	a.open_retry_ms = arg_u64(argc, argv, "--open-retry-ms", 10000);
-	a.checksum = arg_u64(argc, argv, "--checksum", 1) != 0;
+	a.checksum = edge_tool::mandatory_payload_checksum(argc, argv);
 
 	const edge_runtime::SchemaDescriptor schema{bench::bench_fingerprint(a.payload), 1,
 	                                            "BenchPayloadV1"};

@@ -25,7 +25,11 @@ enum class Liveness : uint8_t {
 
 Result<uint64_t> proc_stat_starttime(int pid) noexcept;
 
-void current_boot_id_hash(uint64_t* hi, uint64_t* lo) noexcept;
+Result<void> current_boot_id_hash(uint64_t* hi, uint64_t* lo) noexcept;
+
+bool process_identity_valid(const ProcessIdentity& id) noexcept;
+
+Result<ProcessIdentity> read_current_process_identity() noexcept;
 
 ProcessIdentity current_process_identity() noexcept;
 

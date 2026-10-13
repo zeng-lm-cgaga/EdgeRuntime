@@ -143,7 +143,7 @@ int main(int argc, char** argv) {
 	a.count = edge_tool::arg_u64(argc, argv, "--count", 0);
 	a.interval_us = edge_tool::arg_u64(argc, argv, "--interval-us", 0);
 	a.seq_start = edge_tool::arg_u64(argc, argv, "--seq-start", 0);
-	a.checksum = edge_tool::arg_u64(argc, argv, "--checksum", 1) != 0;
+	a.checksum = edge_tool::mandatory_payload_checksum(argc, argv);
 	a.sleep_first_us = edge_tool::arg_u64(argc, argv, "--sleep-first-us", 0);
 	a.no_publish = edge_tool::arg_flag(argc, argv, "--no-publish") ||
 	               edge_tool::arg_u64(argc, argv, "--no-publish", 0) != 0;
@@ -166,7 +166,7 @@ int main(int argc, char** argv) {
 		             "[--schema testpayloadv1|testpayloadv2] "
 		             "[--count N] [--interval-us N] [--seq-start N] "
 		             "[--sleep-first-us N] [--no-publish 0|1] "
-		             "[--checksum 0|1] [--transport fd|posix] "
+		             "[--checksum 1] [--transport fd|posix] "
 		             "[--heartbeat-interval-us N] [--heartbeat-only 0|1] "
 		             "[--loaned 0|1]\n");
 		return 2;

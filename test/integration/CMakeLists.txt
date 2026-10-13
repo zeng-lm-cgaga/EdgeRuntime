@@ -1,5 +1,15 @@
 # 集成测试必须通过独立可执行文件和 fork/exec 验证进程边界行为。
 
+add_executable(channel_options_cli_test channel_options_cli_test.cpp)
+edgeruntime_apply_project_options(channel_options_cli_test)
+target_link_libraries(channel_options_cli_test PRIVATE GTest::gtest)
+target_include_directories(channel_options_cli_test PRIVATE ../fixtures)
+add_test(NAME channel_options_cli
+  COMMAND channel_options_cli_test
+    $<TARGET_FILE:edge_shm_producer> $<TARGET_FILE:edge_shm_consumer>
+    $<TARGET_FILE:edge_shm_bench_producer> $<TARGET_FILE:edge_shm_bench_consumer>)
+set_tests_properties(channel_options_cli PROPERTIES TIMEOUT 45 LABELS integration)
+
 add_executable(edge_shm_reopen_helper helpers/reopen_child.cpp)
 edgeruntime_apply_project_options(edge_shm_reopen_helper)
 target_link_libraries(
