@@ -7,6 +7,17 @@ if(Python3_Interpreter_FOUND)
             --cmake ${CMAKE_COMMAND})
   set_tests_properties(cmake_option_compatibility PROPERTIES TIMEOUT 120 LABELS packaging
     ENVIRONMENT PYTHONDONTWRITEBYTECODE=1)
+  set(_selfipcs_compat_build_type ${CMAKE_BUILD_TYPE})
+  if(NOT _selfipcs_compat_build_type)
+    set(_selfipcs_compat_build_type Release)
+  endif()
+  add_test(NAME cmake_build_target_compatibility
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cmake_build_targets_test.py
+            --cmake ${CMAKE_COMMAND} --build-type ${_selfipcs_compat_build_type}
+            --sanitizers ${SELFIPCS_ENABLE_SANITIZERS} --failpoints ${SELFIPCS_ENABLE_FAILPOINTS})
+  set_tests_properties(cmake_build_target_compatibility PROPERTIES TIMEOUT 180 LABELS packaging
+    ENVIRONMENT PYTHONDONTWRITEBYTECODE=1)
+  unset(_selfipcs_compat_build_type)
 endif()
 
 add_executable(channel_options_cli_test channel_options_cli_test.cpp)

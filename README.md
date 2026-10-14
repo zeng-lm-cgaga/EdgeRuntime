@@ -50,6 +50,8 @@ target_link_libraries(app PRIVATE SelfIPCs::self_ipcs)
 
 已有工程可继续使用 `find_package(EdgeRuntime CONFIG REQUIRED)`、`EdgeRuntime::edge_runtime`、`edge_runtime/...` 头路径和 `edge_runtime::`。工具安装同时提供 `self_ipcs_*` 名称和对应的 `edge_*` 兼容入口；共享内存标识、ABI 版本及实例校验保持原值。
 
+源码构建支持 `cmake --build <build-dir> --target self_ipcs` 和 `--target edge_runtime`；两种目标及源码内链接入口共用同一份核心编译产物 `libself_ipcs.a`。
+
 `PayloadCodec` 特化在全局作用域使用 qualified 名称：`template <> struct self_ipcs::PayloadCodec<MyPayload> { /* codec members */ };`，具体编译示例见 [examples/compat_demo/](examples/compat_demo/)。
 
 CMake 选项使用 `SELFIPCS_WARNINGS_AS_ERRORS`、`SELFIPCS_ENABLE_SANITIZERS`、`SELFIPCS_ENABLE_FAILPOINTS`，对应的 `EDGERUNTIME_*` 兼容选项同步到同一配置。首次配置同时指定冲突值会报错；重新配置时单独修改任一入口会同步另一入口。Debug 默认启用 failpoints，Release 默认关闭；ASan/UBSan preset 明确启用 sanitizer。

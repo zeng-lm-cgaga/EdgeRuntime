@@ -21,7 +21,9 @@ add_library(self_ipcs STATIC
   edge_runtime/utility/failpoint.cpp)
 add_library(SelfIPCs::self_ipcs ALIAS self_ipcs)
 add_library(EdgeRuntime::edge_runtime ALIAS self_ipcs)
-add_library(edge_runtime ALIAS self_ipcs)
+add_library(edge_runtime INTERFACE ${CMAKE_CURRENT_LIST_FILE})
+target_link_libraries(edge_runtime INTERFACE self_ipcs)
+add_dependencies(edge_runtime self_ipcs)
 
 target_compile_features(self_ipcs PUBLIC cxx_std_17)
 target_include_directories(
